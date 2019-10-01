@@ -33,6 +33,389 @@ typedef enum {
     eCompileOutOfMem
 } eRegexCompileStatus;
 
+typedef struct character_s character_t;
+struct character_s {
+    int c;
+    int escaped;
+};
+
+character_t regexGetNextPatternChar(const char **pattern) {
+    character_t result = {
+        .c = -1,
+        .escaped = 0
+    };
+
+    if(**pattern == '\0') {
+        return result;
+    }
+    if(**pattern == '\\') {
+        result.escaped = 1;
+        (*pattern)++;
+        if(**pattern == '\0') {
+            return result;
+        }
+    }
+    result.c = **pattern;
+    (*pattern)++;
+    return result;
+}
+
+int regexCheckNextPatternChar(const char **pattern, char c) {
+    if(**pattern == '\0' || **pattern != c) {
+        return 0;
+    }
+    (*pattern)++;
+    return 1;
+}
+
+int regexGetActualChar(character_t c) {
+    if(c.escaped) {
+        switch(c.c) {
+            case 'n': return '\n';
+            case 'r': return '\r';
+            case 't': return '\t';
+            default: return c.c;
+        }
+    }
+    return c.c;
+}
+
+int regexIsAlnum(char c) {
+    return (((c >= 'a') && (c <= 'z')) ||
+            ((c >= 'A') && (c <= 'Z')) ||
+            ((c >= '0') && (c <= '9')));
+}
+
+int regexIsMeta(int c) {
+    return ((c == '|') || (c == '?') || (c == '.') || (c == '*') ||
+            (c == '+') || (c == '(') || (c == '[') || (c == ')'));
+}
+
+int regexGetPatternStrLen(const char **pattern) {
+    const char *orig = *pattern;
+    int count = 0;
+    character_t c;
+
+    for(;;) {
+        if(**pattern == '\0') {
+            *pattern = orig;
+            return count;
+        }
+        c = regexGetNextPatternChar(pattern);
+        if(c.c == -1) {
+            // Incomplete escape char
+            return -1;
+        }
+        if(!c.escaped && regexIsMeta(c.c)) {
+            *pattern = orig;
+            return count;
+        }
+        count++;
+    }
+}
+
+char *regexGetPatternStr(const char **pattern, int len) {
+    char *str, *ptr;
+    character_t c;
+
+    if((str = malloc(len + 1)) == NULL) {
+        return NULL;
+    }
+    ptr = str;
+
+    for(; len; len--) {
+        if(**pattern == '\0') {
+            return str;
+        }
+        c = regexGetNextPatternChar(pattern);
+        if(c.escaped) {
+            switch(c.c) {
+                case 'r': *ptr = '\r'; break;
+                case 'n': *ptr = '\n'; break;
+                case 't': *ptr = '\t'; break;
+                default: *ptr = c.c; break;
+            }
+        } else {
+            *ptr = c.c;
+        }
+        ptr++;
+    }
+    *ptr = '\0';
+    return str;
+}
+
+void mapClear(unsigned char *bitmap) {
+    memset(bitmap, 0, 32);
+}
+
+void mapSet(unsigned char *bitmap, int pos) {
+    unsigned int idx = pos / 8u;
+    unsigned int bit = pos % 8u;
+
+    bitmap[idx] |= (1u << bit);
+}
+
+int mapCheck(const unsigned char *bitmap, int pos) {
+    unsigned int idx = pos / 8u;
+    unsigned int bit = pos % 8u;
+
+    return (int)(bitmap[idx] & (1u << bit));
+}
+
+void mapInvert(unsigned char *bitmap) {
+    for(int k = 0; k < 32; k++) {
+        bitmap[k] ^= (unsigned char)0xFF;
+    }
+}
+
+unsigned char *mapCopy(unsigned char *bitmap) {
+    unsigned char *copy;
+
+    if((copy = malloc(32)) == NULL) {
+        return NULL;
+    }
+    memcpy(copy, bitmap, 32);
+    return copy;
+}
+
+eRegexCompileStatus regexParseCharClass(const char **pattern, unsigned char *bitmap) {
+    character_t c;
+    int invert = 0;
+    int range = 0;
+    int last;
+    int next;
+    int k;
+
+    mapClear(bitmap);
+
+    if(*pattern == '\0') {
+        return eCompileCharClassIncomplete;
+    }
+
+    c = regexGetNextPatternChar(pattern);
+    if(!c.escaped && c.c == '^') {
+        invert = 1;
+        c = regexGetNextPatternChar(pattern);
+    }
+
+    for(;;) {
+        if(c.c == -1) {
+            if(c.escaped) {
+                return eCompileEscapeCharIncomplete;
+            }
+            return eCompileCharClassIncomplete;
+        }
+        if(!c.escaped && c.c == ']') {
+            // End of the char class
+            break;
+        }
+        if(range == 0) {
+            last = regexGetActualChar(c);
+            mapSet(bitmap, last);
+            range = 1;
+        } else if(range == 1) {
+            if(!c.escaped && c.c == '-') {
+                range = 2;
+            } else {
+                last = regexGetActualChar(c);
+                mapSet(bitmap, last);
+            }
+        } else {
+            next = regexGetActualChar(c);
+            for(; last <= next; last++) {
+                mapSet(bitmap, last);
+            }
+            range = 0;
+        }
+        if(*pattern == '\0') {
+            if(range == 2) {
+                return eCompileCharClassRangeIncomplete;
+            }
+            return eCompileCharClassIncomplete;
+        }
+        c = regexGetNextPatternChar(pattern);
+    }
+    if(range == 2) {
+        return eCompileCharClassRangeIncomplete;
+    }
+    if(invert) {
+        mapInvert(bitmap);
+    }
+    return eCompileOk;
+}
+
+int regexGetSubexpressionNameLen(const char **pattern) {
+    int c;
+    int k;
+
+    for(k = 0; (*pattern)[k] != '>' && (*pattern)[k] != '\0'; k++) {
+        if(!regexIsAlnum((*pattern)[k])) {
+            return -1;
+        }
+    }
+    if(k == 0) {
+        return -1;
+    }
+    return k;
+}
+
+char *regexGetSubexpressionName(const char **pattern, int len) {
+    char *str, *ptr;
+    int k;
+
+    if((str = malloc(len + 1)) == NULL) {
+        return NULL;
+    }
+    ptr = str;
+    for(; len; len--) {
+        *ptr = **pattern;
+        (*pattern)++;
+        ptr++;
+    }
+    *ptr = '\0';
+    return str;
+}
+
+void regexPrintCharClass(unsigned char *bitmap) {
+    int k;
+    int run;
+
+    for(k = 0; k < 256; k++) {
+        if(mapCheck(bitmap, k)) {
+            for(run = k + 1; run < 256 && mapCheck(bitmap, run); run++);
+            run--;
+            printf("%c", ((k < 32) || (k > 127)) ? '.' : k);
+            if(run - k > 3) {
+                printf("-%c", ((run < 32) || (run > 127)) ? '.' : run);
+                k = run;
+            }
+        }
+    }
+}
+
+typedef struct regex_compile_ctx_s regex_compile_ctx_t;
+struct regex_compile_ctx_s {
+    eRegexCompileStatus status;
+    const char *pattern;
+    int position;
+};
+
+#define SET_RESULT(res,stat,ptr)  res.status = stat; res.position = ptr - res.pattern;
+
+// Return a compiled regex, or an error and position within the pattern
+regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
+    regex_compile_ctx_t result = {
+            .status = eCompileOk,
+            .pattern = pattern,
+            .position = 0
+    };
+    character_t c;
+    int len;
+    char *str;
+    unsigned char bitmap[32];
+    eRegexCompileStatus status;
+
+    for(; *pattern != '\0';) {
+        c = regexGetNextPatternChar(&pattern);
+        if(c.c == -1) {
+            SET_RESULT(result, eCompileEscapeCharIncomplete, pattern);
+            return result;
+        }
+
+        if(!c.escaped) {
+            switch(c.c) {
+                case '.':
+                    printf("Any\n");
+                    continue;
+                case '|':
+                    printf("Alt\n");
+                    continue;
+                case '?':
+                    printf("ZeroOrOne\n");
+                    continue;
+                case '*':
+                    printf("ZeroOrMore\n");
+                    continue;
+                case '+':
+                    printf("OneOrMore\n");
+                    continue;
+                case '(':
+                    if(regexCheckNextPatternChar(&pattern, '?')) {
+                        // Meta character subexpression modifier
+                        if(regexCheckNextPatternChar(&pattern, 'i')) {
+                            // Case insensitive sub expression
+                            // TODO
+                        } else if(regexCheckNextPatternChar(&pattern, 'P')) {
+                            // Named sub expression
+                            if(!regexCheckNextPatternChar(&pattern, '<')) {
+                                SET_RESULT(result, eCompileMalformedSubExprName, pattern);
+                                return result;
+                            }
+                            len = regexGetSubexpressionNameLen(&pattern);
+                            if(len == -1) {
+                                SET_RESULT(result, eCompileMalformedSubExprName, pattern);
+                                return result;
+                            }
+                            if((str = regexGetSubexpressionName(&pattern, len)) == NULL) {
+                                SET_RESULT(result, eCompileOutOfMem, pattern);
+                                return result;
+                            }
+                            printf("[%s]", str);
+                        } else {
+                            SET_RESULT(result, eCompileUnsupportedMeta, pattern);
+                            return result;
+                        }
+                    }
+                    printf("(\n");
+                    continue;
+                case ')':
+                    printf(")\n");
+                    continue;
+                case '[':
+                    if((status = regexParseCharClass(&pattern, bitmap)) != eCompileOk) {
+                        SET_RESULT(result, status, pattern);
+                        return result;
+                    }
+                    printf("CharClass(");
+                    regexPrintCharClass(bitmap);
+                    printf(")\n");
+                    continue;
+                default:
+                    // Unnecessary escaping
+                    break;
+            }
+        }
+
+        // Regular character
+        switch(len = regexGetPatternStrLen(&pattern)) {
+            case -1:
+                SET_RESULT(result, eCompileEscapeCharIncomplete, pattern);
+                return result;
+            case 0:
+                if(c.escaped) {
+                    printf("CHAR(\\%c)\n", c.c);
+                } else {
+                    printf("CHAR(%c)\n", c.c);
+                }
+                break;
+            default:
+                len++;
+                if(c.escaped) {
+                    pattern--;
+                }
+                pattern--;
+                if((str = regexGetPatternStr(&pattern, len)) == NULL) {
+                    SET_RESULT(result, eCompileOutOfMem, pattern);
+                    return result;
+                }
+                printf("STRING(\"%s\")\n", str);
+        }
+    }
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
 typedef struct regex_instr_s regex_instr_t;
 struct regex_instr_s {
     eRegexOpCode opcode;
@@ -43,16 +426,6 @@ struct regex_instr_s {
     regex_instr_t *out_a;
     regex_instr_t *out_b;
 };
-
-unsigned char *regexCharClassBitmapCopy(unsigned char *bitmap) {
-    unsigned char *copy;
-
-    if((copy = malloc(32)) == NULL) {
-        return NULL;
-    }
-    memcpy(copy, bitmap, 32);
-    return copy;
-}
 
 regex_instr_t *regexInstructionCreate(eRegexOpCode opcode, int c, char *str) {
     regex_instr_t *instr;
@@ -70,11 +443,6 @@ regex_instr_t *regexInstructionCreate(eRegexOpCode opcode, int c, char *str) {
     return instr;
 }
 
-int regexCharClassCheck(unsigned char *bitmap, int c) {
-    //printf("Check %d = byte %d, bit %d\n", c, c / 8, c % 8);
-    return bitmap[c / 8] & (c % 8);
-}
-
 void regexInstructionPrint(regex_instr_t *instr) {
     int j;
 
@@ -87,9 +455,9 @@ void regexInstructionPrint(regex_instr_t *instr) {
         case eCharClass:
             printf("CLASS([");
             for(int k = 0; k < 256; k++) {
-                if(regexCharClassCheck((unsigned char *)instr->str, k)) {
+                if(mapCheck((unsigned char *)instr->str, k)) {
                     for(j = k + 1;
-                        (j < 256) && regexCharClassCheck((unsigned char *)instr->str, j);
+                        (j < 256) && mapCheck((unsigned char *)instr->str, j);
                         j++);
                     j--;
                     if((j - k) > 3) {
@@ -113,13 +481,6 @@ void regexInstructionDestroy(regex_instr_t *instr) {
 
 }
 
-typedef struct regex_compile_ctx_s regex_compile_ctx_t;
-struct regex_compile_ctx_s {
-    eRegexCompileStatus status;
-    const char *pattern;
-    int position;
-};
-
 const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
     switch(status) {
         case eCompileOk: return "compiled successfully";
@@ -131,93 +492,6 @@ const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
         case eCompileOutOfMem: return "out of memory";
         default: return "Unknown failure";
     }
-}
-
-int regexIsAlnum(char c) {
-    return (((c >= 'a') && (c <= 'z')) ||
-            ((c >= 'A') && (c <= 'Z')) ||
-            ((c >= '0') && (c <= '9')));
-}
-
-int regexIsMeta(int c) {
-    return ((c == '|') || (c == '?') || (c == '.') || (c == '*') ||
-            (c == '+') || (c == '(') || (c == '['));
-}
-
-#define SET_RESULT(res,stat,base,ptr)  res.status = stat; res.position = ptr - base;
-
-void regexCharClassClear(unsigned char *bitmap) {
-    memset(bitmap, 0, 32);
-}
-
-void regexCharClassSetChar(unsigned char *bitmap, int c) {
-    bitmap[c / 8] |= 1 << (c % 8);
-}
-
-void regexCharClassSetRange(unsigned char *bitmap, int low, int high) {
-    int k;
-
-    for(k = low; k <= high; k++) {
-        bitmap[k / 8] |= 1 << (k % 8);
-    }
-}
-
-void regexCharClassInvert(unsigned char *bitmap) {
-    for(int k = 0; k < 32; k++) {
-        bitmap[k] ^= 0xff;
-    }
-}
-
-eRegexCompileStatus regexParseCharClass(const char *buffer, unsigned char *bitmap, int *increment) {
-    int invert = 0;
-    int last = 0;
-    int next;
-    int c;
-
-    regexCharClassClear(bitmap);
-
-    buffer++;
-    *increment = 1;
-    if(buffer[1] == '^') {
-        invert = 1;
-        buffer++;
-        (*increment)++;
-    }
-
-    for(c = buffer[0];
-        (c != ']') && (c != '\0');
-        c = buffer[0]) {
-        if(c == '-') {
-            if(last == 0) {
-                regexCharClassSetChar(bitmap, '-');
-                last = '-';
-                printf("Class: [-]\n");
-            } else {
-                next = buffer[1];
-                if(next == '\0' || next == ']') {
-                    return eCompileCharClassRangeIncomplete;
-                }
-                printf("Class: Range [%c] - [%c]\n", last, next);
-                regexCharClassSetRange(bitmap, last, next);
-                buffer++;
-                (*increment)++;
-                last = 0;
-            }
-        } else {
-            last = c;
-            printf("Class: [%c]\n", c);
-            regexCharClassSetChar(bitmap, c);
-        }
-        buffer++;
-        (*increment)++;
-    }
-    if(c == ']') {
-        if(invert) {
-            regexCharClassInvert(bitmap);
-        }
-        return eCompileOk;
-    }
-    return eCompileCharClassIncomplete;
 }
 
 typedef struct shunting_yard_s shunting_yard_t;
@@ -253,560 +527,8 @@ int shuntingYardPush(shunting_yard_t *yard, regex_instr_t *instr) {
         yard->operators--;
         operator = yard->operator_stack[yard->operators];
     }
-}
-
-// Return a compiled regex, or an error and position within the pattern
-regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
-    regex_compile_ctx_t result = {
-        .status = eCompileOk,
-        .pattern = pattern,
-        .position = 0
-    };
-
-    regex_instr_t *operand_stack[TOKEN_STACK_DEPTH], *operator_stack[TOKEN_STACK_DEPTH];
-    int operands = 0, operators = 0;
-    const char *p;
-    const char *str;
-    char *name;
-    unsigned char bitmap[32];
-    eRegexCompileStatus status;
-    int offset;
-
-    for(p = pattern; *p != '\0'; p++) {
-        switch(*p) {
-            case '\\':
-                if(p[1] == '\0') {
-                    printf("\nERROR: Incomplete meta char escape\n");
-                    SET_RESULT(result, eCompileEscapeCharIncomplete, pattern, p);
-                    return result;
-                }
-                p++;
-                regexInstructionPrint(regexInstructionCreate(eCharLiteral, *p, NULL));
-                //printf("ESC: \\%c\n", *p);
-                break;
-            case '.':
-                printf("Any");
-                break;
-            case '|':
-                printf("Alt");
-                break;
-            case '?':
-                printf("ZeroOrOne");
-                break;
-            case '*':
-                printf("ZeroOrMore");
-                break;
-            case '+':
-                printf("OneOrMore");
-                break;
-            case '(':
-                printf("(");
-                if(p[1] == '?') {
-                    if(p[2] == 'i') {
-                        // Case insensitive matching for this subexpression
-                        p += 2;
-                        // TODO - set the case insensitive flag
-                        printf("CaseIns");
-                    } else if(p[2] == 'P' && p[3] == '<') {
-                        // PCRE5 style named subexpression
-                        p += 3;
-                        str = p;
-                        for(; regexIsAlnum(*p); p++);
-                        if((*p != '>') || ((p - str) == 1)) {
-                            // Malformed named subexpression
-                            SET_RESULT(result, eCompileMalformedSubExprName, pattern, p);
-                            return result;
-                        }
-                        if((name = malloc(p - str)) == NULL) {
-                            SET_RESULT(result, eCompileOutOfMem, pattern, p);
-                            return result;
-                        }
-                        memcpy(name, str, p - str);
-                        name[p - str - 1] = '\0';
-                        printf("<%s>", name);
-                        free(name);
-                    }
-                }
-                break;
-
-            case ')':
-                printf(")");
-                break;
-
-            case '[':
-                if((status = regexParseCharClass(p, bitmap, &offset)) != eCompileOk) {
-                    SET_RESULT(result, status, pattern, p);
-                    return result;
-                }
-                p += offset;
-                regexInstructionPrint(regexInstructionCreate(eCharClass, 0, (char *)regexCharClassBitmapCopy(bitmap)));
-                //printf("[...]\n");
-                break;
-
-            default:
-                str = p;
-                for(; !regexIsMeta(p[1]) && p[1] != '\0'; p++);
-                if(p - str > 1) {
-                    if((name = malloc(p - str + 1)) == NULL) {
-                        SET_RESULT(result, eCompileOutOfMem, pattern, p);
-                        return result;
-                    }
-                    memcpy(name, str, p - str);
-                    name[p - str] = '\0';
-                    printf("STR \"%s\"\n", name);
-                    free(name);
-                    p--;
-                } else {
-                    printf("CHAR '%c'\n", *p);
-                }
-                break;
-        }
-    }
-    return result;
-}
-
-
-
-#if 0
-
-
-
-
-
-typedef struct regex_thread_s regex_thread_t;
-struct regex_thread_s {
-    regex_instr_t *pc;
-    int subexpr_count;
-    char **subexpressions;
-};
-
-typedef struct regex_subexpr_entry_s regex_subexpr_entry_t;
-struct regex_subexpr_entry_s {
-    char *name;
-    int idx;
-    regex_subexpr_entry_t *next;
-};
-
-typedef struct regex_s regex_t;
-struct regex_s {
-    regex_instr_t *expression;
-    int subexpr_count;
-    regex_subexpr_entry_t *subexpr_names;
-};
-
-typedef struct re_ctx_s re_ctx_t;
-
-struct re_ctx_s {
-    regex_t *expression;
-    int matched;
-    char *text;
-    regex_instr_t *pc;
-    char **subexpressions;
-};
-
-regex_compile_result_t regexCompile(const char *pattern, unsigned int flags);
-void regexFree(regex_t *expr);
-
-const char *regexCompileStatusString(regex_compile_result_t *result);
-
-re_ctx_t *regexContextInit(regex_t *expr);
-void regexContextFree(re_ctx_t *ctx);
-
-int regexSearch(re_ctx_t *ctx, const char *text);
-
-int regexGetNamedSubexprIndex(re_ctx_t *ctx, const char *name);
-int regexGetNamedSubexprBounds(re_ctx_t *ctx, const char *name, char **start, char **end);
-int regexGetSubexprBounds(re_ctx_t *ctx, int subnum, char **start, char **end);
-int regexGetSubexprLen(re_ctx_t *ctx, int subnum);
-int regexGetNamedSubexprLen(re_ctx_t *ctx, int subnum);
-void regexCopySubexprValue(re_ctx_t *ctx, int subnum, char *buf, size_t buflen);
-void regexCopyNamedSubexprValue(re_ctx_t *ctx, const char *name, char *buf, size_t buflen);
-
-
-/////////////////////////////////////////////////////////////////////////////
-
-
-
-
-regex_instr_t *regexInstructionCreate(eRegexOpCode opcode) {
-    regex_instr_t *inst;
-
-    if((inst = malloc(sizeof(regex_instr_t))) == NULL) {
-        return NULL;
-    }
-    memset(inst, 0, sizeof(regex_instr_t));
-    inst->opcode = opcode;
-    return inst;
-}
-
-void regexInstructionDestroy(regex_instr_t *inst) {
-    if((inst->opcode == eCharClass) || (inst->opcode == eStringLiteral)) {
-        if(inst->str != NULL) {
-            free(inst->str);
-        }
-    }
-    free(inst);
-}
-
-typedef struct text_buf_s text_buf_t;
-struct text_buf_s {
-    const char *buffer;
-    int pos;
-    int len;
-};
-
-void regexTextBufInit(text_buf_t *buf, const char *text) {
-    memset(buf, 0, sizeof(text_buf_t));
-    buf->buffer = text;
-    buf->pos = 0;
-    buf->len = strlen(text);
-}
-
-int regexTextBufCharGet(text_buf_t *buf) {
-    int c = -1;
-
-    if(buf->pos < buf->len) {
-        c = buf->buffer[buf->pos];
-        buf->pos++;
-    }
-
-    return c;
-}
-
-int regexTextBufCharPeek(text_buf_t *buf, int offset) {
-    int c = -1;
-
-    if((buf->pos + offset) < buf->len) {
-        c = buf->buffer[buf->pos + offset];
-    }
-
-    return c;
-}
-
-const char *regexTextBufPosGet(text_buf_t *buf) {
-    return buf->buffer + buf->pos;
-}
-
-void regexTextBufAdvance(text_buf_t *buf, int pos) {
-    buf->pos += pos;
-}
-
-int regexTextBufStrLen(text_buf_t *buf, const char *origin) {
-    return (buf->buffer + buf->pos) - origin + 1;
-}
-
-char *regexTextBufStrCopy(text_buf_t *buf, const char *origin) {
-    int len = regexTextBufStrLen(buf, origin);
-    char *str;
-
-    if((str = malloc(len)) == NULL) {
-        return NULL;
-    }
-    memcpy(str, origin, len - 1);
-    str[len - 1] = '\0';
-    return str;
-}
-
-int regexCharLookAhead(const char *str, int offset) {
-    int k;
-    for(k = 0; k < offset; k++) {
-        if(str[k] != '\0') {
-            continue;
-        }
-        return 0;
-    }
-    return str[k];
-}
-
-unsigned char char_class_bitmap[32];
-
-void regexCharClassClear(unsigned char *bitmap) {
-    memset(bitmap, 0, 32);
-}
-
-void regexCharClassSetChar(unsigned char *bitmap, char c) {
-    bitmap[c / 8] |= c % 8;
-}
-
-void regexCharClassSetRange(unsigned char *bitmap, char low, char high) {
-    int k;
-
-    for(k = low; k <= high; k++) {
-        bitmap[k / 8] |= k % 8;
-    }
-}
-
-void regexCharClassInvert(unsigned char *bitmap) {
-    for(int k = 0; k < 32; k++) {
-        bitmap[k] ^= 0xff;
-    }
-}
-
-int regexCharClassCheck(unsigned char *bitmap, char c) {
-    return bitmap[c / 8] & (c % 8);
-}
-
-int regexParseCharClass(text_buf_t *buffer, unsigned char *bitmap) {
-    int invert = 0;
-    int last = 0;
-    int next;
-    int c;
-
-    regexCharClassClear(bitmap);
-
-    if(regexTextBufCharPeek(buffer, 0) == '^') {
-        invert = 1;
-        regexTextBufAdvance(buffer, 1);
-    }
-
-    for(c = regexTextBufCharPeek(buffer, 0);
-        (c != ']') && (c != '\0');
-        c = regexTextBufCharPeek(buffer, 0)) {
-        regexTextBufAdvance(buffer, 1);
-        if(c == '-') {
-            if(last == 0) {
-                regexCharClassSetChar(bitmap, '-');
-            } else {
-                next = regexTextBufCharPeek(buffer, 1);
-                if(next == '\0' || next == ']') {
-                    // TODO - incomplete char class range
-                    return 0;
-                }
-                regexCharClassSetRange(bitmap, last, next);
-                regexTextBufAdvance(buffer, 1);
-            }
-            last = 0;
-        } else {
-            last = c;
-            regexCharClassSetChar(bitmap, c);
-        }
-    }
-    if(c == ']') {
-        return 1;
-    }
-    // TODO - incomplete character class
     return 0;
 }
-
-regex_compile_result_t regexCompile(const char *pattern, unsigned int flags) {
-    regex_compile_result_t result;
-    text_buf_t buffer;
-    const char *p;
-    regex_instr_t *s;
-    unsigned char bitmap[32];
-    int k;
-    int c;
-    int invert;
-    int range;
-    int last;
-    int next;
-    const char *str;
-    char *frag;
-    int num;
-
-    result.status = eCompileOk;
-
-    for(regexTextBufInit(&buffer, pattern);
-        (c = regexTextBufCharGet(&buffer)) != -1;
-       ) {
-        switch(c) {
-            case '\\':
-                if((c = regexTextBufCharGet(&buffer)) == -1) {
-                    printf("ERROR: Incomplete meta char escape\n");
-                    // TODO - report incomplete escape formatted character
-                    // TODO - cleanup before bailout
-                    return result;
-                }
-                printf("{%c}", c);
-                break;
-            case '.':
-                printf("Any");
-                break;
-            case '|':
-                printf("Alt");
-                break;
-            case '?':
-                printf("ZeroOrOne");
-                break;
-            case '*':
-                printf("ZeroOrMore");
-                break;
-            case '+':
-                printf("OneOrMore");
-                break;
-            case '(':
-                printf("(");
-                if(regexTextBufCharPeek(&buffer, 1) == '?') {
-                    if(regexTextBufCharPeek(&buffer, 2) == 'i') {
-                        // Case insensitive matching for this subexpression
-                        regexTextBufAdvance(&buffer, 2);
-                        // TODO - set the case insensitive flag
-                        printf("CaseIns");
-                    } else if((regexTextBufCharPeek(&buffer, 2) == 'P') &&
-                              (regexTextBufCharPeek(&buffer, 3) == '<')) {
-                        // PCRE5 style named subexpression
-                        regexTextBufAdvance(&buffer, 3);
-                        str = regexTextBufPosGet(&buffer);
-                        for(; regexIsAlnum(regexTextBufCharPeek(&buffer, 0));
-                              regexTextBufAdvance(&buffer, 1));
-                        if((regexTextBufCharGet(&buffer) != '>') ||
-                           (regexTextBufStrLen(&buffer, str) <= 1)) {
-                            // Malformed named subexpression
-                            // TODO - report error in expression
-                            // TODO - cleanup before bailout
-                            return result;
-                        }
-                        frag = regexTextBufStrCopy(&buffer, str);
-                        printf("(<%s>", frag);
-                        free(frag);
-                    }
-                } else {
-                    printf("(");
-                }
-                break;
-
-            case ')':
-                printf(")");
-                break;
-
-            case '[':
-                if(!regexParseCharClass(&buffer, bitmap)) {
-                    return result;
-                }
-                printf("[...]");
-                break;
-
-            default:
-                str = regexTextBufPosGet(&buffer);
-                for(num = 1;
-                    !regexIsMeta(regexTextBufCharPeek(&buffer, 1));
-                    regexTextBufCharGet(&buffer));
-                if(num > 1) {
-                    frag = regexTextBufStrCopy(&buffer, str);
-                    printf("{%s}", frag);
-                    free(frag);
-                } else {
-                    printf("{%c}", c);
-                }
-                break;
-        }
-    }
-    return result;
-}
-
-
-void regexFree(regex_t *expr);
-
-re_ctx_t *regexContextInit(regex_t *expr);
-void regexContextFree(re_ctx_t *ctx);
-
-int regexSearch(re_ctx_t *ctx, const char *text);
-
-
-
-int regexGetNamedSubexprIndex(re_ctx_t *ctx, const char *name) {
-    regex_subexpr_entry_t *walk;
-
-    for(walk = ctx->expression->subexpr_names; walk != NULL; walk = walk->next) {
-        if(!strcmp(walk->name, name)) {
-            return walk->idx;
-        }
-    }
-    return 0;
-}
-
-int regexGetNamedSubexprBounds(re_ctx_t *ctx, const char *name, char **start, char **end) {
-    return regexGetSubexprBounds(ctx, regexGetNamedSubexprIndex(ctx, name), start, end);
-}
-
-int regexGetSubexprBounds(re_ctx_t *ctx, int subnum, char **start, char **end) {
-    if(!ctx->matched) {
-        return 0;
-    }
-    if(subnum == 0) {
-        if(start != NULL) {
-            *start = ctx->text;
-        }
-        if(end != NULL) {
-            *end = ctx->text + strlen(ctx->text);
-        }
-    }
-    if(subnum > ctx->expression->subexpr_count) {
-        return 0;
-    }
-    if(start != NULL) {
-        *start = ctx->subexpressions[subnum * 2];
-    }
-    if(end != NULL) {
-        *end = ctx->subexpressions[(subnum * 2) + 1];
-    }
-    return 1;
-}
-
-int regexGetNamedSubexprLen(re_ctx_t *ctx, const char *name) {
-    return regexGetSubexprLen(ctx, regexGetNamedSubexprIndex(ctx, name));
-}
-
-int regexGetSubexprLen(re_ctx_t *ctx, int subnum) {
-    int a, b;
-
-    if(!regexGetSubexprBounds(ctx, subnum, &a, &b)) {
-        return 0;
-    }
-    return (int)(b - a);
-}
-
-int regexCopySubexprValue(re_ctx_t *ctx, int subnum, char *buf, size_t buflen) {
-    int a, b;
-
-    if(!regexGetSubexprBounds(ctx, subnum, &a, &b)) {
-        buf[0] = '\0';
-        return 0;
-    }
-
-    if(buflen > (b - a)) {
-        buflen = (b - a) + 1;
-    }
-
-    memcpy(buf, ctx->subexpressions[subnum * 2], buflen);
-    return 1;
-}
-
-int regexCopyNamedSubexprValue(re_ctx_t *ctx, const char *name, char *buf, size_t buflen) {
-    return regexCopySubexprValue(ctx, regexGetNamedSubexprIndex(ctx, name), buf, buflen);
-}
-
-regex_subexpr_entry_t *reSubexprEntryCreate(const char *name, int index) {
-    regex_subexpr_entry_t *entry;
-
-    if((entry = malloc(sizeof(regex_subexpr_entry_t))) == NULL) {
-        return NULL;
-    }
-    memset(entry, 0, sizeof(regex_subexpr_entry_t));
-
-    entry->idx = index;
-    if((entry->name = strdup(name)) == NULL) {
-        free(entry);
-        return NULL;
-    }
-
-    return entry;
-}
-
-void reSubexprEntryDestroy(regex_subexpr_entry_t *entry) {
-    if(entry->name != NULL) {
-        free(entry->name);
-    }
-
-    if(entry->next != NULL) {
-        reSubexprEntryDestroy(entry->next);
-        entry->next = NULL;
-    }
-
-    free(entry);
-}
-
-#endif
 
 int main(int argc, char **argv) {
     regex_compile_ctx_t result;
