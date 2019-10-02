@@ -8,7 +8,36 @@
         - build VM implementation
         - validate regex evaluator
         - clean up and refactor
-*/
+
+The regular expression:
+
+    a(bcd(?iefg[hijk]foo)?)[0-9]+cat
+
+Should be converted into the conceptual regex VM program:
+
+1       0  char a
+(       1  save 2
+bcd     2  str bcd
+(       3  save 4
+?       4  split 5, 9
+efg     5  str efg
+[hijk]  6  class [hijk]
+foo     7  str foo
+)       8  save 5
+)       9  save 3
+[0-9]   10 class [0-9]
++       11 split 10, 12
+cat     12 str cat
+        13 match
+
+a       c(a)
+(       c(a) -> s(#)
+bcd     c(a) -> s(#) -> r(bcd)
+(       c(a) -> s(#
+
+
+
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +66,7 @@ typedef enum {
     eLexCharClass,
     eLexStringLiteral,
     eLexCharAny,
+    eLexConcatenation,
     eLexAlternative,
     eLexZeroOrOne,
     eLexZeroOrMany,
@@ -44,6 +74,11 @@ typedef enum {
     eLexSubExprStart,
     eLexSubExprEnd
 } eRegexLexeme;
+
+typedef enum {
+    eOpArityUnary,
+    eOpArityBinary
+} eRegexOpArity;
 
 typedef enum {
     eCompileOk,
@@ -325,11 +360,24 @@ struct regex_lexeme_s {
     regex_lexeme_t *next;
 };
 
-int regexLexemeCreate(regex_lexeme_t **list, eRegexLexeme lexType, int c, char *str) {
-    regex_lexeme_t *lexeme, *walk;
+int regexLexemeIsTerminal(regex_lexeme_t *lexeme) {
+    switch(lexeme->lexType) {
+        case eLexCharLiteral:
+        case eLexStringLiteral:
+        case eLexCharClass:
+        case eLexCharAny:
+        case eLexSubExprEnd:
+            return 1;
+        default:
+            return 2;
+    }
+}
+
+regex_lexeme_t *regexAllocLexeme(eRegexLexeme lexType, int c, char *str) {
+    regex_lexeme_t *lexeme;
 
     if((lexeme = malloc(sizeof(regex_lexeme_t))) == NULL) {
-        return 0;
+        return NULL;
     }
     memset(lexeme, 0, sizeof(regex_lexeme_t));
     lexeme->lexType = lexType;
@@ -338,11 +386,27 @@ int regexLexemeCreate(regex_lexeme_t **list, eRegexLexeme lexType, int c, char *
     } else {
         lexeme->c = c;
     }
+    return lexeme;
+}
+
+int regexLexemeCreate(regex_lexeme_t **list, eRegexLexeme lexType, int c, char *str) {
+    regex_lexeme_t *lexeme, *walk;
+
+    if((lexeme = regexAllocLexeme(lexType, c, str)) == NULL) {
+        return 0;
+    }
 
     if(*list == NULL) {
         *list = lexeme;
     } else {
         for(walk = *list; walk->next != NULL; walk = walk->next);
+        if(regexLexemeIsTerminal(lexeme) && regexLexemeIsTerminal(walk)) {
+            // Two adjacent terminals have an implicit concatenation
+            if((walk->next = regexAllocLexeme(eLexConcatenation, 0, NULL)) == NULL) {
+                return 0;
+            }
+            walk = walk->next;
+        }
         walk->next = lexeme;
     }
 
@@ -366,6 +430,45 @@ void regexLexemeDestroy(regex_lexeme_t *instr) {
     }
 }
 
+void regexLexemePrint(regex_lexeme_t *lexeme) {
+    int j;
+
+    switch(lexeme->lexType) {
+        case eLexCharLiteral:
+            printf("CHAR(%c)\n", lexeme->c);
+            break;
+        case eLexCharClass:
+            printf("CLASS[");
+            regexPrintCharClass(lexeme->str);
+            printf("]\n");
+            break;
+        case eLexStringLiteral:
+            printf("STRING(\"%s\")\n", lexeme->str);
+            break;
+        case eLexCharAny:
+            printf("ANY\n");
+            break;
+        case eLexConcatenation,
+        case eLexAlternative,
+        case eLexZeroOrOne,
+        case eLexZeroOrMany,
+        case eLexOneOrMany,
+        case eLexSubExprStart:
+            if(lexeme->str != NULL) {
+                printf("SUBEXPR #%d <%s>\n", lexeme->c, lexeme->str);
+            } else {
+                printf("SUBEXPR #%d\n", lexeme->c);
+            }
+            break;
+        case eLexSubExprEnd:
+            printf("SUBEXPR #%d END\n", lexeme->c);
+            break;
+        default:
+            printf("UNKNOWN! <%d>\n", lexeme->lexType);
+            break;
+    }
+}
+
 typedef struct regex_compile_ctx_s regex_compile_ctx_t;
 struct regex_compile_ctx_s {
     eRegexCompileStatus status;
@@ -373,7 +476,9 @@ struct regex_compile_ctx_s {
     int position;
 };
 
-#define SET_RESULT(res,stat,ptr)  res.status = stat; res.position = ptr - res.pattern;
+//#define SET_RESULT(res,stat,ptr)  res.status = stat; res.position = ptr - res.pattern;
+
+#define SET_RESULT(stat)  result.status = stat; result.position = pattern - result.pattern; goto compileFailure;
 
 // Return a compiled regex, or an error and position within the pattern
 regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
@@ -394,44 +499,38 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
     for(; *pattern != '\0';) {
         c = regexGetNextPatternChar(&pattern);
         if(c.c == -1) {
-            SET_RESULT(result, eCompileEscapeCharIncomplete, pattern);
-            return result;
+            SET_RESULT(eCompileEscapeCharIncomplete);
         }
 
         if(!c.escaped) {
             switch(c.c) {
                 case '.':
                     if(!regexLexemeCreate(&program, eLexCharAny, 0, 0)) {
-                        SET_RESULT(result, eCompileOutOfMem, pattern);
-                        return result;
+                        SET_RESULT(eCompileOutOfMem);
                     }
                     printf("Any\n");
                     continue;
                 case '|':
                     if(!regexLexemeCreate(&program, eLexAlternative, 0, 0)) {
-                        SET_RESULT(result, eCompileOutOfMem, pattern);
-                        return result;
+                        SET_RESULT(eCompileOutOfMem);
                     }
                     printf("Alt\n");
                     continue;
                 case '?':
                     if(!regexLexemeCreate(&program, eLexZeroOrOne, 0, 0)) {
-                        SET_RESULT(result, eCompileOutOfMem, pattern);
-                        return result;
+                        SET_RESULT(eCompileOutOfMem);
                     }
                     printf("ZeroOrOne\n");
                     continue;
                 case '*':
                     if(!regexLexemeCreate(&program, eLexZeroOrMany, 0, 0)) {
-                        SET_RESULT(result, eCompileOutOfMem, pattern);
-                        return result;
+                        SET_RESULT(eCompileOutOfMem);
                     }
                     printf("ZeroOrMore\n");
                     continue;
                 case '+':
                     if(!regexLexemeCreate(&program, eLexOneOrMany, 0, 0)) {
-                        SET_RESULT(result, eCompileOutOfMem, pattern);
-                        return result;
+                        SET_RESULT(eCompileOutOfMem);
                     }
                     printf("OneOrMore\n");
                     continue;
@@ -446,49 +545,40 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
                         } else if(regexCheckNextPatternChar(&pattern, 'P')) {
                             // Named sub expression
                             if(!regexCheckNextPatternChar(&pattern, '<')) {
-                                SET_RESULT(result, eCompileMalformedSubExprName, pattern);
-                                return result;
+                                SET_RESULT(eCompileMalformedSubExprName);
                             }
                             len = regexGetSubexpressionNameLen(&pattern);
                             if(len == -1) {
-                                SET_RESULT(result, eCompileMalformedSubExprName, pattern);
-                                return result;
+                                SET_RESULT(eCompileMalformedSubExprName);
                             }
                             if((str = regexGetSubexpressionName(&pattern, len)) == NULL) {
-                                SET_RESULT(result, eCompileOutOfMem, pattern);
-                                return result;
+                                SET_RESULT(eCompileOutOfMem);
                             }
                             printf("[%s]", str);
                         } else {
-                            SET_RESULT(result, eCompileUnsupportedMeta, pattern);
-                            return result;
+                            SET_RESULT(eCompileUnsupportedMeta);
                         }
                     }
                     if(!regexLexemeCreate(&program, eLexSubExprStart, 0, str)) {
-                        SET_RESULT(result, eCompileOutOfMem, pattern);
-                        return result;
+                        SET_RESULT(eCompileOutOfMem);
                     }
                     printf("({%d}\n", subexpr);
                     continue;
                 case ')':
                     if(!regexLexemeCreate(&program, eLexSubExprEnd, 0, 0)) {
-                        SET_RESULT(result, eCompileOutOfMem, pattern);
-                        return result;
+                        SET_RESULT(eCompileOutOfMem);
                     }
                     printf(")\n");
                     continue;
                 case '[':
                     if((status = regexParseCharClass(&pattern, bitmap)) != eCompileOk) {
-                        SET_RESULT(result, status, pattern);
-                        return result;
+                        SET_RESULT(status);
                     }
                     if((str = (char *)mapCopy(bitmap)) == NULL) {
-                        SET_RESULT(result, eCompileOutOfMem, pattern);
-                        return result;
+                        SET_RESULT(eCompileOutOfMem);
                     }
                     if(!regexLexemeCreate(&program, eLexCharClass, 0, str)) {
-                        SET_RESULT(result, eCompileOutOfMem, pattern);
-                        return result;
+                        SET_RESULT(eCompileOutOfMem);
                     }
                     printf("CharClass(");
                     regexPrintCharClass(bitmap);
@@ -503,8 +593,7 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
         // Regular character
         switch(len = regexGetPatternStrLen(&pattern)) {
             case -1:
-                SET_RESULT(result, eCompileEscapeCharIncomplete, pattern);
-                return result;
+                SET_RESULT(eCompileEscapeCharIncomplete);
             case 0:
                 if(c.escaped) {
                     switch(c.c) {
@@ -519,8 +608,7 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
                     printf("CHAR(%c)\n", c.c);
                 }
                 if(!regexLexemeCreate(&program, eLexCharLiteral, character, 0)) {
-                    SET_RESULT(result, eCompileOutOfMem, pattern);
-                    return result;
+                    SET_RESULT(eCompileOutOfMem);
                 }
                 break;
             default:
@@ -530,16 +618,20 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
                 }
                 pattern--;
                 if((str = regexGetPatternStr(&pattern, len)) == NULL) {
-                    SET_RESULT(result, eCompileOutOfMem, pattern);
-                    return result;
+                    SET_RESULT(eCompileOutOfMem);
                 }
                 if(!regexLexemeCreate(&program, eLexStringLiteral, 0, str)) {
-                    SET_RESULT(result, eCompileOutOfMem, pattern);
-                    return result;
+                    SET_RESULT(eCompileOutOfMem);
                 }
                 printf("STRING(\"%s\")\n", str);
         }
     }
+
+    return result;
+
+compileFailure:
+    // TODO - cleanup
+
     return result;
 }
 
