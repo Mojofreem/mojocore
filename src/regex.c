@@ -9,6 +9,10 @@
         - validate regex evaluator
         - clean up and refactor
 
+        - compiler
+        - parser
+        - code generator (compiler -> c)
+
 The regular expression:
 
     a(bcd(?iefg[hijk]foo)?)[0-9]+cat
@@ -30,14 +34,50 @@ foo     7  str foo
 cat     12 str cat
         13 match
 
-a       c(a)
-(       c(a) -> s(#)
-bcd     c(a) -> s(#) -> r(bcd)
-(       c(a) -> s(#
+if current is
+    c,s,cl,.,ss
+and previous was
+    c,s,cl,.,se
+
+For the expression:
+
+    a(bcd(?iefg[hijk]foo)?)[0-9]+cat
+
+The base token stream is (infix):
+
+    c(a) ( s(bcd) ( s(efg) cl(hijk) s(foo) ) ? ) cl(0-9) + s(cat)
+
+c(a) -> save(2) -> split -> s(bcd) -> save(4) -> s(efg) -> cl(hijk) -> s(foo) -> save(5) -> save(3) -> cl(0-9) -> split -> s(cat)
+                     |                                                                                    ^          |
+                     +----------------------------------------------------------------------------------->|<---------+
+
+With implied concatenation (#) operators:
+
+    c(a) # ( s(bcd) # ( s(efg) # cl(hijk) # s(foo) ) ? ) # cl(0-9) + # s(cat)
+
+    1   c(a)        c(a)
+    2   #           c(a)                                                                            #
+    3   (           c(a)                                                                            # (
+    4   s(bcd)      c(a) s(bcd)                                                                     # (
+    5   #           c(a) s(bcd)                                                                     # ( #
+    6   (           c(a) s(bcd)                                                                     # ( # (
+    7   s(efg)      c(a) s(bcd) s(efg)                                                              # ( # (
+    8   #           c(a) s(bcd) s(efg)                                                              # ( # ( #
+    9   cl(hijk)    c(a) s(bcd) s(efg) cl(hijk)                                                     # ( # ( #
+    10  #           c(a) s(bcd) s(efg) cl(hijk)                                                     # ( # ( # #
+    11  s(foo)      c(a) s(bcd) s(efg) cl(hijk) s(foo)                                              # ( # ( # #
+    12  )           c(a) s(bcd) g([s(efg) [cl(hijk) s(foo)]])                                       # ( #
+    13  ?           c(a) s(bcd) g([s(efg) [cl(hijk) s(foo)]])                                       # ( # ?
+    14  )           c(a) g([s(bcd) opt(g([s(efg) [cl(hijk) s(foo)]]))])                             #
+    15  #           c(a) g([s(bcd) opt(g([s(efg) [cl(hijk) s(foo)]]))])                             # #
+    16  cl(0-9)     c(a) g([s(bcd) opt(g([s(efg) [cl(hijk) s(foo)]]))]) cl(0-9)                     # #
+    17  +           c(a) g([s(bcd) opt(g([s(efg) [cl(hijk) s(foo)]]))]) cl(0-9)                     # # +
+    18  #           c(a) g([s(bcd) opt(g([s(efg) [cl(hijk) s(foo)]]))]) many(cl(0-9))               # # #
+    19  s(cat)      c(a) g([s(bcd) opt(g([s(efg) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9))        # # #
+    20  <DONE>      [c(a) [g([s(bcd) opt(g([s(efg) [cl(hijk) s(foo)]]))]) [s(cat) many(cl(0-9))]]]
 
 
-
- */
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +102,7 @@ typedef enum {
 } eRegexOpCode;
 
 typedef enum {
+    eLexNone,
     eLexCharLiteral,
     eLexCharClass,
     eLexStringLiteral,
@@ -74,6 +115,13 @@ typedef enum {
     eLexSubExprStart,
     eLexSubExprEnd
 } eRegexLexeme;
+
+typedef enum {
+    ePriorityNone,
+    ePriorityLow,
+    ePriorityMedium,
+    ePriorityHigh
+} eRegexLexemePriority;
 
 typedef enum {
     eOpArityUnary,
@@ -330,7 +378,60 @@ char *regexGetSubexpressionName(const char **pattern, int len) {
         ptr++;
     }
     *ptr = '\0';
+
+    // Discard the trailing '>' delimiter
+    (*pattern)++;
+
     return str;
+}
+
+typedef struct regex_subexpr_name_s regex_subexpr_name_t;
+struct regex_subexpr_name_s {
+    char *name;
+    int index;
+    regex_subexpr_name_t *next;
+};
+
+int regexSubexprLookupEntryAdd(regex_subexpr_name_t **list, char *name, int index) {
+    regex_subexpr_name_t *entry;
+
+    if((entry = malloc(sizeof(regex_subexpr_name_t))) == NULL) {
+        return 0;
+    }
+    memset(entry, 0, sizeof(regex_subexpr_name_t));
+    entry->name = name;
+    entry->index = index;
+    entry->next = *list;
+    *list = entry;
+    return 1;
+}
+
+void regexSubexprLookupFree(regex_subexpr_name_t *list) {
+    regex_subexpr_name_t *next;
+
+    for(; list != NULL; list = next) {
+        next = list->next;
+        free(list->name);
+        free(list);
+    }
+}
+
+int regexSubexprLookupIndex(regex_subexpr_name_t *list, const char *name) {
+    for(; list != NULL; list = list->next) {
+        if(!strcasecmp(list->name, name)) {
+            return list->index;
+        }
+    }
+    return 0;
+}
+
+const char *regexSubexprLookupName(regex_subexpr_name_t *list, int index) {
+    for(; list != NULL; list = list->next) {
+        if(list->index == index) {
+            return list->name;
+        }
+    }
+    return NULL;
 }
 
 void regexPrintCharClass(unsigned char *bitmap) {
@@ -357,19 +458,24 @@ struct regex_lexeme_s {
         int c;
         char *str;
     };
+    regex_lexeme_t *outl;
+    regex_lexeme_t *outr;
     regex_lexeme_t *next;
 };
 
-int regexLexemeIsTerminal(regex_lexeme_t *lexeme) {
+int regexLexemeIsTerminal(regex_lexeme_t *lexeme, int preceeding) {
     switch(lexeme->lexType) {
         case eLexCharLiteral:
         case eLexStringLiteral:
         case eLexCharClass:
         case eLexCharAny:
-        case eLexSubExprEnd:
             return 1;
+        case eLexSubExprEnd:
+            return preceeding;
+        case eLexSubExprStart:
+            return !preceeding;
         default:
-            return 2;
+            return 0;
     }
 }
 
@@ -400,12 +506,14 @@ int regexLexemeCreate(regex_lexeme_t **list, eRegexLexeme lexType, int c, char *
         *list = lexeme;
     } else {
         for(walk = *list; walk->next != NULL; walk = walk->next);
-        if(regexLexemeIsTerminal(lexeme) && regexLexemeIsTerminal(walk)) {
+        if(regexLexemeIsTerminal(lexeme, 0) && regexLexemeIsTerminal(walk, 1)) {
             // Two adjacent terminals have an implicit concatenation
             if((walk->next = regexAllocLexeme(eLexConcatenation, 0, NULL)) == NULL) {
                 return 0;
             }
             walk = walk->next;
+        } else {
+            printf("No concat for %d and %d\n", walk->lexType, lexeme->lexType);
         }
         walk->next = lexeme;
     }
@@ -430,8 +538,8 @@ void regexLexemeDestroy(regex_lexeme_t *instr) {
     }
 }
 
-void regexLexemePrint(regex_lexeme_t *lexeme) {
-    int j;
+void regexLexemePrint(regex_lexeme_t *lexeme, regex_subexpr_name_t *subexpr) {
+    const char *str;
 
     switch(lexeme->lexType) {
         case eLexCharLiteral:
@@ -439,7 +547,7 @@ void regexLexemePrint(regex_lexeme_t *lexeme) {
             break;
         case eLexCharClass:
             printf("CLASS[");
-            regexPrintCharClass(lexeme->str);
+            regexPrintCharClass((unsigned char *)(lexeme->str));
             printf("]\n");
             break;
         case eLexStringLiteral:
@@ -448,14 +556,25 @@ void regexLexemePrint(regex_lexeme_t *lexeme) {
         case eLexCharAny:
             printf("ANY\n");
             break;
-        case eLexConcatenation,
-        case eLexAlternative,
-        case eLexZeroOrOne,
-        case eLexZeroOrMany,
-        case eLexOneOrMany,
+        case eLexConcatenation:
+            printf("CONCAT\n");
+            break;
+        case eLexAlternative:
+            printf("ALTERNATIVE\n");
+            break;
+        case eLexZeroOrOne:
+            printf("ZERO_OR_ONE\n");
+            break;
+        case eLexZeroOrMany:
+            printf("ZERO_OR_MANY\n");
+            break;
+        case eLexOneOrMany:
+            printf("ONE_OR_MANY\n");
+            break;
         case eLexSubExprStart:
-            if(lexeme->str != NULL) {
-                printf("SUBEXPR #%d <%s>\n", lexeme->c, lexeme->str);
+            str = regexSubexprLookupName(subexpr, lexeme->c);
+            if(str != NULL) {
+                printf("SUBEXPR #%d <%s>\n", lexeme->c, str);
             } else {
                 printf("SUBEXPR #%d\n", lexeme->c);
             }
@@ -467,6 +586,173 @@ void regexLexemePrint(regex_lexeme_t *lexeme) {
             printf("UNKNOWN! <%d>\n", lexeme->lexType);
             break;
     }
+}
+
+void regexLexemeChainPrint(regex_lexeme_t *lexeme, regex_subexpr_name_t *subexpr) {
+    for(; lexeme != NULL; lexeme = lexeme->next) {
+        regexLexemePrint(lexeme, subexpr);
+    }
+}
+
+void stackPush(regex_lexeme_t **stack, regex_lexeme_t *instr) {
+    if(*stack == NULL) {
+        *stack = instr;
+        instr->next = NULL;
+        return;
+    }
+    instr->next = *stack;
+    *stack = instr;
+}
+
+regex_lexeme_t *stackPop(regex_lexeme_t **stack) {
+    regex_lexeme_t *entry;
+
+    if(*stack == NULL) {
+        return NULL;
+    }
+    entry = *stack;
+    *stack = entry->next;
+    return entry;
+}
+
+eRegexLexeme stackPeekType(regex_lexeme_t *stack) {
+    if(stack == NULL) {
+        return eLexNone;
+    }
+    return stack->lexType;
+}
+
+eRegexLexemePriority regexGetLexemeTypePriority(eRegexLexeme lexType) {
+    switch(lexType) {
+        case eLexCharLiteral:
+        case eLexCharClass:
+        case eLexStringLiteral:
+        case eLexCharAny:
+        default:
+            return ePriorityNone;
+
+        case eLexZeroOrOne:
+        case eLexZeroOrMany:
+        case eLexOneOrMany:
+            return ePriorityHigh;
+
+        case eLexConcatenation:
+        case eLexAlternative:
+            return ePriorityMedium;
+
+        case eLexSubExprStart:
+        case eLexSubExprEnd:
+            return ePriorityLow;
+    }
+}
+
+int regexStackTypeGreaterOrEqualToLexeme(regex_lexeme_t *stack, regex_lexeme_t *lexeme) {
+    eRegexLexemePriority stackPriority;
+
+    stackPriority = regexGetLexemeTypePriority(stackPeekType(stack));
+    return (stackPriority >= regexGetLexemeTypePriority(lexeme->lexType));
+}
+
+int regexGetOperatorArity(regex_lexeme_t *lexeme) {
+    switch(lexeme->lexType) {
+        case eLexZeroOrOne:
+        case eLexZeroOrMany:
+        case eLexOneOrMany:
+            return 1;
+        case eLexConcatenation:
+        case eLexAlternative:
+            return 2;
+        default:
+            return 0;
+    }
+}
+
+int regexApplyOperator(regex_lexeme_t **operands, regex_lexeme_t *operator) {
+    int arity = regexGetOperatorArity(operator);
+    operator->next = NULL;
+    if((operator->outl = stackPop(operands)) == NULL) {
+        printf("ERROR: Missing operand 1 for operator\n");
+        return 0;
+    }
+    if(arity > 1) {
+        operator->outr = operator->outl;
+        if((operator->outl = stackPop(operands)) == NULL) {
+            printf("ERROR: Missing operand 2 for operator\n");
+            return 0;
+        }
+    }
+    stackPush(operands, operator);
+    return 1;
+}
+
+int regexShuntingYard(regex_lexeme_t **program, regex_subexpr_name_t *list) {
+    printf("----------\n");
+
+    regexLexemeChainPrint(*program, list);
+
+    printf("----------\n");
+
+    regex_lexeme_t *operands = NULL, *operators = NULL, *lexeme, *next, *operator;
+
+    for(lexeme = *program; lexeme != NULL; lexeme = next) {
+        next = lexeme->next;
+        lexeme->next = NULL;
+
+        switch(lexeme->lexType) {
+            case eLexCharLiteral:
+            case eLexCharClass:
+            case eLexStringLiteral:
+            case eLexCharAny:
+                stackPush(&operands, lexeme);
+                break;
+
+            case eLexZeroOrOne:
+            case eLexZeroOrMany:
+            case eLexOneOrMany:
+            case eLexConcatenation:
+            case eLexAlternative:
+                while(regexStackTypeGreaterOrEqualToLexeme(operators, lexeme)) {
+                    operator = stackPop(&operators);
+                    if(!regexApplyOperator(&operands, operator)) {
+                        return 0;
+                    }
+                }
+                stackPush(&operators, lexeme);
+                break;
+
+            case eLexSubExprStart:
+                stackPush(&operators, lexeme);
+                break;
+
+            case eLexSubExprEnd:
+                while(stackPeekType(operators) != eLexSubExprStart) {
+                    if((operator = stackPop(&operators)) == NULL) {
+                        printf("ERROR: Unable to find subexpression start token!\n");
+                        return 0;
+                    }
+                    if(!regexApplyOperator(&operands, operator)) {
+                        return 0;
+                    }
+                }
+                // Pop and discard the closing subexpr end token
+                stackPop(&operators);
+                break;
+
+            default:
+                printf("ERROR: Unknown lexeme token [%d]\n", lexeme->lexType);
+                return 0;
+        }
+    }
+
+    while((operator = stackPop(&operators)) != NULL) {
+        if(!regexApplyOperator(&operands, operator)) {
+            return 0;
+        }
+    }
+
+    printf("INFO: Apparent success\n");
+    
+    return 1;
 }
 
 typedef struct regex_compile_ctx_s regex_compile_ctx_t;
@@ -495,6 +781,7 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
     eRegexCompileStatus status;
     int subexpr = 0;
     regex_lexeme_t *program = NULL;
+    regex_subexpr_name_t *subexpr_list = NULL;
 
     for(; *pattern != '\0';) {
         c = regexGetNextPatternChar(&pattern);
@@ -559,10 +846,13 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
                             SET_RESULT(eCompileUnsupportedMeta);
                         }
                     }
-                    if(!regexLexemeCreate(&program, eLexSubExprStart, 0, str)) {
+                    if(str != NULL) {
+                        regexSubexprLookupEntryAdd(&subexpr_list, str, subexpr);
+                    }
+                    if(!regexLexemeCreate(&program, eLexSubExprStart, subexpr, NULL)) {
                         SET_RESULT(eCompileOutOfMem);
                     }
-                    printf("({%d}\n", subexpr);
+                    printf("({%d%s%s}\n", subexpr, (str != NULL ? ":" : ""), (str != NULL ? str : ""));
                     continue;
                 case ')':
                     if(!regexLexemeCreate(&program, eLexSubExprEnd, 0, 0)) {
@@ -626,6 +916,14 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
                 printf("STRING(\"%s\")\n", str);
         }
     }
+
+    // Attempt to convert to infix form
+
+    regexShuntingYard(&program, subexpr_list);
+
+    regexLexemeDestroy(program);
+    regexSubexprLookupFree(subexpr_list);
+    program = NULL;
 
     return result;
 
