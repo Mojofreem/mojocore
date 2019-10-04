@@ -150,19 +150,21 @@ With implied concatenation (#) operators:
     6   (           c(a) s(bcd)                                                                             # ( # (
     7   s(efg)      c(a) s(bcd) s(efg)                                                                      # ( # (
     8   *           c(a) s(bcd) s(efg)                                                                      # ( # ( *
-    9   #           c(a) s(bcd) kleene(l->s(efg) r->0)                                                              # ( # ( #
-    10   cl(hijk)   c(a) s(bcd) kleene(l->s(efg) r->0) cl(hijk)                                                    # ( # ( #
-    11  #           c(a) s(bcd) kleene(l->s(efg) r->0) cl(hijk)                                                     # ( # ( # #
-    12  s(foo)      c(a) s(bcd) kleene(l->s(efg) r->0) cl(hijk) s(foo)                                              # ( # ( # #
-    13  )           c(a) s(bcd) g([kleene(l->s(efg) r->0) [cl(hijk) s(foo)]])                                       # ( #
-    14  ?           c(a) s(bcd) g([kleene(l->s(efg) r->0) [cl(hijk) s(foo)]])                                       # ( # ?
+    9   #           c(a) s(bcd) s(efg) kleene                                                               # ( # ( #
+    10  cl(hijk)    c(a) s(bcd) s(efg) kleene cl(hijk)                                                    # ( # ( #
+    11  #           c(a) s(bcd) s(efg) kleene cl(hijk)                                                     # ( # ( # #
+    12  s(foo)      c(a) s(bcd) s(efg) kleene cl(hijk) s(foo)                                              # ( # ( # #
+    13  )           c(a) s(bcd) g([kleene(s(efg)) [cl(hijk) s(foo)]])                                       # ( #
+    14  ?           c(a) s(bcd) g([kleene(s(efg)) [cl(hijk) s(foo)]])                                       # ( # ?
     15  )           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))])                             #
     16  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))])                             # #
     17  cl(0-9)     c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) cl(0-9)                     # #
     18  +           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) cl(0-9)                     # # +
     19  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) many(cl(0-9))               # # #
     20  s(cat)      c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9))        # # #
-    21  <DONE>      [c(a) [g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) [s(cat) many(cl(0-9))]]]
+    21  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9))        # # # #
+    21  <DONE>      c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9)) <DONE> # # # #
+    22              [c(a) [g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) [s(cat) [many(cl(0-9)) <DONE>]]]]
 
  */
 
@@ -170,7 +172,6 @@ With implied concatenation (#) operators:
 #include <stdlib.h>
 #include <string.h>
 
-#define TOKEN_STACK_DEPTH   1000
 
 typedef enum {
     eReNone,
@@ -201,11 +202,6 @@ typedef enum {
 } eRegexLexemePriority;
 
 typedef enum {
-    eOpArityUnary,
-    eOpArityBinary
-} eRegexOpArity;
-
-typedef enum {
     eCompileOk,
     eCompileCharClassRangeIncomplete,
     eCompileCharClassIncomplete,
@@ -214,6 +210,21 @@ typedef enum {
     eCompileUnsupportedMeta,
     eCompileOutOfMem
 } eRegexCompileStatus;
+
+const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
+    switch(status) {
+        case eCompileOk: return "compiled successfully";
+        case eCompileCharClassRangeIncomplete: return "char class range is incomplete";
+        case eCompileCharClassIncomplete: return "char class definition is incomplete";
+        case eCompileEscapeCharIncomplete: return "escape character is incomplete";
+        case eCompileMalformedSubExprName: return "subexpression name is malformed";
+        case eCompileUnsupportedMeta: return "expression uses an unsupported meta character";
+        case eCompileOutOfMem: return "out of memory";
+        default: return "Unknown failure";
+    }
+}
+
+// Character parsing, assists with escaped chars ////////////////////////////
 
 typedef struct character_s character_t;
 struct character_s {
@@ -273,6 +284,8 @@ int regexIsMeta(int c) {
             (c == '+') || (c == '(') || (c == '[') || (c == ')'));
 }
 
+// String literal parsing handlers //////////////////////////////////////////
+
 int regexGetPatternStrLen(const char **pattern) {
     const char *orig = *pattern;
     int count = 0;
@@ -325,6 +338,10 @@ char *regexGetPatternStr(const char **pattern, int len) {
     *ptr = '\0';
     return str;
 }
+
+// Character class parsing handlers /////////////////////////////////////////
+
+// Note: character classes are stored as 32 byte bitmaps (unsigned char bitmap[32];)
 
 void mapClear(unsigned char *bitmap) {
     memset(bitmap, 0, 32);
@@ -426,29 +443,55 @@ eRegexCompileStatus regexParseCharClass(const char **pattern, unsigned char *bit
     return eCompileOk;
 }
 
-int regexGetSubexpressionNameLen(const char **pattern) {
-    int c;
+void regexPrintCharClass(unsigned char *bitmap) {
     int k;
+    int run;
 
-    for(k = 0; (*pattern)[k] != '>' && (*pattern)[k] != '\0'; k++) {
-        if(!regexIsAlnum((*pattern)[k])) {
+    for(k = 0; k < 256; k++) {
+        if(mapCheck(bitmap, k)) {
+            for(run = k + 1; run < 256 && mapCheck(bitmap, run); run++);
+            run--;
+            printf("%c", ((k < 32) || (k > 127)) ? '.' : k);
+            if(run - k > 3) {
+                printf("-%c", ((run < 32) || (run > 127)) ? '.' : run);
+                k = run;
+            }
+        }
+    }
+}
+
+// Subexpression name table /////////////////////////////////////////////////
+
+typedef struct regex_subexpr_name_s regex_subexpr_name_t;
+struct regex_subexpr_name_s {
+    int index;
+    regex_subexpr_name_t *next;
+    char name[0];
+};
+
+// Parses the subexpression name pointed to by pattern, creates a
+// subexpression name lookup entry, and adds it to the subexpression name list.
+// Returns 1 on success, 0 on out of memory, and -1 if the name is malformed.
+int regexSubexprLookupEntryCreate(regex_subexpr_name_t **list, const char **pattern, int index) {
+    regex_subexpr_name_t *entry;
+    char *ptr;
+    int len;
+
+    for(len = 0; (*pattern)[len] != '>' && (*pattern)[len] != '\0'; len++) {
+        if(!regexIsAlnum((*pattern)[len])) {
             return -1;
         }
     }
-    if(k == 0) {
+    if(len == 0) {
         return -1;
     }
-    return k;
-}
 
-char *regexGetSubexpressionName(const char **pattern, int len) {
-    char *str, *ptr;
-    int k;
-
-    if((str = malloc(len + 1)) == NULL) {
-        return NULL;
+    if((entry = malloc(sizeof(regex_subexpr_name_t) + len + 1)) == NULL) {
+        return 0;
     }
-    ptr = str;
+    memset(entry, 0, sizeof(regex_subexpr_name_t));
+
+    ptr = entry->name;
     for(; len; len--) {
         *ptr = **pattern;
         (*pattern)++;
@@ -459,27 +502,10 @@ char *regexGetSubexpressionName(const char **pattern, int len) {
     // Discard the trailing '>' delimiter
     (*pattern)++;
 
-    return str;
-}
-
-typedef struct regex_subexpr_name_s regex_subexpr_name_t;
-struct regex_subexpr_name_s {
-    char *name;
-    int index;
-    regex_subexpr_name_t *next;
-};
-
-int regexSubexprLookupEntryAdd(regex_subexpr_name_t **list, char *name, int index) {
-    regex_subexpr_name_t *entry;
-
-    if((entry = malloc(sizeof(regex_subexpr_name_t))) == NULL) {
-        return 0;
-    }
-    memset(entry, 0, sizeof(regex_subexpr_name_t));
-    entry->name = name;
     entry->index = index;
     entry->next = *list;
     *list = entry;
+
     return 1;
 }
 
@@ -488,7 +514,7 @@ void regexSubexprLookupFree(regex_subexpr_name_t *list) {
 
     for(; list != NULL; list = next) {
         next = list->next;
-        free(list->name);
+        //free(list->name);
         free(list);
     }
 }
@@ -511,22 +537,8 @@ const char *regexSubexprLookupName(regex_subexpr_name_t *list, int index) {
     return NULL;
 }
 
-void regexPrintCharClass(unsigned char *bitmap) {
-    int k;
-    int run;
+// Lexeme management functions //////////////////////////////////////////////
 
-    for(k = 0; k < 256; k++) {
-        if(mapCheck(bitmap, k)) {
-            for(run = k + 1; run < 256 && mapCheck(bitmap, run); run++);
-            run--;
-            printf("%c", ((k < 32) || (k > 127)) ? '.' : k);
-            if(run - k > 3) {
-                printf("-%c", ((run < 32) || (run > 127)) ? '.' : run);
-                k = run;
-            }
-        }
-    }
-}
 
 typedef struct regex_lexeme_s regex_lexeme_t;
 struct regex_lexeme_s {
@@ -1048,14 +1060,283 @@ int regexShuntingYard(regex_lexeme_t **program, regex_subexpr_name_t *list) {
     return 1;
 }
 
+// NFA form regex support ///////////////////////////////////////////////////
+
+typedef struct regex_state_s regex_state_t;
+struct regex_state_s {
+    eRegexOpCode opcode;
+    union {
+        int c;
+        char *str;
+        unsigned char *bitmap;
+        int group;
+    };
+    regex_state_t *out_a;
+    regex_state_t *out_b;
+};
+
+typedef struct regex_ptrlist_s regex_ptrlist_t;
+struct regex_ptrlist_s {
+    regex_state_t **out;
+    regex_ptrlist_t *next;
+};
+
+typedef struct regex_fragment_s regex_fragment_t;
+struct regex_fragment_s {
+    regex_state_t *state;
+    regex_ptrlist_t *ptrlist;
+    regex_fragment_t *next;
+};
+
+regex_state_t *regexStateCreate(eRegexOpCode opcode, int c, char *str, regex_state_t *out_a, regex_state_t *out_b) {
+    regex_state_t *state;
+
+    if((state = malloc(sizeof(regex_state_t))) == NULL) {
+        return NULL;
+    }
+    memset(state, 0, sizeof(regex_state_t));
+    state->opcode = opcode;
+    if(str != NULL) {
+        state->str = str;
+    } else {
+        state->c = c;
+    }
+    state->out_a = out_a;
+    state->out_b = out_b;
+    return state;
+}
+
+regex_state_t *regexStateCharCreate(int c) {
+    return regexStateCreate(eCharLiteral, c, NULL, NULL, NULL);
+}
+
+regex_state_t *regexStateCharClassCreate(unsigned char *bitmap) {
+    return regexStateCreate(eCharClass, 0, (char *)bitmap, NULL, NULL);
+}
+
+regex_state_t *regexStateStringCreate(char *str) {
+    return regexStateCreate(eStringLiteral, 0, str, NULL, NULL);
+}
+
+regex_state_t *regexStateAnyCreate(void) {
+    return regexStateCreate(eCharAny, 0, NULL, NULL, NULL);
+}
+
+regex_state_t *regexStateSplitCreate(regex_state_t *out_a, regex_state_t *out_b) {
+    return regexStateCreate(eSplit, 0, NULL, out_a, out_b);
+}
+
+regex_fragment_t *regexFragmentCreate(regex_state_t *state, regex_ptrlist_t *list) {
+    regex_fragment_t *fragment;
+
+    if((fragment = malloc(sizeof(regex_fragment_t))) == NULL) {
+        return NULL;
+    }
+    memset(fragment, 0, sizeof(regex_fragment_t));
+    fragment->state = state;
+    fragment->ptrlist = list;
+    return fragment;
+}
+
+regex_ptrlist_t *regexPtrlistCreate(regex_state_t **state) {
+    regex_ptrlist_t *entry;
+
+    if((entry = malloc(sizeof(regex_ptrlist_t))) == NULL) {
+        return NULL;
+    }
+    memset(entry, 0, sizeof(regex_ptrlist_t));
+    entry->out = state;
+    return entry;
+}
+
+regex_ptrlist_t *regexPtrlistAppend(regex_ptrlist_t *lista, regex_ptrlist_t *listb) {
+    regex_ptrlist_t *walk;
+
+    if(lista == NULL) {
+        return listb;
+    }
+    if(listb == NULL) {
+        return lista;
+    }
+
+    for(walk = lista; walk->next != NULL; walk = walk->next);
+    walk->next = listb;
+    return lista;
+}
+
+void regexPtrlistPatch(regex_ptrlist_t *list, regex_state_t *state) {
+    for(; list != NULL; list = list->next) {
+        *(list->out) = state;
+    }
+}
+
+void regexFragmentStackPush(regex_fragment_t **stack, regex_fragment_t *fragment) {
+    fragment->next = *stack;
+    *stack = fragment;
+}
+
+regex_fragment_t *regexFragmentStackPop(regex_fragment_t **stack) {
+    regex_fragment_t *fragment;
+    fragment = *stack;
+    if(fragment != NULL) {
+        *stack = fragment->next;
+    }
+    return fragment;
+}
+
+regex_state_t *regexBuildNFAFromPostfixForm(regex_lexeme_t *lexeme) {
+    regex_fragment_t *stack = NULL, *e1, *e2;
+    regex_state_t *state;
+
+    for(; lexeme != NULL; lexeme = lexeme->next) {
+        switch(lexeme->lexType) {
+            case eLexCharLiteral:
+                state = regexStateCharCreate(lexeme->c);
+                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistCreate(&(state->out_a))));
+                break;
+
+            case eLexCharClass:
+                state = regexStateCharClassCreate((unsigned char *)lexeme->str);
+                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistCreate(&(state->out_a))));
+                break;
+
+            case eLexStringLiteral:
+                state = regexStateStringCreate(lexeme->str);
+                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistCreate(&(state->out_a))));
+                break;
+
+            case eLexCharAny:
+                state = regexStateAnyCreate();
+                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistCreate(&(state->out_a))));
+                break;
+
+            case eLexZeroOrOne:
+                e1 = regexFragmentStackPop(&stack);
+                state = regexStateSplitCreate(e1->state, NULL);
+                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistAppend(e1->ptrlist, regexPtrlistCreate(&state->out_b))));
+                break;
+
+            case eLexZeroOrMany:
+                e1 = regexFragmentStackPop(&stack);
+                state = regexStateSplitCreate(e1->state, NULL);
+                regexPtrlistPatch(e1->ptrlist, state);
+                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistCreate(&(state->out_b))));
+                break;
+
+            case eLexOneOrMany:
+                e1 = regexFragmentStackPop(&stack);
+                state = regexStateSplitCreate(e1->state, NULL);
+                regexPtrlistPatch(e1->ptrlist, state);
+                regexFragmentStackPush(&stack, regexFragmentCreate(e1->state, regexPtrlistCreate(&(state->out_b))));
+                break;
+
+            case eLexAlternative:
+                e2 = regexFragmentStackPop(&stack);
+                e1 = regexFragmentStackPop(&stack);
+                state = regexStateSplitCreate(e1->state, e2->state);
+                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistAppend(e1->ptrlist, e2->ptrlist)));
+                break;
+
+            case eLexConcatenation:
+                e2 = regexFragmentStackPop(&stack);
+                e1 = regexFragmentStackPop(&stack);
+                regexPtrlistPatch(e1->ptrlist, e2->state);
+                regexFragmentStackPush(&stack, regexFragmentCreate(e1->state, e2->ptrlist));
+                break;
+
+            case eLexSubExprStart:
+                break;
+
+            case eLexSubExprEnd:
+                break;
+
+            default:
+                printf("ERROR: Unknown lexeme token [%d]\n", lexeme->lexType);
+                return NULL;
+        }
+        e1 = regexFragmentStackPop(&stack);
+        regexPtrlistPatch(e1->ptrlist, regexStateCreate(eMatch, 0, NULL, NULL, NULL));
+        return e1->state;
+    }
+
+}
+
+int regexInfixToPostfix(regex_lexeme_t **program, regex_subexpr_name_t *list) {
+    printf("----------\n");
+
+    regex_lexeme_t *operands = NULL, *operators = NULL, *lexeme, *next, *operator;
+
+    for(lexeme = *program; lexeme != NULL; lexeme = next) {
+        next = lexeme->next;
+        lexeme->next = NULL;
+
+        switch(lexeme->lexType) {
+            case eLexCharLiteral:
+            case eLexCharClass:
+            case eLexStringLiteral:
+            case eLexCharAny:
+                stackPush(&operands, lexeme);
+                break;
+
+            case eLexZeroOrOne:
+            case eLexZeroOrMany:
+            case eLexOneOrMany:
+            case eLexAlternative:
+            case eLexConcatenation:
+                while(regexStackTypeGreaterOrEqualToLexeme(operators, lexeme)) {
+                    operator = stackPop(&operators);
+                    if(!regexApplyOperator(&operands, operator)) {
+                        return 0;
+                    }
+                }
+                stackPush(&operators, lexeme);
+                break;
+
+            case eLexSubExprStart:
+                stackPush(&lex_operators, lexeme);
+                break;
+
+            case eLexSubExprEnd:
+                while(stackPeekType(lex_operators) != eLexSubExprStart) {
+                    if((lex_operator = stackPop(&lex_operators)) == NULL) {
+                        printf("ERROR: Unable to find subexpression start token!\n");
+                        return 0;
+                    }
+                    if(!regexApplyOperator(&lex_operands, lex_operator)) {
+                        return 0;
+                    }
+                }
+                // Pop and discard the closing subexpr end token
+                stackPop(&lex_operators);
+                break;
+
+            default:
+                printf("ERROR: Unknown lexeme token [%d]\n", lexeme->lexType);
+                return 0;
+        }
+    }
+
+    while((lex_operator = stackPop(&lex_operators)) != NULL) {
+        if(!regexApplyOperator(&lex_operands, lex_operator)) {
+            return 0;
+        }
+    }
+
+    printf("INFO: Apparent success\n");
+
+    regexPrintProgram(lex_operands);
+
+    return 1;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
 typedef struct regex_compile_ctx_s regex_compile_ctx_t;
 struct regex_compile_ctx_s {
     eRegexCompileStatus status;
     const char *pattern;
     int position;
 };
-
-//#define SET_RESULT(res,stat,ptr)  res.status = stat; res.position = ptr - res.pattern;
 
 #define SET_RESULT(stat)  result.status = stat; result.position = pattern - result.pattern; goto compileFailure;
 
@@ -1067,6 +1348,7 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
             .position = 0
     };
     character_t c;
+    int response;
     int len;
     char *str;
     char character;
@@ -1075,6 +1357,8 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
     int subexpr = 0;
     regex_lexeme_t *program = NULL;
     regex_subexpr_name_t *subexpr_list = NULL;
+    regex_lexeme_t *operands = NULL, *operators = NULL, *operator;
+
 
     for(; *pattern != '\0';) {
         c = regexGetNextPatternChar(&pattern);
@@ -1127,25 +1411,18 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
                             if(!regexCheckNextPatternChar(&pattern, '<')) {
                                 SET_RESULT(eCompileMalformedSubExprName);
                             }
-                            len = regexGetSubexpressionNameLen(&pattern);
-                            if(len == -1) {
-                                SET_RESULT(eCompileMalformedSubExprName);
+                            if((response = regexSubexprLookupEntryCreate(&subexpr_list, &pattern, subexpr)) != 1) {
+                                SET_RESULT((response == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName));
                             }
-                            if((str = regexGetSubexpressionName(&pattern, len)) == NULL) {
-                                SET_RESULT(eCompileOutOfMem);
-                            }
-                            printf("[%s]", str);
+                            printf("[%s]", subexpr_list->name);
                         } else {
                             SET_RESULT(eCompileUnsupportedMeta);
                         }
                     }
-                    if(str != NULL) {
-                        regexSubexprLookupEntryAdd(&subexpr_list, str, subexpr);
-                    }
                     if(!regexLexemeCreate(&program, eLexSubExprStart, subexpr, NULL)) {
                         SET_RESULT(eCompileOutOfMem);
                     }
-                    printf("({%d%s%s}\n", subexpr, (str != NULL ? ":" : ""), (str != NULL ? str : ""));
+                    printf("({%d%s%s}\n", subexpr, ((subexpr_list != NULL && subexpr_list->index == subexpr) ? ":" : ""), ((subexpr_list != NULL && subexpr_list->index == subexpr) ? subexpr_list->name : ""));
                     continue;
                 case ')':
                     if(!regexLexemeCreate(&program, eLexSubExprEnd, 0, 0)) {
@@ -1212,9 +1489,11 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
 
     // The final implicit lexeme is the "match"
 
+    /*
     if(!regexLexemeCreate(&program, eLexMatch, 0, 0)) {
         SET_RESULT(eCompileOutOfMem);
     }
+    */
 
     // Attempt to convert to infix form
 
@@ -1232,19 +1511,7 @@ compileFailure:
     return result;
 }
 
-const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
-    switch(status) {
-        case eCompileOk: return "compiled successfully";
-        case eCompileCharClassRangeIncomplete: return "char class range is incomplete";
-        case eCompileCharClassIncomplete: return "char class definition is incomplete";
-        case eCompileEscapeCharIncomplete: return "escape character is incomplete";
-        case eCompileMalformedSubExprName: return "subexpression name is malformed";
-        case eCompileUnsupportedMeta: return "expression uses an unsupported meta character";
-        case eCompileOutOfMem: return "out of memory";
-        default: return "Unknown failure";
-    }
-}
-
+#undef SET_RESULT
 
 int main(int argc, char **argv) {
     regex_compile_ctx_t result;
