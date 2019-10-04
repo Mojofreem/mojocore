@@ -3,8 +3,7 @@
 
 /*
     Task list:
-        - parse tokens
-        - build NFA (shunting yard)
+        - generate instruction set
         - build VM implementation
         - validate regex evaluator
         - clean up and refactor
@@ -76,7 +75,23 @@ With implied concatenation (#) operators:
     19  s(cat)      c(a) g([s(bcd) opt(g([s(efg) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9))        # # #
     20  <DONE>      [c(a) [g([s(bcd) opt(g([s(efg) [cl(hijk) s(foo)]]))]) [s(cat) many(cl(0-9))]]]
 
+    1   c(a)        char a
+    2   g           save 2
+    3   s(bcd)      string "bcd"
+    4   opt         split 5, 11
+    5   g           save 4
+    6   s(efg)      string "efg"
+    7   cl(hijk)    class "hijk"
+    8   s(foo)      string "foo"
+    9   <inf:g>     save 5
+    10  <inf:g>     save 3
+    11  s(cat)      string "cat"
+    12  ...?        class "0-9"
+    13  many        split 12, 14
+    14  match
 
+    one-or-more split _follows_ the operand
+    opt requires knowledge of position of future elements
 */
 
 #include <stdio.h>
@@ -113,7 +128,8 @@ typedef enum {
     eLexZeroOrMany,
     eLexOneOrMany,
     eLexSubExprStart,
-    eLexSubExprEnd
+    eLexSubExprEnd,
+    eLexMatch
 } eRegexLexeme;
 
 typedef enum {
@@ -594,6 +610,71 @@ void regexLexemeChainPrint(regex_lexeme_t *lexeme, regex_subexpr_name_t *subexpr
     }
 }
 
+void regexProgramStepPrint(regex_lexeme_t *lexeme, regex_subexpr_name_t *subexpr) {
+    const char *str;
+
+    while(lexeme != NULL) {
+        switch(lexeme->lexType) {
+            case eLexCharLiteral:
+                printf("CHAR(%c)", lexeme->c);
+                break;
+            case eLexCharClass:
+                printf("CLASS(");
+                regexPrintCharClass((unsigned char *)(lexeme->str));
+                printf(")");
+                break;
+            case eLexStringLiteral:
+                printf("STRING(\"%s\")", lexeme->str);
+                break;
+            case eLexCharAny:
+                printf("ANY");
+                break;
+            case eLexConcatenation:
+                printf("CONCAT(");
+                regexProgramStepPrint(lexeme->outl, subexpr);
+                printf(",");
+                regexProgramStepPrint(lexeme->outr, subexpr);
+                printf(")");
+                break;
+            case eLexAlternative:
+                printf("ALTERNATIVE\n");
+                regexProgramStepPrint(lexeme->outl, subexpr);
+                printf("|");
+                regexProgramStepPrint(lexeme->outr, subexpr);
+                printf(")");
+                break;
+            case eLexZeroOrOne:
+                printf("ZERO_OR_ONE");
+                break;
+            case eLexZeroOrMany:
+                printf("ZERO_OR_MANY");
+                break;
+            case eLexOneOrMany:
+                printf("ONE_OR_MANY");
+                break;
+            case eLexSubExprStart:
+                str = regexSubexprLookupName(subexpr, lexeme->c);
+                if(str != NULL) {
+                    printf("SUBEXPR #%d <%s>\n", lexeme->c, str);
+                } else {
+                    printf("SUBEXPR #%d\n", lexeme->c);
+                }
+                break;
+            case eLexSubExprEnd:
+                printf("SUBEXPR #%d END\n", lexeme->c);
+                break;
+            default:
+                printf("UNKNOWN! <%d>\n", lexeme->lexType);
+                break;
+        }
+    }
+}
+
+typedef struct regex_instr_s regex_instr_t;
+struct regex_instr_s {
+
+};
+
 void stackPush(regex_lexeme_t **stack, regex_lexeme_t *instr) {
     if(*stack == NULL) {
         *stack = instr;
@@ -751,7 +832,7 @@ int regexShuntingYard(regex_lexeme_t **program, regex_subexpr_name_t *list) {
     }
 
     printf("INFO: Apparent success\n");
-    
+
     return 1;
 }
 
@@ -935,6 +1016,7 @@ compileFailure:
 
 /////////////////////////////////////////////////////////////////////////////
 
+#if 0
 typedef struct regex_instr_s regex_instr_t;
 struct regex_instr_s {
     eRegexOpCode opcode;
@@ -1019,7 +1101,7 @@ void regexInstructionPrint(regex_instr_t *instr) {
         case eCharAny: printf("ANYCHAR\n"); break;
     }
 }
-
+#endif
 
 const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
     switch(status) {
@@ -1034,6 +1116,7 @@ const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
     }
 }
 
+#if 0
 typedef struct shunting_yard_s shunting_yard_t;
 struct shunting_yard_s {
     regex_instr_t *operand_stack[TOKEN_STACK_DEPTH];
@@ -1069,6 +1152,7 @@ int shuntingYardPush(shunting_yard_t *yard, regex_instr_t *instr) {
     }
     return 0;
 }
+#endif
 
 int main(int argc, char **argv) {
     regex_compile_ctx_t result;
