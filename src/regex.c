@@ -76,22 +76,70 @@ With implied concatenation (#) operators:
     20  <DONE>      [c(a) [g([s(bcd) opt(g([s(efg) [cl(hijk) s(foo)]]))]) [s(cat) many(cl(0-9))]]]
 
     1   c(a)        char a
-    2   g           save 2
+    2   g(1)        save 2
     3   s(bcd)      string "bcd"
     4   opt         split 5, 11
-    5   g           save 4
+    5   g(2)        save 4
     6   s(efg)      string "efg"
     7   cl(hijk)    class "hijk"
     8   s(foo)      string "foo"
-    9   <inf:g>     save 5
-    10  <inf:g>     save 3
+    9   <g(2)>      save 5
+    10  <g(1)>      save 3
     11  s(cat)      string "cat"
-    12  ...?        class "0-9"
-    13  many        split 12, 14
+    12  many        class "0-9"
+    13  cl[0-9]     split 12, 14
     14  match
 
-    one-or-more split _follows_ the operand
-    opt requires knowledge of position of future elements
+For the expression:
+
+    a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat
+
+The base token stream is (infix):
+
+    c(a) ( s(bcd) ( s(efg) * cl(hijk) s(foo) ) ? ) cl(0-9) + s(cat)
+
+With implied concatenation (#) operators:
+
+    c(a) # ( s(bcd) # ( s(efg) * # cl(hijk) # s(foo) ) ? ) # cl(0-9) + # s(cat)
+
+    1   c(a)        c(a)
+    2   #           c(a)                                                                                    #
+    3   (           c(a)                                                                                    # (
+    4   s(bcd)      c(a) s(bcd)                                                                             # (
+    5   #           c(a) s(bcd)                                                                             # ( #
+    6   (           c(a) s(bcd)                                                                             # ( # (
+    7   s(efg)      c(a) s(bcd) s(efg)                                                                      # ( # (
+    8   *           c(a) s(bcd) s(efg)                                                                      # ( # ( *
+    9   #           c(a) s(bcd) kleene(s(efg))                                                              # ( # ( #
+    10   cl(hijk)    c(a) s(bcd) kleene(s(efg)) cl(hijk)                                                    # ( # ( #
+    11  #           c(a) s(bcd) kleene(s(efg)) cl(hijk)                                                     # ( # ( # #
+    12  s(foo)      c(a) s(bcd) kleene(s(efg)) cl(hijk) s(foo)                                              # ( # ( # #
+    13  )           c(a) s(bcd) g([kleene(s(efg)) [cl(hijk) s(foo)]])                                       # ( #
+    14  ?           c(a) s(bcd) g([kleene(s(efg)) [cl(hijk) s(foo)]])                                       # ( # ?
+    15  )           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))])                             #
+    16  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))])                             # #
+    17  cl(0-9)     c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) cl(0-9)                     # #
+    18  +           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) cl(0-9)                     # # +
+    19  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) many(cl(0-9))               # # #
+    20  s(cat)      c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9))        # # #
+    21  <DONE>      [c(a) [g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) [s(cat) many(cl(0-9))]]]
+
+    1   c(a)        char a
+    2   g(1)        save 2
+    3   s(bcd)      string "bcd"
+    4   opt         split 5, 11
+    5   g(2)        save 4
+    6   kleene      split 6, 7
+    7   s(efg)      string "efg"
+    8   cl(hijk)    class "hijk"
+    9   s(foo)      string "foo"
+    10  <g(2)>      save 5
+    11  <g(1)>      save 3
+    12  s(cat)      string "cat"
+    13  many        class "0-9"
+    14  cl[0-9]     split 12, 14
+    15  match
+
 */
 
 #include <stdio.h>
@@ -104,17 +152,6 @@ typedef enum {
     eReNone,
     eReCaseInsensitive
 } eRegexFlags;
-
-typedef enum {
-    eCharLiteral,
-    eMatch,
-    eJmp,
-    eSplit,
-    eSave,
-    eCharClass,
-    eStringLiteral,
-    eCharAny
-} eRegexOpCode;
 
 typedef enum {
     eLexNone,
@@ -528,8 +565,6 @@ int regexLexemeCreate(regex_lexeme_t **list, eRegexLexeme lexType, int c, char *
                 return 0;
             }
             walk = walk->next;
-        } else {
-            printf("No concat for %d and %d\n", walk->lexType, lexeme->lexType);
         }
         walk->next = lexeme;
     }
@@ -543,8 +578,8 @@ void regexLexemeDestroy(regex_lexeme_t *instr) {
     for(; instr != NULL; instr = next) {
         next = instr->next;
         switch(instr->lexType) {
-            case eCharClass:
-            case eStringLiteral:
+            case eLexCharClass:
+            case eLexStringLiteral:
                 free(instr->str);
                 break;
             default:
@@ -597,6 +632,9 @@ void regexLexemePrint(regex_lexeme_t *lexeme, regex_subexpr_name_t *subexpr) {
             break;
         case eLexSubExprEnd:
             printf("SUBEXPR #%d END\n", lexeme->c);
+            break;
+        case eLexMatch:
+            printf("MATCH!\n");
             break;
         default:
             printf("UNKNOWN! <%d>\n", lexeme->lexType);
@@ -663,17 +701,15 @@ void regexProgramStepPrint(regex_lexeme_t *lexeme, regex_subexpr_name_t *subexpr
             case eLexSubExprEnd:
                 printf("SUBEXPR #%d END\n", lexeme->c);
                 break;
+            case eLexMatch:
+                printf("MATCH\n");
+                break;
             default:
                 printf("UNKNOWN! <%d>\n", lexeme->lexType);
                 break;
         }
     }
 }
-
-typedef struct regex_instr_s regex_instr_t;
-struct regex_instr_s {
-
-};
 
 void stackPush(regex_lexeme_t **stack, regex_lexeme_t *instr) {
     if(*stack == NULL) {
@@ -709,6 +745,7 @@ eRegexLexemePriority regexGetLexemeTypePriority(eRegexLexeme lexType) {
         case eLexCharClass:
         case eLexStringLiteral:
         case eLexCharAny:
+        case eLexMatch:
         default:
             return ePriorityNone;
 
@@ -766,6 +803,90 @@ int regexApplyOperator(regex_lexeme_t **operands, regex_lexeme_t *operator) {
     return 1;
 }
 
+typedef enum {
+    eCharLiteral,
+    eMatch,
+    eJmp,
+    eSplit,
+    eSave,
+    eCharClass,
+    eStringLiteral,
+    eCharAny
+} eRegexOpCode;
+
+typedef struct regex_instr_s regex_instr_t;
+struct regex_instr_s {
+    eRegexOpCode opcode;
+    union {
+        int c;
+        int group;
+        unsigned char *bitmap;
+        char *str;
+    };
+    regex_instr_t *out_left;
+    regex_instr_t *out_right;
+    regex_instr_t *next;
+};
+
+regex_instr_t *regexInstrCreate(eRegexOpCode opcode, int c, char *str) {
+    regex_instr_t *instr;
+
+    if((instr = malloc(sizeof(regex_instr_t))) == NULL) {
+        return NULL;
+    }
+    memset(instr, 0, sizeof(regex_instr_t));
+    instr->opcode = opcode;
+    if(str != NULL) {
+        instr->str = str;
+    } else {
+        instr->c = c;
+    }
+    return instr;
+}
+
+eRegexOpCode regexGetOpcodeFromLexeme(eRegexLexeme lexType) {
+    switch(lexType) {
+        case eLexCharLiteral: return eCharLiteral;
+        case eLexCharClass: return eCharClass;
+        case eLexStringLiteral: return eStringLiteral;
+        case eLexCharAny: return eCharAny;
+        case eLexMatch: return eMatch;
+        default: return 0;
+    }
+}
+
+regex_instr_t *regexInstrCharLiteralCreate(int c) {
+    return regexInstrCreate(eCharLiteral, c, NULL);
+}
+
+regex_instr_t *regexInstrStringLiteralCreate(char *str) {
+    return regexInstrCreate(eStringLiteral, 0, str);
+}
+
+regex_instr_t *regexInstrCharClassCreate(unsigned char *bitmap) {
+    return regexInstrCreate(eCharClass, 0, (char *)bitmap);
+}
+
+regex_instr_t *regexInstrCharAnyCreate() {
+    return regexInstrCreate(eCharAny, 0, NULL);
+}
+
+void regexInstrStackPush(regex_instr_t **stack, regex_instr_t *instr) {
+    instr->next = *stack;
+    *stack = instr;
+}
+
+regex_instr_t *regexInstrStackPop(regex_instr_t **stack) {
+    regex_instr_t *instr;
+
+    if(*stack == NULL) {
+        return NULL;
+    }
+    instr = *stack;
+    *stack = instr->next;
+    return instr;
+}
+
 int regexShuntingYard(regex_lexeme_t **program, regex_subexpr_name_t *list) {
     printf("----------\n");
 
@@ -773,7 +894,9 @@ int regexShuntingYard(regex_lexeme_t **program, regex_subexpr_name_t *list) {
 
     printf("----------\n");
 
-    regex_lexeme_t *operands = NULL, *operators = NULL, *lexeme, *next, *operator;
+    regex_lexeme_t *lex_operands = NULL, *lex_operators = NULL, *lexeme, *next, *lex_operator;
+    regex_instr_t *operands = NULL, *operators = NULL, *instr, *operator;
+    eRegexOpCode opcode;
 
     for(lexeme = *program; lexeme != NULL; lexeme = next) {
         next = lexeme->next;
@@ -784,39 +907,44 @@ int regexShuntingYard(regex_lexeme_t **program, regex_subexpr_name_t *list) {
             case eLexCharClass:
             case eLexStringLiteral:
             case eLexCharAny:
-                stackPush(&operands, lexeme);
+            case eLexMatch:
+                if((instr = regexInstrCreate(regexGetOpcodeFromLexeme(lexeme->lexType), lexeme->c, lexeme->str)) == NULL) {
+                    return 0;
+                }
+                regexInstrStackPush(&operands, instr);
+                stackPush(&lex_operands, lexeme);
                 break;
 
             case eLexZeroOrOne:
             case eLexZeroOrMany:
             case eLexOneOrMany:
-            case eLexConcatenation:
             case eLexAlternative:
-                while(regexStackTypeGreaterOrEqualToLexeme(operators, lexeme)) {
-                    operator = stackPop(&operators);
-                    if(!regexApplyOperator(&operands, operator)) {
+            case eLexConcatenation:
+                while(regexStackTypeGreaterOrEqualToLexeme(lex_operators, lexeme)) {
+                    lex_operator = stackPop(&lex_operators);
+                    if(!regexApplyOperator(&lex_operands, lex_operator)) {
                         return 0;
                     }
                 }
-                stackPush(&operators, lexeme);
+                stackPush(&lex_operators, lexeme);
                 break;
 
             case eLexSubExprStart:
-                stackPush(&operators, lexeme);
+                stackPush(&lex_operators, lexeme);
                 break;
 
             case eLexSubExprEnd:
-                while(stackPeekType(operators) != eLexSubExprStart) {
-                    if((operator = stackPop(&operators)) == NULL) {
+                while(stackPeekType(lex_operators) != eLexSubExprStart) {
+                    if((lex_operator = stackPop(&lex_operators)) == NULL) {
                         printf("ERROR: Unable to find subexpression start token!\n");
                         return 0;
                     }
-                    if(!regexApplyOperator(&operands, operator)) {
+                    if(!regexApplyOperator(&lex_operands, lex_operator)) {
                         return 0;
                     }
                 }
                 // Pop and discard the closing subexpr end token
-                stackPop(&operators);
+                stackPop(&lex_operators);
                 break;
 
             default:
@@ -825,13 +953,15 @@ int regexShuntingYard(regex_lexeme_t **program, regex_subexpr_name_t *list) {
         }
     }
 
-    while((operator = stackPop(&operators)) != NULL) {
-        if(!regexApplyOperator(&operands, operator)) {
+    while((lex_operator = stackPop(&lex_operators)) != NULL) {
+        if(!regexApplyOperator(&lex_operands, lex_operator)) {
             return 0;
         }
     }
 
     printf("INFO: Apparent success\n");
+
+    //regexBuildVMProgram(lex_operands);
 
     return 1;
 }
@@ -998,6 +1128,12 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
         }
     }
 
+    // The final implicit lexeme is the "match"
+
+    if(!regexLexemeCreate(&program, eLexMatch, 0, 0)) {
+        SET_RESULT(eCompileOutOfMem);
+    }
+
     // Attempt to convert to infix form
 
     regexShuntingYard(&program, subexpr_list);
@@ -1014,95 +1150,6 @@ compileFailure:
     return result;
 }
 
-/////////////////////////////////////////////////////////////////////////////
-
-#if 0
-typedef struct regex_instr_s regex_instr_t;
-struct regex_instr_s {
-    eRegexOpCode opcode;
-    union {
-        int c;
-        char *str;
-    };
-    regex_instr_t *out_a;
-    regex_instr_t *out_b;
-    regex_instr_t *next;
-};
-
-regex_instr_t *regexInstructionCreate(eRegexOpCode opcode, int c, char *str) {
-    regex_instr_t *instr;
-
-    if((instr = malloc(sizeof(regex_instr_t))) == NULL) {
-        return NULL;
-    }
-    memset(instr, 0, sizeof(regex_instr_t));
-    instr->opcode = opcode;
-    if(str != NULL) {
-        instr->str = str;
-    } else {
-        instr->c = c;
-    }
-    return instr;
-}
-
-void regexInstructionDestroy(regex_instr_t *instr) {
-    switch(instr->opcode) {
-        case eCharClass:
-        case eStringLiteral:
-            free(instr->str);
-            break;
-        default:
-            break;
-    }
-    free(instr);
-}
-
-void pushInstruction(regex_instr_t **list, regex_instr_t *instr) {
-    regex_instr_t *walk;
-
-    if(*list == NULL) {
-        *list = instr;
-    } else {
-        for(walk = *list; walk->next != NULL; walk = walk->next);
-        walk->next = instr;
-    }
-}
-
-void regexInstructionPrint(regex_instr_t *instr) {
-    int j;
-
-    switch(instr->opcode) {
-        case eCharLiteral: printf("CHAR('%c')\n", instr->c); break;
-        case eMatch: printf("MATCH\n"); break;
-        case eJmp: printf("JMP\n"); break;
-        case eSplit: printf("SPLIT\n"); break;
-        case eSave: printf("SAVE\n"); break;
-        case eCharClass:
-            printf("CLASS([");
-            for(int k = 0; k < 256; k++) {
-                if(mapCheck((unsigned char *)instr->str, k)) {
-                    for(j = k + 1;
-                        (j < 256) && mapCheck((unsigned char *)instr->str, j);
-                        j++);
-                    j--;
-                    if((j - k) > 3) {
-                        //printf("%c-%c", k, j);
-                        printf("%d-%d,", k, j);
-                        k = j;
-                    } else {
-                        //printf("%c", k);
-                        printf("%d,", k);
-                    }
-                }
-            }
-            printf("])\n");
-            break;
-        case eStringLiteral: printf("STR(\"%s\")\n", instr->str); break;
-        case eCharAny: printf("ANYCHAR\n"); break;
-    }
-}
-#endif
-
 const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
     switch(status) {
         case eCompileOk: return "compiled successfully";
@@ -1116,43 +1163,6 @@ const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
     }
 }
 
-#if 0
-typedef struct shunting_yard_s shunting_yard_t;
-struct shunting_yard_s {
-    regex_instr_t *operand_stack[TOKEN_STACK_DEPTH];
-    regex_instr_t *operator_stack[TOKEN_STACK_DEPTH];
-    int operands;
-    int operators;
-};
-
-int shuntingYardPush(shunting_yard_t *yard, regex_instr_t *instr) {
-    regex_instr_t *operator;
-
-    if(instr == NULL) {
-        return -2;
-    }
-    if((instr->opcode == eCharLiteral) ||
-       (instr->opcode == eStringLiteral) ||
-       (instr->opcode == eCharClass) ||
-       (instr->opcode == eCharAny)) {
-        // Operand
-        if(yard->operands >= TOKEN_STACK_DEPTH) {
-            return -1;
-        }
-        yard->operand_stack[yard->operands] = instr;
-        yard->operands++;
-        return 1;
-    } else {
-        // Operator
-        if(yard->operators < 1) {
-            return -3;
-        }
-        yard->operators--;
-        operator = yard->operator_stack[yard->operators];
-    }
-    return 0;
-}
-#endif
 
 int main(int argc, char **argv) {
     regex_compile_ctx_t result;
