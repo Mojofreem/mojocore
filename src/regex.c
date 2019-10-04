@@ -122,7 +122,9 @@ With implied concatenation (#) operators:
     18  +           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) cl(0-9)                     # # +
     19  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) many(cl(0-9))               # # #
     20  s(cat)      c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9))        # # #
-    21  <DONE>      [c(a) [g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) [s(cat) many(cl(0-9))]]]
+    21  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9))        # # # #
+    21  <DONE>      c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9)) <DONE> # # # #
+    22              [c(a) [g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) [s(cat) [many(cl(0-9)) <DONE>]]]]
 
     1   c(a)        char a
     2   g(1)        save 2
@@ -140,7 +142,29 @@ With implied concatenation (#) operators:
     14  cl[0-9]     split 12, 14
     15  match
 
-*/
+    1   c(a)        c(a)
+    2   #           c(a)                                                                                    #
+    3   (           c(a)                                                                                    # (
+    4   s(bcd)      c(a) s(bcd)                                                                             # (
+    5   #           c(a) s(bcd)                                                                             # ( #
+    6   (           c(a) s(bcd)                                                                             # ( # (
+    7   s(efg)      c(a) s(bcd) s(efg)                                                                      # ( # (
+    8   *           c(a) s(bcd) s(efg)                                                                      # ( # ( *
+    9   #           c(a) s(bcd) kleene(l->s(efg) r->0)                                                              # ( # ( #
+    10   cl(hijk)   c(a) s(bcd) kleene(l->s(efg) r->0) cl(hijk)                                                    # ( # ( #
+    11  #           c(a) s(bcd) kleene(l->s(efg) r->0) cl(hijk)                                                     # ( # ( # #
+    12  s(foo)      c(a) s(bcd) kleene(l->s(efg) r->0) cl(hijk) s(foo)                                              # ( # ( # #
+    13  )           c(a) s(bcd) g([kleene(l->s(efg) r->0) [cl(hijk) s(foo)]])                                       # ( #
+    14  ?           c(a) s(bcd) g([kleene(l->s(efg) r->0) [cl(hijk) s(foo)]])                                       # ( # ?
+    15  )           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))])                             #
+    16  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))])                             # #
+    17  cl(0-9)     c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) cl(0-9)                     # #
+    18  +           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) cl(0-9)                     # # +
+    19  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) many(cl(0-9))               # # #
+    20  s(cat)      c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9))        # # #
+    21  <DONE>      [c(a) [g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) [s(cat) many(cl(0-9))]]]
+
+ */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -887,6 +911,64 @@ regex_instr_t *regexInstrStackPop(regex_instr_t **stack) {
     return instr;
 }
 
+void regexPrintProgramElement(regex_lexeme_t *lexeme) {
+
+}
+
+void regexPrintProgram(regex_lexeme_t *lexeme) {
+    switch(lexeme->lexType) {
+        case eLexNone: printf("!"); break;
+        case eLexCharLiteral:
+            if((lexeme->c < 32) || (lexeme->c > 127)) {
+                printf("\\x%2.2x", lexeme->c);
+            } else {
+                printf("%c", lexeme->c);
+            }
+            break;
+        case eLexCharClass:
+            printf("[");
+            regexPrintCharClass((unsigned char *)lexeme->str);
+            printf("]");
+            if(lexeme->outl != NULL) {
+                regexPrintProgram(lexeme->outl);
+            }
+            break;
+        case eLexStringLiteral:
+            printf("%s", lexeme->str);
+            break;
+        case eLexCharAny:
+            printf(".");
+            break;
+        case eLexAlternative:
+            regexPrintProgram(lexeme->outl);
+            printf("|");
+            regexPrintProgram(lexeme->outr);
+            break;
+        case eLexZeroOrOne:
+            regexPrintProgram(lexeme->outl);
+            printf("?");
+            break;
+        case eLexZeroOrMany:
+            regexPrintProgram(lexeme->outl);
+            printf("*");
+            break;
+        case eLexOneOrMany:
+            regexPrintProgram(lexeme->outl);
+            printf("+");
+            break;
+        case eLexSubExprStart:
+            printf("(");
+            regexPrintProgram(lexeme->outl);
+            printf(")");
+
+        case eLexSubExprEnd:
+        case eLexMatch:
+        case eLexConcatenation:
+        default:
+            break;
+    }
+}
+
 int regexShuntingYard(regex_lexeme_t **program, regex_subexpr_name_t *list) {
     printf("----------\n");
 
@@ -961,7 +1043,7 @@ int regexShuntingYard(regex_lexeme_t **program, regex_subexpr_name_t *list) {
 
     printf("INFO: Apparent success\n");
 
-    //regexBuildVMProgram(lex_operands);
+    regexPrintProgram(lex_operands);
 
     return 1;
 }
