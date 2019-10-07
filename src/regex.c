@@ -170,13 +170,6 @@ With implied concatenation (#) operators:
 #include <stdlib.h>
 #include <string.h>
 
-#define TOKEN_STACK_DEPTH   1000
-
-typedef enum {
-    eReNone,
-    eReCaseInsensitive
-} eRegexFlags;
-
 typedef enum {
     eLexNone,
     eLexCharLiteral,
@@ -199,11 +192,6 @@ typedef enum {
     ePriorityMedium,
     ePriorityHigh
 } eRegexLexemePriority;
-
-typedef enum {
-    eOpArityUnary,
-    eOpArityBinary
-} eRegexOpArity;
 
 typedef enum {
     eCompileOk,
@@ -364,9 +352,8 @@ eRegexCompileStatus regexParseCharClass(const char **pattern, unsigned char *bit
     character_t c;
     int invert = 0;
     int range = 0;
-    int last;
+    int last = 0;
     int next;
-    int k;
 
     mapClear(bitmap);
 
@@ -427,7 +414,6 @@ eRegexCompileStatus regexParseCharClass(const char **pattern, unsigned char *bit
 }
 
 int regexGetSubexpressionNameLen(const char **pattern) {
-    int c;
     int k;
 
     for(k = 0; (*pattern)[k] != '>' && (*pattern)[k] != '\0'; k++) {
@@ -443,7 +429,6 @@ int regexGetSubexpressionNameLen(const char **pattern) {
 
 char *regexGetSubexpressionName(const char **pattern, int len) {
     char *str, *ptr;
-    int k;
 
     if((str = malloc(len + 1)) == NULL) {
         return NULL;
@@ -1060,7 +1045,7 @@ struct regex_compile_ctx_s {
 #define SET_RESULT(stat)  result.status = stat; result.position = pattern - result.pattern; goto compileFailure;
 
 // Return a compiled regex, or an error and position within the pattern
-regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
+regex_compile_ctx_t regexCompile(const char *pattern) {
     regex_compile_ctx_t result = {
             .status = eCompileOk,
             .pattern = pattern,
@@ -1245,12 +1230,11 @@ const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
     }
 }
 
-
 int main(int argc, char **argv) {
     regex_compile_ctx_t result;
 
     if(argc > 1) {
-        result = regexCompile(argv[1], 0);
+        result = regexCompile(argv[1]);
         if(result.status != eCompileOk) {
             printf("Compile failed: %s", regexGetCompileStatusStr(result.status));
         }
