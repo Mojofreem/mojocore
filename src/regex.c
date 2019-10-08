@@ -203,7 +203,10 @@ typedef enum {
     eCompileEscapeCharIncomplete,
     eCompileMalformedSubExprName,
     eCompileUnsupportedMeta,
-    eCompileOutOfMem
+    eCompileOutOfMem,
+    eCompileMissingOperand,
+    eCompileMissingSubexprStart,
+    eCompileInternalError
 } eRegexCompileStatus;
 
 const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
@@ -215,6 +218,9 @@ const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
         case eCompileMalformedSubExprName: return "subexpression name is malformed";
         case eCompileUnsupportedMeta: return "expression uses an unsupported meta character";
         case eCompileOutOfMem: return "out of memory";
+        case eCompileMissingOperand: return "missing operand during postfix transform";
+        case eCompileMissingSubexprStart: return "missing subexpr start \"(\"";
+        case eCompileInternalError: return "unknown internal error state";
         default: return "Unknown failure";
     }
 }
@@ -232,6 +238,7 @@ character_t regexGetNextPatternChar(const char **pattern) {
         .c = -1,
         .escaped = 0
     };
+    int k, val;
 
     if(**pattern == '\0') {
         return result;
@@ -242,8 +249,59 @@ character_t regexGetNextPatternChar(const char **pattern) {
         if(**pattern == '\0') {
             return result;
         }
+        switch(**pattern) {
+            case 'a': result.c = '\a'; break;
+            case 'b': result.c = '\b'; break;
+            case 'e': result.c = '\x1B'; break;
+            case 'f': result.c = '\f'; break;
+            case 'n': result.c = '\n'; break;
+            case 'r': result.c = '\r'; break;
+            case 't': result.c = '\t'; break;
+            case 'v': result.c = '\v'; break;
+            case 'x':
+                // Hexidecimal encoding
+                (*pattern)++;
+                val = 0;
+                for(k = 0; k < 2; k++) {
+                    val *= 16;
+                    if((**pattern >= 0) && (**pattern <= 9)) {
+                        val += **pattern - '0';
+                    } else if((**pattern >= 'A') && (**pattern <= 'F')) {
+                        val += (**pattern - 'A') + 10;
+                    } else if((**pattern >= 'a') && (**pattern <= 'f')) {
+                        val += (**pattern - 'a') + 10;
+                    } else {
+                        return result;
+                    }
+                }
+                result.c = (char)val;
+                break;
+            case 'u':
+                // Unicode is not supported in this iteration
+                return result;
+            default:
+                if((**pattern >= '0') && (**pattern <= '9')) {
+                    // Octal encoded escape character
+                    val = 0;
+                    for(k = 0; k < 3; k++) {
+                        if((**pattern >= '0') && (**pattern <= '9')) {
+                            val *= 8;
+                            val += **pattern - '0';
+                        } else {
+                            return result;
+                        }
+                        (*pattern)++;
+                    }
+                    result.c = (char)(val);
+                } else {
+                    // Assume an overzealous escape regime
+                    result.c = **pattern;
+                }
+                break;
+        }
+    } else {
+        result.c = **pattern;
     }
-    result.c = **pattern;
     (*pattern)++;
     return result;
 }
@@ -254,18 +312,6 @@ int regexCheckNextPatternChar(const char **pattern, char c) {
     }
     (*pattern)++;
     return 1;
-}
-
-int regexGetActualChar(character_t c) {
-    if(c.escaped) {
-        switch(c.c) {
-            case 'n': return '\n';
-            case 'r': return '\r';
-            case 't': return '\t';
-            default: return c.c;
-        }
-    }
-    return c.c;
 }
 
 int regexIsAlnum(char c) {
@@ -318,16 +364,7 @@ char *regexGetPatternStr(const char **pattern, int len) {
             return str;
         }
         c = regexGetNextPatternChar(pattern);
-        if(c.escaped) {
-            switch(c.c) {
-                case 'r': *ptr = '\r'; break;
-                case 'n': *ptr = '\n'; break;
-                case 't': *ptr = '\t'; break;
-                default: *ptr = (char)(c.c); break;
-            }
-        } else {
-            *ptr = (char)(c.c);
-        }
+        *ptr = (char)(c.c);
         ptr++;
     }
     *ptr = '\0';
@@ -403,18 +440,18 @@ eRegexCompileStatus regexParseCharClass(const char **pattern, unsigned char *bit
             break;
         }
         if(range == 0) {
-            last = regexGetActualChar(c);
+            last = c.c;
             mapSet(bitmap, last);
             range = 1;
         } else if(range == 1) {
             if(!c.escaped && c.c == '-') {
                 range = 2;
             } else {
-                last = regexGetActualChar(c);
+                last = c.c;
                 mapSet(bitmap, last);
             }
         } else {
-            next = regexGetActualChar(c);
+            next = c.c;
             for(; last <= next; last++) {
                 mapSet(bitmap, last);
             }
@@ -508,7 +545,6 @@ void regexSubexprLookupFree(regex_subexpr_name_t *list) {
 
     for(; list != NULL; list = next) {
         next = list->next;
-        //free(list->name);
         free(list);
     }
 }
@@ -558,6 +594,92 @@ int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
             return !preceeding;
         default:
             return 0;
+    }
+}
+
+void regexTokenPrint(regex_token_t *token, regex_subexpr_name_t *subexpr, int newlines, int recursive) {
+    const char *str = NULL;
+
+#define HAS_NEWLINE()   (newlines ? "\n" : "")
+
+    switch(token->tokenType) {
+        case eTokenCharLiteral:
+            printf("CHAR(%c)%s", token->c, HAS_NEWLINE());
+            break;
+        case eTokenCharClass:
+            printf("CLASS[");
+            regexPrintCharClass((unsigned char *)(token->str));
+            printf("]%s", HAS_NEWLINE());
+            break;
+        case eTokenStringLiteral:
+            printf("STRING(\"%s\")%s", token->str, HAS_NEWLINE());
+            break;
+        case eTokenCharAny:
+            printf("ANY%s", HAS_NEWLINE());
+            break;
+        case eTokenConcatenation:
+            printf("CONCAT");
+            if(recursive) {
+                printf("(");
+                regexTokenPrint(token->outl, subexpr, newlines, recursive);
+                printf(",");
+                regexTokenPrint(token->outr, subexpr, newlines, recursive);
+                printf(")%s", HAS_NEWLINE());
+            } else {
+                if(newlines) {
+                    printf("\n");
+                }
+            }
+            break;
+        case eTokenAlternative:
+            printf("ALTERNATIVE");
+            if(recursive) {
+                printf("(");
+                regexTokenPrint(token->outl, subexpr, newlines, recursive);
+                printf("|");
+                regexTokenPrint(token->outr, subexpr, newlines, recursive);
+                printf(")%s", HAS_NEWLINE());
+            } else {
+                if(newlines) {
+                    printf("\n");
+                }
+            }
+            break;
+        case eTokenZeroOrOne:
+            printf("ZERO_OR_ONE%s", HAS_NEWLINE());
+            break;
+        case eTokenZeroOrMany:
+            printf("ZERO_OR_MANY%s", HAS_NEWLINE());
+            break;
+        case eTokenOneOrMany:
+            printf("ONE_OR_MANY%s", HAS_NEWLINE());
+            break;
+        case eTokenSubExprStart:
+            if(subexpr != NULL) {
+                str = regexSubexprLookupName(subexpr, token->c);
+            }
+            if(str != NULL) {
+                printf("SUBEXPR #%d <%s>%s", token->c, str, HAS_NEWLINE());
+            } else {
+                printf("SUBEXPR #%d%s", token->c, HAS_NEWLINE());
+            }
+            break;
+        case eTokenSubExprEnd:
+            printf("SUBEXPR #%d END%s", token->c, HAS_NEWLINE());
+            break;
+        case eTokenMatch:
+            printf("MATCH!%s", HAS_NEWLINE());
+            break;
+        default:
+            printf("UNKNOWN! <%d>%s", token->tokenType, HAS_NEWLINE());
+            break;
+    }
+#undef HAS_NEWLINE
+}
+
+void regexTokenChainPrint(regex_token_t *tokens, regex_subexpr_name_t *subexpr) {
+    for(; tokens != NULL; tokens = tokens->next) {
+        regexTokenPrint(tokens, subexpr, 1, 0);
     }
 }
 
@@ -615,128 +737,6 @@ void regexTokenDestroy(regex_token_t *token) {
                 break;
         }
         free(token);
-    }
-}
-
-void regexTokenPrint(regex_token_t *token, regex_subexpr_name_t *subexpr) {
-    const char *str;
-
-    switch(token->tokenType) {
-        case eTokenCharLiteral:
-            printf("CHAR(%c)\n", token->c);
-            break;
-        case eTokenCharClass:
-            printf("CLASS[");
-            regexPrintCharClass((unsigned char *)(token->str));
-            printf("]\n");
-            break;
-        case eTokenStringLiteral:
-            printf("STRING(\"%s\")\n", token->str);
-            break;
-        case eTokenCharAny:
-            printf("ANY\n");
-            break;
-        case eTokenConcatenation:
-            printf("CONCAT\n");
-            break;
-        case eTokenAlternative:
-            printf("ALTERNATIVE\n");
-            break;
-        case eTokenZeroOrOne:
-            printf("ZERO_OR_ONE\n");
-            break;
-        case eTokenZeroOrMany:
-            printf("ZERO_OR_MANY\n");
-            break;
-        case eTokenOneOrMany:
-            printf("ONE_OR_MANY\n");
-            break;
-        case eTokenSubExprStart:
-            str = regexSubexprLookupName(subexpr, token->c);
-            if(str != NULL) {
-                printf("SUBEXPR #%d <%s>\n", token->c, str);
-            } else {
-                printf("SUBEXPR #%d\n", token->c);
-            }
-            break;
-        case eTokenSubExprEnd:
-            printf("SUBEXPR #%d END\n", token->c);
-            break;
-        case eTokenMatch:
-            printf("MATCH!\n");
-            break;
-        default:
-            printf("UNKNOWN! <%d>\n", token->tokenType);
-            break;
-    }
-}
-
-void regexTokenChainPrint(regex_token_t *token, regex_subexpr_name_t *subexpr) {
-    for(; token != NULL; token = token->next) {
-        regexTokenPrint(token, subexpr);
-    }
-}
-
-void regexProgramStepPrint(regex_token_t *token, regex_subexpr_name_t *subexpr) {
-    const char *str;
-
-    while(token != NULL) {
-        switch(token->tokenType) {
-            case eTokenCharLiteral:
-                printf("CHAR(%c)", token->c);
-                break;
-            case eTokenCharClass:
-                printf("CLASS(");
-                regexPrintCharClass((unsigned char *)(token->str));
-                printf(")");
-                break;
-            case eTokenStringLiteral:
-                printf("STRING(\"%s\")", token->str);
-                break;
-            case eTokenCharAny:
-                printf("ANY");
-                break;
-            case eTokenConcatenation:
-                printf("CONCAT(");
-                regexProgramStepPrint(token->outl, subexpr);
-                printf(",");
-                regexProgramStepPrint(token->outr, subexpr);
-                printf(")");
-                break;
-            case eTokenAlternative:
-                printf("ALTERNATIVE\n");
-                regexProgramStepPrint(token->outl, subexpr);
-                printf("|");
-                regexProgramStepPrint(token->outr, subexpr);
-                printf(")");
-                break;
-            case eTokenZeroOrOne:
-                printf("ZERO_OR_ONE");
-                break;
-            case eTokenZeroOrMany:
-                printf("ZERO_OR_MANY");
-                break;
-            case eTokenOneOrMany:
-                printf("ONE_OR_MANY");
-                break;
-            case eTokenSubExprStart:
-                str = regexSubexprLookupName(subexpr, token->c);
-                if(str != NULL) {
-                    printf("SUBEXPR #%d <%s>\n", token->c, str);
-                } else {
-                    printf("SUBEXPR #%d\n", token->c);
-                }
-                break;
-            case eTokenSubExprEnd:
-                printf("SUBEXPR #%d END\n", token->c);
-                break;
-            case eTokenMatch:
-                printf("MATCH\n");
-                break;
-            default:
-                printf("UNKNOWN! <%d>\n", token->tokenType);
-                break;
-        }
     }
 }
 
@@ -873,117 +873,8 @@ regex_instr_t *regexInstrCreate(eRegexOpCode opcode, int c, char *str) {
     return instr;
 }
 
-eRegexOpCode regexGetOpcodeFromToken(eRegexToken tokenType) {
-    switch(tokenType) {
-        case eTokenCharLiteral: return eCharLiteral;
-        case eTokenCharClass: return eCharClass;
-        case eTokenStringLiteral: return eStringLiteral;
-        case eTokenCharAny: return eCharAny;
-        case eTokenMatch: return eMatch;
-        default: return 0;
-    }
-}
-
-regex_instr_t *regexInstrCharLiteralCreate(int c) {
-    return regexInstrCreate(eCharLiteral, c, NULL);
-}
-
-regex_instr_t *regexInstrStringLiteralCreate(char *str) {
-    return regexInstrCreate(eStringLiteral, 0, str);
-}
-
-regex_instr_t *regexInstrCharClassCreate(unsigned char *bitmap) {
-    return regexInstrCreate(eCharClass, 0, (char *)bitmap);
-}
-
-regex_instr_t *regexInstrCharAnyCreate() {
-    return regexInstrCreate(eCharAny, 0, NULL);
-}
-
-void regexInstrStackPush(regex_instr_t **stack, regex_instr_t *instr) {
-    instr->next = *stack;
-    *stack = instr;
-}
-
-regex_instr_t *regexInstrStackPop(regex_instr_t **stack) {
-    regex_instr_t *instr;
-
-    if(*stack == NULL) {
-        return NULL;
-    }
-    instr = *stack;
-    *stack = instr->next;
-    return instr;
-}
-
-void regexPrintProgramElement(regex_token_t *token) {
-
-}
-
-void regexPrintProgram(regex_token_t *token) {
-    switch(token->tokenType) {
-        case eTokenNone: printf("!"); break;
-        case eTokenCharLiteral:
-            if((token->c < 32) || (token->c > 127)) {
-                printf("\\x%2.2x", token->c);
-            } else {
-                printf("%c", token->c);
-            }
-            break;
-        case eTokenCharClass:
-            printf("[");
-            regexPrintCharClass((unsigned char *)token->str);
-            printf("]");
-            if(token->outl != NULL) {
-                regexPrintProgram(token->outl);
-            }
-            break;
-        case eTokenStringLiteral:
-            printf("%s", token->str);
-            break;
-        case eTokenCharAny:
-            printf(".");
-            break;
-        case eTokenAlternative:
-            regexPrintProgram(token->outl);
-            printf("|");
-            regexPrintProgram(token->outr);
-            break;
-        case eTokenZeroOrOne:
-            regexPrintProgram(token->outl);
-            printf("?");
-            break;
-        case eTokenZeroOrMany:
-            regexPrintProgram(token->outl);
-            printf("*");
-            break;
-        case eTokenOneOrMany:
-            regexPrintProgram(token->outl);
-            printf("+");
-            break;
-        case eTokenSubExprStart:
-            printf("(");
-            regexPrintProgram(token->outl);
-            printf(")");
-
-        case eTokenSubExprEnd:
-        case eTokenMatch:
-        case eTokenConcatenation:
-        default:
-            break;
-    }
-}
-
-int regexShuntingYard(regex_token_t **program, regex_subexpr_name_t *list) {
-    printf("----------\n");
-
-    regexTokenChainPrint(*program, list);
-
-    printf("----------\n");
-
-    regex_token_t *lex_operands = NULL, *lex_operators = NULL, *token, *next, *lex_operator;
-    regex_instr_t *operands = NULL, *operators = NULL, *instr, *operator;
-    eRegexOpCode opcode;
+eRegexCompileStatus regexShuntingYard(regex_token_t **program) {
+    regex_token_t *operands = NULL, *operators = NULL, *token, *next, *operator;
 
     for(token = *program; token != NULL; token = next) {
         next = token->next;
@@ -995,11 +886,7 @@ int regexShuntingYard(regex_token_t **program, regex_subexpr_name_t *list) {
             case eTokenStringLiteral:
             case eTokenCharAny:
             case eTokenMatch:
-                if((instr = regexInstrCreate(regexGetOpcodeFromToken(token->tokenType), token->c, token->str)) == NULL) {
-                    return 0;
-                }
-                regexInstrStackPush(&operands, instr);
-                stackPush(&lex_operands, token);
+                stackPush(&operands, token);
                 break;
 
             case eTokenZeroOrOne:
@@ -1007,50 +894,49 @@ int regexShuntingYard(regex_token_t **program, regex_subexpr_name_t *list) {
             case eTokenOneOrMany:
             case eTokenAlternative:
             case eTokenConcatenation:
-                while(regexStackTypeGreaterOrEqualToToken(lex_operators, token)) {
-                    lex_operator = stackPop(&lex_operators);
-                    if(!regexApplyOperator(&lex_operands, lex_operator)) {
-                        return 0;
+                while(regexStackTypeGreaterOrEqualToToken(operators, token)) {
+                    operator = stackPop(&operators);
+                    if(!regexApplyOperator(&operands, operator)) {
+                        return eCompileMissingOperand;
                     }
                 }
-                stackPush(&lex_operators, token);
+                stackPush(&operators, token);
                 break;
 
             case eTokenSubExprStart:
-                stackPush(&lex_operators, token);
+                stackPush(&operators, token);
                 break;
 
             case eTokenSubExprEnd:
-                while(stackPeekType(lex_operators) != eTokenSubExprStart) {
-                    if((lex_operator = stackPop(&lex_operators)) == NULL) {
-                        printf("ERROR: Unable to find subexpression start token!\n");
-                        return 0;
+                while(stackPeekType(operators) != eTokenSubExprStart) {
+                    if((operator = stackPop(&operators)) == NULL) {
+                        return eCompileMissingSubexprStart;
                     }
-                    if(!regexApplyOperator(&lex_operands, lex_operator)) {
-                        return 0;
+                    if(!regexApplyOperator(&operands, operator)) {
+                        return eCompileMissingOperand;
                     }
                 }
                 // Pop and discard the closing subexpr end token
-                stackPop(&lex_operators);
+                stackPop(&operators);
                 break;
 
             default:
                 printf("ERROR: Unknown token token [%d]\n", token->tokenType);
-                return 0;
+                return eCompileInternalError;
         }
     }
 
-    while((lex_operator = stackPop(&lex_operators)) != NULL) {
-        if(!regexApplyOperator(&lex_operands, lex_operator)) {
-            return 0;
+    while((operator = stackPop(&operators)) != NULL) {
+        if(!regexApplyOperator(&operands, operator)) {
+            return eCompileMissingOperand;
         }
     }
 
     printf("INFO: Apparent success\n");
 
-    regexPrintProgram(lex_operands);
+    //regexTokenPrint(operands, NULL, 0, 1);
 
-    return 1;
+    return eCompileOk;
 }
 
 // NFA form regex support ///////////////////////////////////////////////////
@@ -1097,6 +983,15 @@ regex_state_t *regexStateCreate(eRegexOpCode opcode, int c, char *str, regex_sta
     state->out_a = out_a;
     state->out_b = out_b;
     return state;
+}
+
+void regexStateFree(regex_state_t *state) {
+    if((state->opcode == eCharClass) || (state->opcode == eStringLiteral)) {
+        if(state->str != NULL) {
+            free(state->str);
+        }
+    }
+    free(state);
 }
 
 regex_state_t *regexStateCharCreate(int c) {
@@ -1163,6 +1058,13 @@ void regexPtrlistPatch(regex_ptrlist_t *list, regex_state_t *state) {
     }
 }
 
+void regexPtrListFree(regex_ptrlist_t *list) {
+    regex_ptrlist_t *next = NULL;
+    for(; list != NULL; list = next) {
+        next = list->next;
+        free(list);
+    }
+}
 void regexFragmentStackPush(regex_fragment_t **stack, regex_fragment_t *fragment) {
     fragment->next = *stack;
     *stack = fragment;
@@ -1177,81 +1079,215 @@ regex_fragment_t *regexFragmentStackPop(regex_fragment_t **stack) {
     return fragment;
 }
 
-regex_state_t *regexBuildNFAFromPostfixForm(regex_token_t *token) {
-    regex_fragment_t *stack = NULL, *e1, *e2;
+int regexOperatorLiteralCreate(regex_fragment_t **stack, regex_token_t *token) {
     regex_state_t *state;
+    regex_fragment_t *fragment;
+    regex_ptrlist_t *list;
+
+    switch(token->tokenType) {
+        case eCharLiteral:
+            state = regexStateCharCreate(token->c);
+            break;
+        case eCharClass:
+            state = regexStateCharClassCreate((unsigned char *)token->str);
+            break;
+        case eStringLiteral:
+            state = regexStateStringCreate(token->str);
+            break;
+        case eCharAny:
+            state = regexStateAnyCreate();
+            break;
+        default:
+            return 0;
+    }
+    if(state == NULL) {
+        return 0;
+    }
+    if((list = regexPtrlistCreate(&(state->out_a))) == NULL) {
+        regexStateFree(state);
+        return 0;
+    }
+    if((fragment = regexFragmentCreate(state, list)) == NULL) {
+        regexPtrListFree(list);
+        return 0;
+    }
+    regexFragmentStackPush(stack, fragment);
+    return 1;
+}
+
+int regexOperatorConcatenationCreate(regex_fragment_t **stack) {
+    regex_fragment_t *e1, *e2;
+    regex_fragment_t *fragment;
+
+    if(((e2 = regexFragmentStackPop(stack)) == NULL) ||
+       ((e1 = regexFragmentStackPop(stack)) == NULL)) {
+        return 0;
+    }
+    regexPtrlistPatch(e1->ptrlist, e2->state);
+    if((fragment = regexFragmentCreate(e1->state, e2->ptrlist)) == NULL) {
+        return 0;
+    }
+    regexFragmentStackPush(stack, fragment);
+    return 1;
+}
+
+int regexOperatorAlternationCreate(regex_fragment_t **stack) {
+    regex_fragment_t *e1, *e2, *fragment;
+    regex_state_t *state;
+
+    if(((e2 = regexFragmentStackPop(stack)) == NULL) ||
+       ((e1 = regexFragmentStackPop(stack)) == NULL)) {
+        return 0;
+    }
+    if((state = regexStateSplitCreate(e1->state, e2->state)) == NULL) {
+        return 0;
+    }
+    if((fragment = regexFragmentCreate(state, regexPtrlistAppend(e1->ptrlist, e2->ptrlist))) == NULL) {
+        return 0;
+    }
+    regexFragmentStackPush(stack, fragment);
+    return 1;
+}
+
+int regexOperatorZeroOrOneCreate(regex_fragment_t **stack) {
+    regex_fragment_t *e, *fragment;
+    regex_state_t *state;
+    regex_ptrlist_t *list;
+
+    if((e = regexFragmentStackPop(stack)) == NULL) {
+        return 0;
+    }
+    if((state = regexStateSplitCreate(e->state, NULL)) == NULL) {
+        return 0;
+    }
+    if((list = regexPtrlistCreate(&(state->out_b))) == NULL) {
+        return 0;
+    }
+    if((fragment = regexFragmentCreate(state, regexPtrlistAppend(e->ptrlist, list))) == NULL) {
+        return 0;
+    }
+    regexFragmentStackPush(stack, fragment);
+    return 1;
+}
+
+int regexOperatorZeroOrMoreCreate(regex_fragment_t **stack) {
+    regex_state_t *state;
+    regex_ptrlist_t *list;
+    regex_fragment_t *fragment, *e;
+
+    if((e = regexFragmentStackPop(stack)) == NULL) {
+        return 0;
+    }
+    if((state = regexStateSplitCreate(e->state, NULL)) == NULL) {
+        regexFragmentStackPush(stack, e);
+        return 0;
+    }
+    regexPtrlistPatch(e->ptrlist, state);
+    if((list = regexPtrlistCreate(&(state->out_b))) == NULL) {
+        return 0;
+    }
+    if((fragment = regexFragmentCreate(state, list)) == NULL) {
+        return 0;
+    }
+    regexFragmentStackPush(stack, fragment);
+    return 1;
+}
+
+int regexOperatorOneOrMoreCreate(regex_fragment_t **stack) {
+    regex_state_t *state;
+    regex_ptrlist_t *list;
+    regex_fragment_t *fragment, *e;
+
+    if((e = regexFragmentStackPop(stack)) == NULL) {
+        return 0;
+    }
+    if((state = regexStateSplitCreate(e->state, NULL)) == NULL) {
+        regexFragmentStackPush(stack, e);
+        return 0;
+    }
+    regexPtrlistPatch(e->ptrlist, state);
+    if((list = regexPtrlistCreate(&(state->out_b))) == NULL) {
+        free(state);
+        return 0;
+    }
+    if((fragment = regexFragmentCreate(e->state, list)) == NULL) {
+        free(list);
+        return 0;
+    }
+    regexFragmentStackPush(stack, fragment);
+    return 1;
+}
+
+regex_state_t *regexBuildNFAFromPostfixForm(regex_token_t *token) {
+    regex_fragment_t *stack = NULL, *e;
 
     for(; token != NULL; token = token->next) {
         switch(token->tokenType) {
             case eTokenCharLiteral:
-                state = regexStateCharCreate(token->c);
-                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistCreate(&(state->out_a))));
-                break;
-
             case eTokenCharClass:
-                state = regexStateCharClassCreate((unsigned char *)token->str);
-                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistCreate(&(state->out_a))));
-                break;
-
             case eTokenStringLiteral:
-                state = regexStateStringCreate(token->str);
-                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistCreate(&(state->out_a))));
-                break;
-
             case eTokenCharAny:
-                state = regexStateAnyCreate();
-                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistCreate(&(state->out_a))));
+                if(!regexOperatorLiteralCreate(&stack, token)) {
+                    goto NFAFailure;
+                }
                 break;
 
             case eTokenZeroOrOne:
-                e1 = regexFragmentStackPop(&stack);
-                state = regexStateSplitCreate(e1->state, NULL);
-                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistAppend(e1->ptrlist, regexPtrlistCreate(&state->out_b))));
+                if(!regexOperatorZeroOrOneCreate(&stack)) {
+                    goto NFAFailure;
+                }
                 break;
 
             case eTokenZeroOrMany:
-                e1 = regexFragmentStackPop(&stack);
-                state = regexStateSplitCreate(e1->state, NULL);
-                regexPtrlistPatch(e1->ptrlist, state);
-                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistCreate(&(state->out_b))));
+                if(!regexOperatorZeroOrMoreCreate(&stack)) {
+                    goto NFAFailure;
+                }
                 break;
 
             case eTokenOneOrMany:
-                e1 = regexFragmentStackPop(&stack);
-                state = regexStateSplitCreate(e1->state, NULL);
-                regexPtrlistPatch(e1->ptrlist, state);
-                regexFragmentStackPush(&stack, regexFragmentCreate(e1->state, regexPtrlistCreate(&(state->out_b))));
+                if(!regexOperatorOneOrMoreCreate(&stack)) {
+                    goto NFAFailure;
+                }
                 break;
 
             case eTokenAlternative:
-                e2 = regexFragmentStackPop(&stack);
-                e1 = regexFragmentStackPop(&stack);
-                state = regexStateSplitCreate(e1->state, e2->state);
-                regexFragmentStackPush(&stack, regexFragmentCreate(state, regexPtrlistAppend(e1->ptrlist, e2->ptrlist)));
+                if(!regexOperatorAlternationCreate(&stack)) {
+                    goto NFAFailure;
+                }
                 break;
 
             case eTokenConcatenation:
-                e2 = regexFragmentStackPop(&stack);
-                e1 = regexFragmentStackPop(&stack);
-                regexPtrlistPatch(e1->ptrlist, e2->state);
-                regexFragmentStackPush(&stack, regexFragmentCreate(e1->state, e2->ptrlist));
+                if(!regexOperatorConcatenationCreate(&stack)) {
+                    goto NFAFailure;
+                }
                 break;
 
             case eTokenSubExprStart:
+                // TODO
                 break;
 
             case eTokenSubExprEnd:
+                // TODO
                 break;
 
             default:
-                printf("ERROR: Unknown token token [%d]\n", token->tokenType);
+                printf("ERROR: Unknown token [%d]\n", token->tokenType);
                 return NULL;
         }
-        e1 = regexFragmentStackPop(&stack);
-        regexPtrlistPatch(e1->ptrlist, regexStateCreate(eMatch, 0, NULL, NULL, NULL));
-        return e1->state;
+        if((e = regexFragmentStackPop(&stack)) == NULL) {
+            return NULL;
+        }
+        regexPtrlistPatch(e->ptrlist, regexStateCreate(eMatch, 0, NULL, NULL, NULL));
+        return e->state;
     }
-    return state;
+
+    if(stack != NULL) {
+        return stack->state;
+    }
+
+NFAFailure:
+    // TODO - cleanup
+    return NULL;
 }
 
 #if 0
@@ -1332,31 +1368,46 @@ struct regex_compile_ctx_s {
     eRegexCompileStatus status;
     const char *pattern;
     int position;
+    regex_token_t *tokens;
+    regex_subexpr_name_t *subexpr_list;
 };
+
+void regexCompileCtxCleanup(regex_compile_ctx_t *ctx) {
+    if(ctx->tokens != NULL) {
+        regexTokenDestroy(ctx->tokens);
+        ctx->tokens = NULL;
+    }
+    if(ctx->subexpr_list != NULL) {
+        regexSubexprLookupFree(ctx->subexpr_list);
+        ctx->subexpr_list = NULL;
+    }
+}
 
 #define SET_RESULT(stat)  result.status = stat; goto compileFailure;
 
-// Return a compiled regex, or an error and position within the pattern
-regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
+regex_compile_ctx_t regexTokenizePattern(const char *pattern) {
     regex_compile_ctx_t result = {
             .status = eCompileOk,
             .pattern = pattern,
-            .position = 0
+            .position = 0,
+            .tokens = NULL,
+            .subexpr_list = NULL
     };
     character_t c;
     int response;
     int len;
     char *str;
-    char character;
     unsigned char bitmap[32];
     eRegexCompileStatus status;
     int subexpr = 0;
-    regex_token_t *program = NULL;
-    regex_subexpr_name_t *subexpr_list = NULL;
-    regex_token_t *operands = NULL, *operators = NULL, *operator;
 
+    // Parse the regex pattern into a sequence of tokens (operators and operands)
+    // The output of this stage is a sequence of lexical tokens in infix form
 
+    // Loop through the pattern until we've handled it all
     for(; *pattern != '\0';) {
+        // Get the next character in the pattern. The helper function assists
+        // in disambiguating escaped characters.
         c = regexGetNextPatternChar(&pattern);
         if(c.c == -1) {
             SET_RESULT(eCompileEscapeCharIncomplete);
@@ -1365,36 +1416,51 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
         if(!c.escaped) {
             switch(c.c) {
                 case '.':
-                    if(!regexTokenCreate(&program, eTokenCharAny, 0, 0)) {
+                    // Operand, the meta "ANY" char
+                    if(!regexTokenCreate(&(result.tokens), eTokenCharAny, 0, 0)) {
                         SET_RESULT(eCompileOutOfMem);
                     }
-                    printf("Any\n");
                     continue;
-                case '|':
-                    if(!regexTokenCreate(&program, eTokenAlternative, 0, 0)) {
+
+                case '[':
+                    // Operand, character class
+                    if((status = regexParseCharClass(&pattern, bitmap)) != eCompileOk) {
+                        SET_RESULT(status);
+                    }
+                    if((str = (char *)mapCopy(bitmap)) == NULL) {
                         SET_RESULT(eCompileOutOfMem);
                     }
-                    printf("Alt\n");
+                    if(!regexTokenCreate(&(result.tokens), eTokenCharClass, 0, str)) {
+                        SET_RESULT(eCompileOutOfMem);
+                    }
                     continue;
+
                 case '?':
-                    if(!regexTokenCreate(&program, eTokenZeroOrOne, 0, 0)) {
+                    if(!regexTokenCreate(&(result.tokens), eTokenZeroOrOne, 0, 0)) {
                         SET_RESULT(eCompileOutOfMem);
                     }
-                    printf("ZeroOrOne\n");
                     continue;
+
                 case '*':
-                    if(!regexTokenCreate(&program, eTokenZeroOrMany, 0, 0)) {
+                    if(!regexTokenCreate(&(result.tokens), eTokenZeroOrMany, 0, 0)) {
                         SET_RESULT(eCompileOutOfMem);
                     }
-                    printf("ZeroOrMore\n");
                     continue;
+
                 case '+':
-                    if(!regexTokenCreate(&program, eTokenOneOrMany, 0, 0)) {
+                    if(!regexTokenCreate(&(result.tokens), eTokenOneOrMany, 0, 0)) {
                         SET_RESULT(eCompileOutOfMem);
                     }
-                    printf("OneOrMore\n");
                     continue;
+
+                case '|':
+                    if(!regexTokenCreate(&(result.tokens), eTokenAlternative, 0, 0)) {
+                        SET_RESULT(eCompileOutOfMem);
+                    }
+                    continue;
+
                 case '(':
+                    // Grouped subexpression, complex operator, resolves to a compound operand
                     subexpr++;
                     str = NULL;
                     if(regexCheckNextPatternChar(&pattern, '?')) {
@@ -1407,63 +1473,37 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
                             if(!regexCheckNextPatternChar(&pattern, '<')) {
                                 SET_RESULT(eCompileMalformedSubExprName);
                             }
-                            if((response = regexSubexprLookupEntryCreate(&subexpr_list, &pattern, subexpr)) != 1) {
+                            if((response = regexSubexprLookupEntryCreate(&(result.subexpr_list), &pattern, subexpr)) != 1) {
                                 SET_RESULT((response == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName));
                             }
-                            printf("[%s]", subexpr_list->name);
                         } else {
                             SET_RESULT(eCompileUnsupportedMeta);
                         }
                     }
-                    if(!regexTokenCreate(&program, eTokenSubExprStart, subexpr, NULL)) {
+                    if(!regexTokenCreate(&(result.tokens), eTokenSubExprStart, subexpr, NULL)) {
                         SET_RESULT(eCompileOutOfMem);
                     }
-                    printf("({%d%s%s}\n", subexpr, ((subexpr_list != NULL && subexpr_list->index == subexpr) ? ":" : ""), ((subexpr_list != NULL && subexpr_list->index == subexpr) ? subexpr_list->name : ""));
                     continue;
+
                 case ')':
-                    if(!regexTokenCreate(&program, eTokenSubExprEnd, 0, 0)) {
+                    // End of grouped subexpression
+                    if(!regexTokenCreate(&(result.tokens), eTokenSubExprEnd, 0, 0)) {
                         SET_RESULT(eCompileOutOfMem);
                     }
-                    printf(")\n");
                     continue;
-                case '[':
-                    if((status = regexParseCharClass(&pattern, bitmap)) != eCompileOk) {
-                        SET_RESULT(status);
-                    }
-                    if((str = (char *)mapCopy(bitmap)) == NULL) {
-                        SET_RESULT(eCompileOutOfMem);
-                    }
-                    if(!regexTokenCreate(&program, eTokenCharClass, 0, str)) {
-                        SET_RESULT(eCompileOutOfMem);
-                    }
-                    printf("CharClass(");
-                    regexPrintCharClass(bitmap);
-                    printf(")\n");
-                    continue;
+
                 default:
-                    // Unnecessary escaping
+                    // Operand, unnecessary escaping, fall through to "regular character"...
                     break;
             }
         }
 
-        // Regular character
+        // Operand, either character literal or string literal
         switch(len = regexGetPatternStrLen(&pattern)) {
             case -1:
-                SET_RESULT(eCompileEscapeCharIncomplete);
+            SET_RESULT(eCompileEscapeCharIncomplete);
             case 0:
-                if(c.escaped) {
-                    switch(c.c) {
-                        case 'r': character = '\r'; break;
-                        case 'n': character = '\n'; break;
-                        case 't': character = '\t'; break;
-                        default: character = c.c; break;
-                    }
-                    printf("CHAR(\\%c)\n", c.c);
-                } else {
-                    character = c.c;
-                    printf("CHAR(%c)\n", c.c);
-                }
-                if(!regexTokenCreate(&program, eTokenCharLiteral, character, 0)) {
+                if(!regexTokenCreate(&(result.tokens), eTokenCharLiteral, (char)(c.c), 0)) {
                     SET_RESULT(eCompileOutOfMem);
                 }
                 break;
@@ -1476,35 +1516,65 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
                 if((str = regexGetPatternStr(&pattern, len)) == NULL) {
                     SET_RESULT(eCompileOutOfMem);
                 }
-                if(!regexTokenCreate(&program, eTokenStringLiteral, 0, str)) {
+                if(!regexTokenCreate(&(result.tokens), eTokenStringLiteral, 0, str)) {
                     SET_RESULT(eCompileOutOfMem);
                 }
-                printf("STRING(\"%s\")\n", str);
         }
     }
 
-    // The final implicit lexeme is the "match"
-
-    /*
-    if(!regexTokenCreate(&program, eTokenMatch, 0, 0)) {
-        SET_RESULT(eCompileOutOfMem);
-    }
-    */
-
-    // Attempt to convert to infix form
-
-    regexShuntingYard(&program, subexpr_list);
-
-    regexTokenDestroy(program);
-    regexSubexprLookupFree(subexpr_list);
-    program = NULL;
-
-    return result;
+    SET_RESULT(eCompileOk);
 
 compileFailure:
     result.position = (int)(pattern - result.pattern);
 
-    // TODO - cleanup
+    if(result.status != eCompileOk) {
+        regexCompileCtxCleanup(&result);
+    }
+
+    return result;
+}
+
+// Return a compiled regex, or an error and position within the pattern
+regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
+    regex_compile_ctx_t result;
+
+    // Parse the regex pattern into a sequence of tokens (operators and operands)
+    // The output of this stage is a sequence of lexical tokens in infix form
+
+    result = regexTokenizePattern(pattern);
+    if(result.status != eCompileOk) {
+        regexCompileCtxCleanup(&result);
+        return result;
+    }
+
+    regexTokenChainPrint(result.tokens, result.subexpr_list);
+
+    // Next, convert the infix form of the regular expression to postfix form.
+    // We accomplish this using the shunting yard algorithm.
+
+    if((result.status = regexShuntingYard(&(result.tokens))) != eCompileOk) {
+        regexCompileCtxCleanup(&result);
+        return result;
+    }
+
+    // Finally, convert the infix form of the postfix expression into an ordered
+    // NFA. This final form is used to perform the actual expression matching.
+
+    // TODO
+    /*
+    if(!regexBuildNFAFromPostfixForm(result.tokens)) {
+        result.status = eCompileInternalError;
+        return result;
+    }
+    */
+
+    // Return the completed NFA and associated meta-data to the caller.
+
+    // TODO
+
+    // Attempt to convert to infix form
+
+    regexCompileCtxCleanup(&result);
 
     return result;
 }
