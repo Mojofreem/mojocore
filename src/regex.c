@@ -142,31 +142,24 @@ With implied concatenation (#) operators:
     14  cl[0-9]     split 12, 14
     15  match
 
-    1   c(a)        c(a)
-    2   #           c(a)                                                                                    #
-    3   (           c(a)                                                                                    # (
-    4   s(bcd)      c(a) s(bcd)                                                                             # (
-    5   #           c(a) s(bcd)                                                                             # ( #
-    6   (           c(a) s(bcd)                                                                             # ( # (
-    7   s(efg)      c(a) s(bcd) s(efg)                                                                      # ( # (
-    8   *           c(a) s(bcd) s(efg)                                                                      # ( # ( *
-    9   #           c(a) s(bcd) s(efg) kleene                                                               # ( # ( #
-    10  cl(hijk)    c(a) s(bcd) s(efg) kleene cl(hijk)                                                    # ( # ( #
-    11  #           c(a) s(bcd) s(efg) kleene cl(hijk)                                                     # ( # ( # #
-    12  s(foo)      c(a) s(bcd) s(efg) kleene cl(hijk) s(foo)                                              # ( # ( # #
-    13  )           c(a) s(bcd) g([kleene(s(efg)) [cl(hijk) s(foo)]])                                       # ( #
-    14  ?           c(a) s(bcd) g([kleene(s(efg)) [cl(hijk) s(foo)]])                                       # ( # ?
-    15  )           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))])                             #
-    16  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))])                             # #
-    17  cl(0-9)     c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) cl(0-9)                     # #
-    18  +           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) cl(0-9)                     # # +
-    19  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) many(cl(0-9))               # # #
-    20  s(cat)      c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9))        # # #
-    21  #           c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9))        # # # #
-    21  <DONE>      c(a) g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) s(cat) many(cl(0-9)) <DONE> # # # #
-    22              [c(a) [g([s(bcd) opt(g([kleene(s(efg)) [cl(hijk) s(foo)]]))]) [s(cat) [many(cl(0-9)) <DONE>]]]]
+NFA to VM:
 
- */
+    literals
+        char
+            op() (char)
+        string
+            op() (string table index)
+        class
+            op() (class table index)
+        any
+            op()
+    match
+        op()
+    split
+        op() (index a) (index b)
+    save
+        op() (subexpr index)
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -719,12 +712,15 @@ void regexTokenDestroy(regex_token_t *token) {
     }
 }
 
+typedef struct regex_state_s regex_state_t;
+
 typedef struct regex_compile_ctx_s regex_compile_ctx_t;
 struct regex_compile_ctx_s {
     eRegexCompileStatus status;
     const char *pattern;
     int position;
     regex_token_t *tokens;
+    regex_state_t *state_tree;
     regex_subexpr_name_t *subexpr_list;
 };
 
@@ -988,7 +984,6 @@ typedef enum {
 
 // NFA form regex support ///////////////////////////////////////////////////
 
-typedef struct regex_state_s regex_state_t;
 struct regex_state_s {
     eRegexOpCode opcode;
     union {
@@ -997,6 +992,7 @@ struct regex_state_s {
         unsigned char *bitmap;
         int group;
     };
+    int index;
     regex_state_t *out_a;
     regex_state_t *out_b;
 };
@@ -1475,8 +1471,15 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
     }
 
     if(sub_expression != -1) {
-        return eCompileInternalError;
+        SET_YARD_RESULT(eCompileInternalError);
     }
+
+    // Complete the sequence with a match
+    if(!regexOperatorMatchCreate(&operands)) {
+        SET_YARD_RESULT(eCompileOutOfMem);
+    }
+
+    *root_stack = operands;
 
     return status;
 
@@ -1486,16 +1489,14 @@ ShuntingYardFailure:
     return status;
 }
 
-eRegexCompileStatus regexShuntingYard(regex_token_t **tokens) {
+eRegexCompileStatus regexShuntingYard(regex_compile_ctx_t *ctx) {
     regex_fragment_t *stack = NULL;
     eRegexCompileStatus status;
 
     printf("\n== Shunting yard ==============================\n\n");
 
-    if((status = regexShuntingYardFragment(tokens, &stack, -1)) != eCompileOk) {
-        return status;
-    }
-    return eCompileOk;
+    ctx->status = regexShuntingYardFragment(&(ctx->tokens), &stack, -1);
+    return ctx->status;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1519,28 +1520,14 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
     // and derive an NFA representation. We accomplish this using the shunting
     // yard algorithm.
 
-    if((result.status = regexShuntingYard(&(result.tokens))) != eCompileOk) {
+    if((result.status = regexShuntingYard(&result)) != eCompileOk) {
         regexCompileCtxCleanup(&result);
         return result;
     }
 
-    // Finally, convert the infix form of the postfix expression into an ordered
-    // NFA. This final form is used to perform the actual expression matching.
-
-    // TODO
-    /*
-    if(!regexBuildNFAFromPostfixForm(result.tokens)) {
-        result.status = eCompileInternalError;
-        return result;
-    }
-    */
-
-    // Return the completed NFA and associated meta-data to the caller.
-
-    // TODO
-
-    // Attempt to convert to infix form
-
+    // At this point, we have a valid NFA form of the regular expression. We
+    // can use it directly, or transform it into the compact VM form.
+    
     regexCompileCtxCleanup(&result);
 
     return result;
