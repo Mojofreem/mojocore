@@ -914,6 +914,13 @@ regex_token_t *regexTokenStackPop(regex_token_t **stack) {
     return entry;
 }
 
+int regexTokenStackSize(regex_token_t *stack) {
+    int count = 0;
+
+    for(; stack != NULL; stack = stack->next, count++);
+    return count;
+}
+
 eRegexToken regexTokenStackPeekType(regex_token_t *stack) {
     if(stack == NULL) {
         return eTokenNone;
@@ -950,6 +957,7 @@ int regexStackTypeGreaterOrEqualToToken(regex_token_t *stack, eRegexToken tokenT
     eRegexTokenPriority stackPriority;
 
     stackPriority = regexGetTokenTypePriority(regexTokenStackPeekType(stack));
+    //printf("Priority s[%d] t[%d]\n", stackPriority, regexGetTokenTypePriority(tokenType));
     return (stackPriority >= regexGetTokenTypePriority(tokenType));
 }
 
@@ -967,29 +975,6 @@ int regexGetOperatorArity(regex_token_t *token) {
     }
 }
 
-#if 0
-
-int regexApplyOperator(regex_token_t **operands, regex_token_t *operator) {
-    int arity = regexGetOperatorArity(operator);
-    operator->next = NULL;
-#if 0
-    if((operator->outl = stackPop(operands)) == NULL) {
-        printf("ERROR: Missing operand 1 for operator\n");
-        return 0;
-    }
-    if(arity > 1) {
-        operator->outr = operator->outl;
-        if((operator->outl = stackPop(operands)) == NULL) {
-            printf("ERROR: Missing operand 2 for operator\n");
-            return 0;
-        }
-    }
-#endif
-    regexTokenStackPush(operands, operator);
-    return 1;
-}
-#endif
-
 typedef enum {
     eCharLiteral,
     eMatch,
@@ -1000,75 +985,6 @@ typedef enum {
     eStringLiteral,
     eCharAny
 } eRegexOpCode;
-
-#if 0
-eRegexCompileStatus regexShuntingYard(regex_token_t **program) {
-    regex_token_t *operators = NULL, *token, *next, *operator;
-
-    for(token = *program; token != NULL; token = next) {
-        next = token->next;
-        token->next = NULL;
-
-        switch(token->tokenType) {
-            case eTokenCharLiteral:
-            case eTokenCharClass:
-            case eTokenStringLiteral:
-            case eTokenCharAny:
-            case eTokenMatch:
-                // TODO - add literal
-                //stackPush(&operands, token);
-                break;
-
-            case eTokenZeroOrOne:
-            case eTokenZeroOrMany:
-            case eTokenOneOrMany:
-            case eTokenAlternative:
-            case eTokenConcatenation:
-                while(regexStackTypeGreaterOrEqualToToken(operators, token)) {
-                    operator = stackPop(&operators);
-                    if(!regexApplyOperator(&operands, operator)) {
-                        return eCompileMissingOperand;
-                    }
-                }
-                stackPush(&operators, token);
-                break;
-
-            case eTokenSubExprStart:
-                stackPush(&operators, token);
-                break;
-
-            case eTokenSubExprEnd:
-                while(stackPeekType(operators) != eTokenSubExprStart) {
-                    if((operator = stackPop(&operators)) == NULL) {
-                        return eCompileMissingSubexprStart;
-                    }
-                    if(!regexApplyOperator(&operands, operator)) {
-                        return eCompileMissingOperand;
-                    }
-                }
-                // Pop and discard the closing subexpr end token
-                stackPop(&operators);
-                break;
-
-            default:
-                printf("ERROR: Unknown token token [%d]\n", token->tokenType);
-                return eCompileInternalError;
-        }
-    }
-
-    while((operator = stackPop(&operators)) != NULL) {
-        if(!regexApplyOperator(&operands, operator)) {
-            return eCompileMissingOperand;
-        }
-    }
-
-    printf("INFO: Apparent success\n");
-
-    //regexTokenPrint(operands, NULL, 0, 1);
-
-    return eCompileOk;
-}
-#endif
 
 // NFA form regex support ///////////////////////////////////////////////////
 
@@ -1412,11 +1328,11 @@ int regexOperatorMatchCreate(regex_fragment_t **stack) {
     return 1;
 }
 
-void regexFragmentStackSize(regex_fragment_t *fragments) {
+int regexFragmentStackSize(regex_fragment_t *fragments) {
     int depth = 0;
 
     for(; fragments != NULL; depth++, fragments = fragments->next);
-    printf("Fragment stack depth is %d\n", depth);
+    return depth;
 }
 
 int regexHasSufficientOperands(regex_fragment_t *fragments, int arity) {
@@ -1482,20 +1398,12 @@ eRegexCompileStatus regexOperatorApply(regex_token_t **operators, eRegexOpApply 
 
 eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_fragment_t **root_stack, int sub_expression) {
     regex_token_t *token, *operators = NULL;
-    regex_fragment_t *operands = NULL, *subexpr;
+    regex_fragment_t *operands = NULL, *subexpr, *sidestack;
     eRegexCompileStatus status = eCompileOk;
-
-    if(sub_expression != -1) {
-        // This is a subexpression group. We need to inject a concatenation
-        // operator to join the start of the expression with the group, and
-        // follow up with a concatenation of the close of the expression.
-        if(!regexTokenCreate(&operators, eTokenConcatenation, 0, NULL)) {
-            SET_YARD_RESULT(eCompileOutOfMem);
-        }
-    }
 
     while((token = regexTokenStackPop(tokens)) != NULL) {
         regexFragmentStackSize(operands);
+        //printf("=> Operands: %d,  Operators: %d\n", regexFragmentStackSize(operands), regexTokenStackSize(operators));
         regexTokenPrint(token, NULL, 1);
         switch(token->tokenType) {
             default:
@@ -1525,33 +1433,41 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
                 break;
 
             case eTokenSubExprStart:
-                // TODO - pass subexpression number, and discard group token
                 subexpr = NULL;
-                if(!regexOperatorSubexprCreate(&subexpr, token->c)) {
-                    SET_YARD_RESULT(eCompileOutOfMem);
-                }
                 if((status = regexShuntingYardFragment(tokens, &subexpr, token->c)) != eCompileOk) {
                     goto ShuntingYardFailure;
                 }
+                regexFragmentStackPush(&operands, subexpr);
                 break;
 
             case eTokenSubExprEnd:
-                // TODO - wrap fragment in start/end operators, and return in the root_stack
                 regexTokenDestroy(token);
                 if(sub_expression == -1) {
                     SET_YARD_RESULT(eCompileMissingSubexprStart);
-                }
-                if(!regexTokenCreate(&operators, eTokenConcatenation, 0, NULL)) {
-                    SET_YARD_RESULT(eCompileOutOfMem);
-                }
-                if(!regexOperatorSubexprCreate(&operands, sub_expression + 1)) {
-                    SET_YARD_RESULT(eCompileOutOfMem);
                 }
                 if((status = regexOperatorApply(&operators, OP_ALL, 0, &operands)) != eCompileOk) {
                     goto ShuntingYardFailure;
                 }
                 if(operands->next != NULL) {
                     SET_YARD_RESULT(eCompileInternalError);
+                }
+                sidestack = regexFragmentStackPop(&operands);
+                // Prefix/suffix the group operators
+                if(!regexOperatorSubexprCreate(&operands, token->c)) {
+                    SET_YARD_RESULT(eCompileOutOfMem);
+                }
+                regexFragmentStackPush(&operands, sidestack);
+                if(!regexOperatorSubexprCreate(&operands, sub_expression + 1)) {
+                    SET_YARD_RESULT(eCompileOutOfMem);
+                }
+                if(!regexTokenCreate(&operators, eTokenConcatenation, 0, NULL)) {
+                    SET_YARD_RESULT(eCompileOutOfMem);
+                }
+                if(!regexTokenCreate(&operators, eTokenConcatenation, 0, NULL)) {
+                    SET_YARD_RESULT(eCompileOutOfMem);
+                }
+                if((status = regexOperatorApply(&operators, OP_ALL, 0, &operands)) != eCompileOk) {
+                    goto ShuntingYardFailure;
                 }
                 regexFragmentStackPush(root_stack, operands);
                 return eCompileOk;
@@ -1582,154 +1498,7 @@ eRegexCompileStatus regexShuntingYard(regex_token_t **tokens) {
     return eCompileOk;
 }
 
-#if 0
-regex_state_t *regexBuildNFAFromPostfixForm(regex_token_t *token) {
-    regex_fragment_t *operands = NULL, *operators = NULL, *operand, *operator;
-    regex_token_t *next;
-    regex_fragment_t *stack = NULL, *e;
-
-    for(; token != NULL; token = next) {
-        next = token->next;
-        switch(token->tokenType) {
-            case eTokenCharLiteral:
-            case eTokenCharClass:
-            case eTokenStringLiteral:
-            case eTokenCharAny:
-                if(!regexOperatorLiteralCreate(&stack, token)) {
-                    goto NFAFailure;
-                }
-                break;
-
-            case eTokenZeroOrOne:
-                if(!regexOperatorZeroOrOneCreate(&stack)) {
-                    goto NFAFailure;
-                }
-                break;
-
-            case eTokenZeroOrMany:
-                if(!regexOperatorZeroOrMoreCreate(&stack)) {
-                    goto NFAFailure;
-                }
-                break;
-
-            case eTokenOneOrMany:
-                if(!regexOperatorOneOrMoreCreate(&stack)) {
-                    goto NFAFailure;
-                }
-                break;
-
-            case eTokenAlternative:
-                if(!regexOperatorAlternationCreate(&stack)) {
-                    goto NFAFailure;
-                }
-                break;
-
-            case eTokenConcatenation:
-                if(!regexOperatorConcatenationCreate(&stack)) {
-                    goto NFAFailure;
-                }
-                break;
-
-            case eTokenSubExprStart:
-                // TODO
-                break;
-
-            case eTokenSubExprEnd:
-                // TODO
-                break;
-
-            default:
-                printf("ERROR: Unknown token [%d]\n", token->tokenType);
-                return NULL;
-        }
-    }
-    if(!regexOperatorMatchCreate(&stack)) {
-        return NULL;
-    }
-
-    if(stack != NULL) {
-        return stack->state;
-    }
-
-NFAFailure:
-    // TODO - cleanup
-    return NULL;
-}
-#endif
-
-#if 0
-
-int regexInfixToPostfix(regex_token_t **program, regex_subexpr_name_t *list) {
-    printf("----------\n");
-
-    regex_token_t *operands = NULL, *operators = NULL, *lexeme, *next, *operator;
-
-    for(lexeme = *program; lexeme != NULL; lexeme = next) {
-        next = lexeme->next;
-        lexeme->next = NULL;
-
-        switch(lexeme->tokenType) {
-            case eTokenCharLiteral:
-            case eTokenCharClass:
-            case eTokenStringLiteral:
-            case eTokenCharAny:
-                stackPush(&operands, lexeme);
-                break;
-
-            case eTokenZeroOrOne:
-            case eTokenZeroOrMany:
-            case eTokenOneOrMany:
-            case eTokenAlternative:
-            case eTokenConcatenation:
-                while(regexStackTypeGreaterOrEqualToLexeme(operators, lexeme)) {
-                    operator = stackPop(&operators);
-                    if(!regexApplyOperator(&operands, operator)) {
-                        return 0;
-                    }
-                }
-                stackPush(&operators, lexeme);
-                break;
-
-            case eTokenSubExprStart:
-                stackPush(&lex_operators, lexeme);
-                break;
-
-            case eTokenSubExprEnd:
-                while(stackPeekType(lex_operators) != eTokenSubExprStart) {
-                    if((lex_operator = stackPop(&lex_operators)) == NULL) {
-                        printf("ERROR: Unable to find subexpression start token!\n");
-                        return 0;
-                    }
-                    if(!regexApplyOperator(&lex_operands, lex_operator)) {
-                        return 0;
-                    }
-                }
-                // Pop and discard the closing subexpr end token
-                stackPop(&lex_operators);
-                break;
-
-            default:
-                printf("ERROR: Unknown lexeme token [%d]\n", lexeme->tokenType);
-                return 0;
-        }
-    }
-
-    while((lex_operator = stackPop(&lex_operators)) != NULL) {
-        if(!regexApplyOperator(&lex_operands, lex_operator)) {
-            return 0;
-        }
-    }
-
-    printf("INFO: Apparent success\n");
-
-    regexPrintProgram(lex_operands);
-
-    return 1;
-}
-#endif
-
 /////////////////////////////////////////////////////////////////////////////
-
 
 // Return a compiled regex, or an error and position within the pattern
 regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
