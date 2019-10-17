@@ -16,6 +16,8 @@ The regular expression:
 
     a(bcd(?iefg[hijk]foo)?)[0-9]+cat
 
+    a(?P<foolio>bcd(?iefg[hijk]foo)?)[0-9]+cat
+
 Should be converted into the conceptual regex VM program:
 
 1       0  char a
@@ -159,12 +161,42 @@ NFA to VM:
         op() (index a) (index b)
     save
         op() (subexpr index)
+
+A given token sequence can be used to generate a regex tree in 2 primary forms:
+NFA, and VM bytecode
+
+Node type
+--------------
+Terminal        2 ints: opcode, identifier
+                char - character code
+                string - string table index
+                class - class table index
+AnyChar         1 int
+Concatenation   no explicit, sequentially ordered
+Alternation     split (3 ints), jmp (2 ints)
+ZeroOrOne       split (3 ints)
+ZeroOrMany      split (3 ints), jmp (2 ints)
+OneOrMany       split (3 ints)
+Subexpression   processed as a subsequence, + 2 saves (2 ints each)
+
+    c(a) # ( s(bcd) # ( s(efg) # cl(hijk) # s(foo) ) ? ) # cl(0-9) + # s(cat)
+
+    c(a) s(bcd) s(efg) cl(hijk) # s(foo) # ( ? # ( # cl(0-9) + # s(cat) #
+    c(a) # g( s(bcd) # g( s(efg) # cl(hijk) # s(foo) )? ) # cl(0-9)+ # s(cat)
+
+
+    token type
+    operand/operator
+    arity
+
+split over group should go to token after group close
+split on group should go to token after group open
+
 */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 
 typedef enum {
     eTokenNone,
@@ -182,12 +214,88 @@ typedef enum {
     eTokenMatch
 } eRegexToken;
 
+typedef struct regex_token_s regex_token_t;
+struct regex_token_s {
+    eRegexToken tokenType;
+    union {
+        int c;
+        char *str;
+    };
+    regex_token_t *next;
+};
+
+typedef struct regex_subexpr_name_s regex_subexpr_name_t;
+struct regex_subexpr_name_s {
+    int index;
+    regex_subexpr_name_t *next;
+    char name[0];
+};
+
 typedef enum {
     ePriorityNone,
     ePriorityLow,
     ePriorityMedium,
     ePriorityHigh
 } eRegexTokenPriority;
+
+typedef enum {
+    eCharLiteral,
+    eMatch,
+    eJmp,
+    eSplit,
+    eSave,
+    eCharClass,
+    eStringLiteral,
+    eCharAny
+} eRegexOpCode;
+
+typedef struct regex_state_s regex_state_t;
+struct regex_state_s {
+    eRegexOpCode opcode;
+    union {
+        int c;
+        char *str;
+        unsigned char *bitmap;
+        int group;
+    };
+    int pc;
+    regex_state_t *out_a;
+    regex_state_t *out_b;
+};
+
+typedef struct regex_ptrlist_s regex_ptrlist_t;
+struct regex_ptrlist_s {
+    regex_state_t **out;
+    regex_ptrlist_t *next;
+};
+
+typedef struct regex_fragment_s regex_fragment_t;
+struct regex_fragment_s {
+    regex_state_t *state;
+    regex_ptrlist_t *ptrlist;
+    regex_fragment_t *next;
+};
+
+typedef struct regex_vm_build_s regex_vm_build_t;
+struct regex_vm_build_s {
+    int pc;
+    int str_tbl_size;
+    int str_tbl_index;
+    char **str_table;
+    int class_tbl_size;
+    int class_tbl_index;
+    unsigned char **class_table;
+    int prog_size;
+    int *program;
+};
+
+typedef enum {
+    OP_GREATER_OR_EQUAL,
+    OP_ALL
+} eRegexOpApply;
+
+#define DEF_VM_SIZE_INC 1024
+#define DEF_VM_STRTBL_INC 32
 
 typedef enum {
     eCompileOk,
@@ -202,23 +310,19 @@ typedef enum {
     eCompileInternalError
 } eRegexCompileStatus;
 
-const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
-    switch(status) {
-        case eCompileOk: return "compiled successfully";
-        case eCompileCharClassRangeIncomplete: return "char class range is incomplete";
-        case eCompileCharClassIncomplete: return "char class definition is incomplete";
-        case eCompileEscapeCharIncomplete: return "escape character is incomplete";
-        case eCompileMalformedSubExprName: return "subexpression name is malformed";
-        case eCompileUnsupportedMeta: return "expression uses an unsupported meta character";
-        case eCompileOutOfMem: return "out of memory";
-        case eCompileMissingOperand: return "missing operand during postfix transform";
-        case eCompileMissingSubexprStart: return "missing subexpr start \"(\"";
-        case eCompileInternalError: return "unknown internal error state";
-        default: return "Unknown failure";
-    }
-}
+typedef struct regex_compile_ctx_s regex_compile_ctx_t;
+struct regex_compile_ctx_s {
+    eRegexCompileStatus status;
+    const char *pattern;
+    int position;
+    regex_token_t *tokens;
+    regex_state_t *state_tree;
+    regex_subexpr_name_t *subexpr_list;
+};
 
-// Character parsing, assists with escaped chars ////////////////////////////
+/////////////////////////////////////////////////////////////////////////////
+// Character parsing, assists with escaped chars
+/////////////////////////////////////////////////////////////////////////////
 
 typedef struct character_s character_t;
 struct character_s {
@@ -228,8 +332,8 @@ struct character_s {
 
 character_t regexGetNextPatternChar(const char **pattern) {
     character_t result = {
-        .c = -1,
-        .escaped = 0
+            .c = -1,
+            .escaped = 0
     };
     int k, val;
 
@@ -486,13 +590,6 @@ void regexPrintCharClass(unsigned char *bitmap) {
 
 // Subexpression name table /////////////////////////////////////////////////
 
-typedef struct regex_subexpr_name_s regex_subexpr_name_t;
-struct regex_subexpr_name_s {
-    int index;
-    regex_subexpr_name_t *next;
-    char name[0];
-};
-
 // Parses the subexpression name pointed to by pattern, creates a
 // subexpression name lookup entry, and adds it to the subexpression name list.
 // Returns 1 on success, 0 on out of memory, and -1 if the name is malformed.
@@ -561,16 +658,6 @@ const char *regexSubexprLookupName(regex_subexpr_name_t *list, int index) {
 }
 
 // Token management functions //////////////////////////////////////////////
-
-typedef struct regex_token_s regex_token_t;
-struct regex_token_s {
-    eRegexToken tokenType;
-    union {
-        int c;
-        char *str;
-    };
-    regex_token_t *next;
-};
 
 int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
     switch(token->tokenType) {
@@ -712,17 +799,13 @@ void regexTokenDestroy(regex_token_t *token) {
     }
 }
 
-typedef struct regex_state_s regex_state_t;
+/////////////////////////////////////////////////////////////////////////////
 
-typedef struct regex_compile_ctx_s regex_compile_ctx_t;
-struct regex_compile_ctx_s {
-    eRegexCompileStatus status;
-    const char *pattern;
-    int position;
-    regex_token_t *tokens;
-    regex_state_t *state_tree;
-    regex_subexpr_name_t *subexpr_list;
-};
+void regexCompileCtxInit(regex_compile_ctx_t *ctx, const char *pattern) {
+    memset(ctx, 0, sizeof(regex_compile_ctx_t));
+    ctx->pattern = pattern;
+    ctx->status = eCompileOk;
+}
 
 void regexCompileCtxCleanup(regex_compile_ctx_t *ctx) {
     if(ctx->tokens != NULL) {
@@ -734,6 +817,24 @@ void regexCompileCtxCleanup(regex_compile_ctx_t *ctx) {
         ctx->subexpr_list = NULL;
     }
 }
+
+const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
+    switch(status) {
+        case eCompileOk: return "compiled successfully";
+        case eCompileCharClassRangeIncomplete: return "char class range is incomplete";
+        case eCompileCharClassIncomplete: return "char class definition is incomplete";
+        case eCompileEscapeCharIncomplete: return "escape character is incomplete";
+        case eCompileMalformedSubExprName: return "subexpression name is malformed";
+        case eCompileUnsupportedMeta: return "expression uses an unsupported meta character";
+        case eCompileOutOfMem: return "out of memory";
+        case eCompileMissingOperand: return "missing operand during postfix transform";
+        case eCompileMissingSubexprStart: return "missing subexpr start \"(\"";
+        case eCompileInternalError: return "unknown internal error state";
+        default: return "Unknown failure";
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
 
 #define SET_RESULT(stat)  result.status = stat; goto compileFailure;
 
@@ -876,7 +977,7 @@ regex_compile_ctx_t regexTokenizePattern(const char *pattern) {
 
     SET_RESULT(eCompileOk);
 
-compileFailure:
+    compileFailure:
     result.position = (int)(pattern - result.pattern);
 
     if(result.status != eCompileOk) {
@@ -885,6 +986,8 @@ compileFailure:
 
     return result;
 }
+
+/////////////////////////////////////////////////////////////////////////////
 
 // Shunting yard implementation, to convert infix to postfix form ///////////
 
@@ -953,7 +1056,7 @@ int regexStackTypeGreaterOrEqualToToken(regex_token_t *stack, eRegexToken tokenT
     eRegexTokenPriority stackPriority;
 
     stackPriority = regexGetTokenTypePriority(regexTokenStackPeekType(stack));
-    //printf("Priority s[%d] t[%d]\n", stackPriority, regexGetTokenTypePriority(tokenType));
+    printf("Priority s[%d] t[%d]\n", stackPriority, regexGetTokenTypePriority(tokenType));
     return (stackPriority >= regexGetTokenTypePriority(tokenType));
 }
 
@@ -971,44 +1074,7 @@ int regexGetOperatorArity(regex_token_t *token) {
     }
 }
 
-typedef enum {
-    eCharLiteral,
-    eMatch,
-    eJmp,
-    eSplit,
-    eSave,
-    eCharClass,
-    eStringLiteral,
-    eCharAny
-} eRegexOpCode;
-
 // NFA form regex support ///////////////////////////////////////////////////
-
-struct regex_state_s {
-    eRegexOpCode opcode;
-    union {
-        int c;
-        char *str;
-        unsigned char *bitmap;
-        int group;
-    };
-    int index;
-    regex_state_t *out_a;
-    regex_state_t *out_b;
-};
-
-typedef struct regex_ptrlist_s regex_ptrlist_t;
-struct regex_ptrlist_s {
-    regex_state_t **out;
-    regex_ptrlist_t *next;
-};
-
-typedef struct regex_fragment_s regex_fragment_t;
-struct regex_fragment_s {
-    regex_state_t *state;
-    regex_ptrlist_t *ptrlist;
-    regex_fragment_t *next;
-};
 
 regex_state_t *regexStateCreate(eRegexOpCode opcode, int c, char *str, regex_state_t *out_a, regex_state_t *out_b) {
     regex_state_t *state;
@@ -1025,6 +1091,7 @@ regex_state_t *regexStateCreate(eRegexOpCode opcode, int c, char *str, regex_sta
     }
     state->out_a = out_a;
     state->out_b = out_b;
+    state->pc = -1;
     return state;
 }
 
@@ -1145,6 +1212,7 @@ regex_fragment_t *regexFragmentStackPop(regex_fragment_t **stack) {
     fragment = *stack;
     if(fragment != NULL) {
         *stack = fragment->next;
+        fragment->next = NULL;
     }
     return fragment;
 }
@@ -1336,10 +1404,20 @@ int regexHasSufficientOperands(regex_fragment_t *fragments, int arity) {
     return arity == 0;
 }
 
-typedef enum {
-    OP_GREATER_OR_EQUAL,
-    OP_ALL
-} eRegexOpApply;
+void regexPrintOperatorStack(regex_token_t *operators) {
+    printf("Operator stack: ");
+    for(;operators != NULL; operators = operators->next) {
+        switch(operators->tokenType) {
+            case eTokenAlternative: printf("| "); break;
+            case eTokenConcatenation: printf(". "); break;
+            case eTokenZeroOrOne: printf("? "); break;
+            case eTokenZeroOrMany: printf("* "); break;
+            case eTokenOneOrMany: printf("+ "); break;
+            default: printf("%% "); break;
+        }
+    }
+    printf("\n");
+}
 
 eRegexCompileStatus regexOperatorApply(regex_token_t **operators, eRegexOpApply apply, eRegexToken tokenType, regex_fragment_t **operands) {
     regex_token_t *operator;
@@ -1392,13 +1470,15 @@ eRegexCompileStatus regexOperatorApply(regex_token_t **operators, eRegexOpApply 
 
 #define SET_YARD_RESULT(res)    status = res; goto ShuntingYardFailure;
 
+void regexNFANodePrint(regex_state_t *state, int pad);
+
 eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_fragment_t **root_stack, int sub_expression) {
     regex_token_t *token, *operators = NULL;
     regex_fragment_t *operands = NULL, *subexpr, *sidestack;
     eRegexCompileStatus status = eCompileOk;
 
     while((token = regexTokenStackPop(tokens)) != NULL) {
-        regexFragmentStackSize(operands);
+        printf("-----------------\n");
         //printf("=> Operands: %d,  Operators: %d\n", regexFragmentStackSize(operands), regexTokenStackSize(operators));
         regexTokenPrint(token, NULL, 1);
         switch(token->tokenType) {
@@ -1465,9 +1545,16 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
                 if((status = regexOperatorApply(&operators, OP_ALL, 0, &operands)) != eCompileOk) {
                     goto ShuntingYardFailure;
                 }
+                printf("Group close:\n");
+                printf("    base: %d  %p\n", operands->state->opcode, operands->state);
+                regexNFANodePrint(operands->state, 1);
                 regexFragmentStackPush(root_stack, operands);
                 return eCompileOk;
         }
+    }
+
+    if((status = regexOperatorApply(&operators, OP_ALL, 0, &operands)) != eCompileOk) {
+        goto ShuntingYardFailure;
     }
 
     if(sub_expression != -1) {
@@ -1489,6 +1576,68 @@ ShuntingYardFailure:
     return status;
 }
 
+void indent(int pad) {
+    int k;
+
+    for(k = 0; k < pad; k++) {
+        printf("    ");
+    }
+}
+
+void regexNFANodePrint(regex_state_t *state, int pad) {
+    if(state != NULL && state->pc == -2) {
+        return;
+    }
+    indent(pad);
+    printf("%p  ", state);
+    if(state == NULL) {
+        printf("NULL\n");
+        return;
+    }
+    if(state->pc == -1) {
+        state->pc = -2;
+    }
+    switch(state->opcode) {
+        case eCharLiteral:
+            printf("char(%c)\n", (state->c < 32 || state->c > 127) ? '-' : state->c);
+            regexNFANodePrint(state->out_a, pad);
+            break;
+        case eStringLiteral:
+            printf("string(\"%s\")\n", state->str);
+            regexNFANodePrint(state->out_a, pad);
+            break;
+        case eCharClass:
+            printf("class(");
+            regexPrintCharClass(state->bitmap);
+            printf(")\n");
+            regexNFANodePrint(state->out_a, pad);
+            break;
+        case eCharAny:
+            printf("anychar\n");
+            regexNFANodePrint(state->out_a, pad);
+            break;
+        case eSave:
+            printf("save(%d)\n", state->group);
+            regexNFANodePrint(state->out_a, pad);
+            break;
+        case eSplit:
+            printf("split %p, %p\n", state->out_a, state->out_b);
+            indent(pad + 1);
+            printf("%p\n", state->out_a);
+            regexNFANodePrint(state->out_a, pad + 1);
+            indent(pad + 1);
+            printf("%p\n", state->out_b);
+            regexNFANodePrint(state->out_b, pad + 1);
+            break;
+        case eMatch:
+            printf("match\n");
+            return;
+        default:
+            printf("UNKNOWN!\n");
+            return;
+    }
+}
+
 eRegexCompileStatus regexShuntingYard(regex_compile_ctx_t *ctx) {
     regex_fragment_t *stack = NULL;
     eRegexCompileStatus status;
@@ -1496,7 +1645,267 @@ eRegexCompileStatus regexShuntingYard(regex_compile_ctx_t *ctx) {
     printf("\n== Shunting yard ==============================\n\n");
 
     ctx->status = regexShuntingYardFragment(&(ctx->tokens), &stack, -1);
+    ctx->state_tree = stack->state;
+
+    printf("--------------------\n");
+    regexNFANodePrint(stack->state, 0);
+    printf("--------------------\n");
+
     return ctx->status;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
+char *regexVMGetStringTableEntry(regex_vm_build_t *vm, int index) {
+    if(index >= vm->str_tbl_index || index < 0) {
+        return "ERROR";
+    }
+    return vm->str_table[index];
+}
+
+unsigned char *regexVMGetClassTableEntry(regex_vm_build_t *vm, int index) {
+    if(index >= vm->class_tbl_index || index < 0) {
+        return (unsigned char *)"                                ";
+    }
+    return vm->class_table[index];
+}
+
+regex_vm_build_t *regexVMBuildCreate(void) {
+    regex_vm_build_t *vm;
+
+    if((vm = malloc(sizeof(regex_vm_build_t))) == NULL) {
+        return NULL;
+    }
+    memset(vm, 0, sizeof(regex_vm_build_t));
+    return vm;
+}
+
+int regexVMPtrTableGrow(char ***table, int count, int *size) {
+    if((count + 1) >= *size) {
+        if((*table = realloc(*table, (*size + DEF_VM_STRTBL_INC) * sizeof(char *))) == NULL) {
+            return 0;
+        }
+        memset(*table + *size, 0, DEF_VM_STRTBL_INC * sizeof(char *));
+        *size += DEF_VM_SIZE_INC;
+    }
+    return 1;
+}
+
+int regexVMStringTableEntryCreate(regex_vm_build_t *vm, char *str) {
+    char *entry;
+    int index;
+
+    if(!regexVMPtrTableGrow(&(vm->str_table), vm->str_tbl_index, &(vm->str_tbl_size))) {
+        return -1;
+    }
+
+    if((entry = strdup(str)) == NULL) {
+        return -1;
+    }
+    vm->str_table[vm->str_tbl_index] = entry;
+    index = vm->str_tbl_index;
+    vm->str_tbl_index++;
+    return index;
+}
+
+int regexVMClassTableEntryCreate(regex_vm_build_t *vm, unsigned char *bitmap) {
+    unsigned char *entry;
+    int index;
+
+    if(!regexVMPtrTableGrow((char ***)(&(vm->class_table)), vm->class_tbl_index, &(vm->class_tbl_size))) {
+        return -1;
+    }
+
+    if((entry = mapCopy(bitmap)) == NULL) {
+        return -1;
+    }
+    vm->class_table[vm->class_tbl_index] = entry;
+    index = vm->class_tbl_index;
+    vm->class_tbl_index++;
+    return index;
+}
+
+int regexVMProgramGrow(regex_vm_build_t *vm, int count) {
+    if((vm->pc + count) >= vm->prog_size) {
+        if((vm->program = realloc(vm->program, (vm->prog_size + DEF_VM_SIZE_INC) * sizeof(int))) == NULL) {
+            return 0;
+        }
+        memset(vm->program + vm->prog_size, 0, DEF_VM_SIZE_INC * sizeof(int));
+        vm->prog_size += DEF_VM_SIZE_INC;
+    }
+    return 1;
+}
+
+int regexVMInstrTerminal(regex_vm_build_t *vm, regex_state_t *state) {
+    int idx;
+    int size = (state->opcode == eCharAny) ? 1 : 2;
+
+    if(!regexVMProgramGrow(vm, size)) {
+        return 0;
+    }
+    vm->program[vm->pc] = state->opcode;
+    state->pc = vm->pc;
+    vm->pc++;
+    switch(state->opcode) {
+        case eCharLiteral:
+            vm->program[vm->pc] = state->c;
+            vm->pc++;
+            break;
+        case eCharClass:
+            if((idx = regexVMClassTableEntryCreate(vm, state->bitmap)) == -1) {
+                return 0;
+            }
+            vm->program[vm->pc] = idx;
+            vm->pc++;
+            break;
+        case eStringLiteral:
+            if((idx = regexVMStringTableEntryCreate(vm, state->str)) == -1) {
+                return 0;
+            }
+            vm->program[vm->pc] = idx;
+            vm->pc++;
+            break;
+        default:
+            break;
+    }
+    return 1;
+}
+
+int regexVMInstrMatch(regex_vm_build_t *vm) {
+    // TODO
+    return 1;
+}
+
+int regexVMInstrSplit(regex_vm_build_t *vm, regex_state_t *state_a, regex_state_t *state_b) {
+    // TODO
+    return 1;
+}
+
+int regexVMInstrSave(regex_vm_build_t *vm, int subexpr) {
+    // TODO
+    return 1;
+}
+
+int regexVMInstrCreate(regex_vm_build_t *vm, regex_state_t *state) {
+    printf("instr create [pc=%d][%d %p %p]...\n", vm->pc, state->opcode, state->out_a, state->out_b);
+
+    if(state == NULL) {
+        return 1;
+    }
+
+    switch(state->opcode) {
+        case eCharLiteral:
+        case eCharClass:
+        case eStringLiteral:
+        case eCharAny:
+            if(!regexVMInstrTerminal(vm, state)) {
+                return 0;
+            }
+            break;
+        case eMatch:
+            if(!regexVMInstrMatch(vm)) {
+                return 0;
+            }
+            return 1;
+        case eSplit:
+            if(!regexVMInstrSplit(vm, state->out_a, state->out_b)) {
+                return 0;
+            }
+            break;
+        case eSave:
+            if(!regexVMInstrSave(vm, state->c)) {
+                return 0;
+            }
+            break;
+        default:
+            printf("ERROR: Unknown state opcode [%d]", state->opcode);
+            return 0;
+    }
+    if(!regexVMInstrCreate(vm, state->out_a)) {
+        return 0;
+    }
+    if(state->opcode == eSplit) {
+        if(!regexVMInstrCreate(vm, state->out_b)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void regexVMInstrPrint(regex_vm_build_t *vm, int *pc, int *program) {
+    char c;
+
+    printf("%4.4d  ", *pc);
+    switch(program[*pc]) {
+        case eCharLiteral:
+            c = (char)program[*pc + 1];
+            printf("char %c\n", (c < 32 || c > 127) ? '-' : c);
+            pc += 1;
+            break;
+        case eMatch:
+            printf("match\n");
+            pc += 1;
+            break;
+        case eJmp:
+            printf("jmp %d\n", program[*pc + 1]);
+            pc += 2;
+            break;
+        case eSplit:
+            printf("split %d, %d\n", program[*pc + 1], program[*pc + 2]);
+            pc += 3;
+            break;
+        case eSave:
+            printf("save %d\n", program[*pc + 1]);
+            pc += 2;
+            break;
+        case eCharClass:
+            printf("class [");
+            regexPrintCharClass(regexVMGetClassTableEntry(vm, program[*pc + 1]));
+            printf("]\n");
+            pc += 2;
+            break;
+        case eStringLiteral:
+            printf("string \"%s\"\n", regexVMGetStringTableEntry(vm, program[*pc + 1]));
+            pc += 2;
+            break;
+        case eCharAny:
+            printf("anychar\n");
+            pc += 1;
+            break;
+    }
+}
+
+void regexVMPrintProgram(regex_vm_build_t *vm) {
+    int pc;
+
+    for(pc = 0; pc < vm->pc;) {
+        regexVMInstrPrint(vm, &pc, vm->program);
+    }
+}
+
+eRegexCompileStatus regexNFAToVMBytecode(regex_compile_ctx_t *ctx) {
+    eRegexCompileStatus status;
+    regex_vm_build_t *vm;
+
+    printf("Generating bytecode...\n");
+
+    if((vm = regexVMBuildCreate()) == NULL) {
+        return eCompileOutOfMem;
+    }
+
+    if(!regexVMInstrCreate(vm, ctx->state_tree)) {
+        return eCompileOutOfMem;
+    }
+
+    // TODO - patch split fixups
+
+    printf("Bytecode complete:\n\n");
+
+    //regexVMPrintProgram(vm);
+
+    printf("---------------------\n");
+
+    return eCompileOk;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1527,7 +1936,14 @@ regex_compile_ctx_t regexCompile(const char *pattern, unsigned int flags) {
 
     // At this point, we have a valid NFA form of the regular expression. We
     // can use it directly, or transform it into the compact VM form.
-    
+
+    /*
+    if((result.status= regexNFAToVMBytecode(&result)) != eCompileOk) {
+        regexCompileCtxCleanup(&result);
+        return result;
+    }
+     */
+
     regexCompileCtxCleanup(&result);
 
     return result;

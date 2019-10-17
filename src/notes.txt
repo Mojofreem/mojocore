@@ -1,0 +1,22 @@
+state:
+    opcode
+    out (default path on match)
+    out_b (alternate route [split])
+
+
+literal (match and go)
+    s
+    l = [out]
+
+concatenation
+    a[l] -> b
+
+alternation
+
+zeroorone
+
+zeroormany
+
+oneormany
+
+group
