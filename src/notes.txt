@@ -1,3 +1,11 @@
+generate source from bytecode sequence
+write evaluator and support functions
+refactor into single file header
+    evaluator only
+    compiler only
+    combined
+
+
 literal (match and go)
     char (c)
     string (idx)
