@@ -1,22 +1,55 @@
-state:
-    opcode
-    out (default path on match)
-    out_b (alternate route [split])
-
-
 literal (match and go)
-    s
-    l = [out]
+    char (c)
+    string (idx)
+    class (idx)
+    anychar
+
+    in place
 
 concatenation
-    a[l] -> b
+    no op
 
 alternation
+    split (l1) (l2)
+    l1: ...
+    jmp (l3)
+    l2: ...
+    l3:
+
+    defer:
+        op a
+        op b
+        end
 
 zeroorone
+    split (l1) (l2)
+    l1: ...
+    l2:
+
+    no defer
 
 zeroormany
+    l1: split (l2) (l3)
+    l2: ...
+    jmp (l1)
+    l3:
+
+    no defer
 
 oneormany
+    l1: ...
+    split (l1) (l2)
+    l2:
+
+    no defer
 
 group
+    save (idx)
+
+    no defer
+
+match
+    match
+
+
+start pc, next pc

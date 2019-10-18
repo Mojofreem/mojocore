@@ -18,7 +18,7 @@ struct regex_vm_s {
 };
 
 
-eRegexCompileStatus regexGenerateVMProgram(regex_vm_t **vm, regex_token_t **tokens);
+eRegexCompileStatus regexGenerateVMProgram(regex_vm_t **vm, regex_state_t *state);
 
 
 #endif // _RE_VM_HEADER_

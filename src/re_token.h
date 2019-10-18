@@ -28,7 +28,11 @@ struct regex_token_s {
     union {
         int c;
         char *str;
+        unsigned char *bitmap;
+        int group;
     };
+    regex_token_t *out_a;
+    regex_token_t *out_b;
     regex_token_t *next;
 };
 
