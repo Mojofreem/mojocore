@@ -252,7 +252,7 @@ eRegexCompileStatus regexParseCharClass(const char **pattern, unsigned char *bit
     return eCompileOk;
 }
 
-void regexPrintCharClass(unsigned char *bitmap) {
+void regexPrintCharClassToFP(FILE *fp, unsigned char *bitmap) {
     int k;
     int run;
 
@@ -260,13 +260,17 @@ void regexPrintCharClass(unsigned char *bitmap) {
         if(mapCheck(bitmap, k)) {
             for(run = k + 1; run < 256 && mapCheck(bitmap, run); run++);
             run--;
-            printf("%c", ((k < 32) || (k > 127)) ? '.' : k);
+            fprintf(fp, "%c", ((k < 32) || (k > 127)) ? '.' : k);
             if(run - k > 3) {
-                printf("-%c", ((run < 32) || (run > 127)) ? '.' : run);
+                fprintf(fp, "-%c", ((run < 32) || (run > 127)) ? '.' : run);
                 k = run;
             }
         }
     }
+}
+
+void regexPrintCharClass(unsigned char *bitmap) {
+    regexPrintCharClassToFP(stdout, bitmap);
 }
 
 // Subexpression name table /////////////////////////////////////////////////

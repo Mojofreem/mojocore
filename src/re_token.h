@@ -67,6 +67,7 @@ void regexTokenChainPrint(regex_token_t *tokens, regex_subexpr_name_t *subexpr);
 void regexTokenPrint(regex_token_t *token, regex_subexpr_name_t *subexpr, int newlines);
 int regexTokenCreate(regex_token_t **list, eRegexToken tokenType, int c, char *str);
 void regexPrintCharClass(unsigned char *bitmap);
+void regexPrintCharClassToFP(FILE *fp, unsigned char *bitmap);
 
 eRegexCompileStatus regexTokenizePattern(const char *pattern,
                                          int *pos,

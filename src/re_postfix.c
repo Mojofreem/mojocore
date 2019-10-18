@@ -4,6 +4,7 @@
 
 
 #include "re_postfix.h"
+#include "re_vm.h"
 
 
 typedef enum {
@@ -218,14 +219,12 @@ int regexOperatorLiteralCreate(regex_fragment_t **stack, regex_token_t *token) {
     return 1;
 }
 
-#if 0
 int regexOperatorSubexprCreate(regex_fragment_t **stack, regex_token_t *token) {
     regex_ptrlist_t *list;
     regex_fragment_t *fragment;
 
     token->tokenType = eTokenSave;
     if((list = regexPtrlistCreate(&(token->out_a))) == NULL) {
-        regexTokenDestroy(token);
         return 0;
     }
     if((fragment = regexFragmentCreate(token, list)) == NULL) {
@@ -235,7 +234,6 @@ int regexOperatorSubexprCreate(regex_fragment_t **stack, regex_token_t *token) {
     regexFragmentStackPush(stack, fragment);
     return 1;
 }
-#endif
 
 int regexOperatorConcatenationCreate(regex_fragment_t **stack, regex_token_t *token) {
     regex_fragment_t *e1, *e2;
@@ -442,14 +440,27 @@ eRegexCompileStatus regexOperatorApply(regex_token_t **operators, eRegexOpApply 
     return eCompileOk;
 }
 
+int regexGroupFromSubexpression(int subexpr) {
+    return (subexpr - 1) * 2;
+}
+
 #define SET_YARD_RESULT(res)    status = res; goto ShuntingYardFailure;
 
 void regexNFANodePrint(regex_token_t *state);
 
 eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_fragment_t **root_stack, int sub_expression) {
-    regex_token_t *token, *operators = NULL;
-    regex_fragment_t *operands = NULL;
+    regex_token_t *token = NULL, *operators = NULL;
+    regex_fragment_t *operands = NULL, *subexpr;
     eRegexCompileStatus status = eCompileOk;
+    int group_num;
+
+    if(sub_expression >= 0) {
+        operands = *root_stack;
+        if(!regexTokenCreate(&token, eTokenConcatenation, 0, NULL)) {
+            return eCompileOutOfMem;
+        }
+        regexTokenStackPush(&operators, token);
+    }
 
     while((token = regexTokenStackPop(tokens)) != NULL) {
         regexTokenPrint(token, NULL, 1);
@@ -478,50 +489,40 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
                 regexTokenStackPush(&operators, token);
                 break;
 
-#if 0
             case eTokenSubExprStart:
                 subexpr = NULL;
-                if((status = regexShuntingYardFragment(tokens, &subexpr, token->c)) != eCompileOk) {
-                    goto ShuntingYardFailure;
+                group_num = token->group;
+                token->group = regexGroupFromSubexpression(token->group);
+                if(!regexOperatorSubexprCreate(&subexpr, token)) {
+                    SET_YARD_RESULT(eCompileOutOfMem);
+                }
+                if((status = regexShuntingYardFragment(tokens, &subexpr, group_num)) != eCompileOk) {
+                    SET_YARD_RESULT(status);
                 }
                 regexFragmentStackPush(&operands, subexpr);
                 break;
 
             case eTokenSubExprEnd:
-                regexTokenDestroy(token);
                 if(sub_expression == -1) {
                     SET_YARD_RESULT(eCompileMissingSubexprStart);
                 }
+                token->group = regexGroupFromSubexpression(sub_expression) + 1;
+                if(!regexOperatorSubexprCreate(&operands, token)) {
+                    SET_YARD_RESULT(eCompileOutOfMem);
+                }
+                token = NULL;
+                if(!regexTokenCreate(&token, eTokenConcatenation, 0, NULL)) {
+                    return eCompileOutOfMem;
+                }
+                regexTokenStackPush(&operators, token);
                 if((status = regexOperatorApply(&operators, OP_ALL, 0, &operands)) != eCompileOk) {
                     goto ShuntingYardFailure;
                 }
                 if(operands->next != NULL) {
                     SET_YARD_RESULT(eCompileInternalError);
                 }
-                sidestack = regexFragmentStackPop(&operands);
-                // Prefix/suffix the group operators
-                if(!regexOperatorSubexprCreate(&operands, (sub_expression - 1) * 2)) {
-                    SET_YARD_RESULT(eCompileOutOfMem);
-                }
-                regexFragmentStackPush(&operands, sidestack);
-                if(!regexOperatorSubexprCreate(&operands, ((sub_expression - 1) * 2) + 1)) {
-                    SET_YARD_RESULT(eCompileOutOfMem);
-                }
-                if(!regexTokenCreate(&operators, eTokenConcatenation, 0, NULL)) {
-                    SET_YARD_RESULT(eCompileOutOfMem);
-                }
-                if(!regexTokenCreate(&operators, eTokenConcatenation, 0, NULL)) {
-                    SET_YARD_RESULT(eCompileOutOfMem);
-                }
-                if((status = regexOperatorApply(&operators, OP_ALL, 0, &operands)) != eCompileOk) {
-                    goto ShuntingYardFailure;
-                }
-                printf("Group close:\n");
-                printf("    base: %d  %p\n", operands->state->opcode, operands->state);
-                regexNFANodePrint(operands->state, 1);
-                regexFragmentStackPush(root_stack, operands);
+                *root_stack = operands;
                 return eCompileOk;
-#endif
         }
     }
 
@@ -544,6 +545,7 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
 
 ShuntingYardFailure:
     regexFragmentFree(operands);
+    operands = NULL;
 
     return status;
 }
@@ -615,20 +617,38 @@ void regexNFANodePrint(regex_token_t *token) {
     }
 }
 
+
 eRegexCompileStatus regexShuntingYard(regex_token_t **tokens /*, regex_state_t **nfa_stack*/) {
     regex_fragment_t *stack = NULL;
     eRegexCompileStatus status = eCompileOk;
+    regex_vm_t *vm;
 
     printf("\n== Shunting yard ==============================\n\n");
 
 #if 1
     status = regexShuntingYardFragment(tokens, &stack, -1);
+    if(status != eCompileOk) {
+        return status;
+    }
 
+    printf("\n== Generating VM program ======================\n\n");
+
+    if((vm = regexVMCreate(stack->token)) == NULL) {
+        return eCompileOutOfMem;
+    }
+    printf("Printing program...\n");
+    regexVMPrintProgram(stdout, vm);
+    regexVMDestroy(vm);
+
+    printf("-------------------------------------------------\n");
+
+#if 0
     regexNFANodeClear(stack->token, -3);
     regexNFANodeClear(stack->token, -1);
     printf("--------------------\n");
     regexNFANodePrint(stack->token);
     printf("--------------------\n");
+#endif
 #endif
 
     return status;
