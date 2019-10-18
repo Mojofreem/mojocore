@@ -29,7 +29,7 @@ const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
         case eCompileOutOfMem: return "out of memory";
         case eCompileMissingOperand: return "missing operand during postfix transform";
         case eCompileMissingSubexprStart: return "missing subexpr start \"(\"";
-        case eCompileInternalError: return "unknown internal error state";
+        case eCompileInternalError: return "unknown internal error token";
         default: return "Unknown failure";
     }
 }
@@ -50,7 +50,7 @@ eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx) {
     // and derive an NFA representation. We accomplish this using the shunting
     // yard algorithm.
 
-    if((ctx->status = regexShuntingYard(&(ctx->tokens), &(ctx->state_tree))) != eCompileOk) {
+    if((ctx->status = regexShuntingYard(&(ctx->tokens) /*, &(ctx->state_tree)*/)) != eCompileOk) {
         regexCompileCtxCleanup(ctx);
         return ctx->status;
     }

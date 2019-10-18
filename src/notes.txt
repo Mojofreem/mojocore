@@ -9,7 +9,7 @@ literal (match and go)
 concatenation
     no op
 
-alternation
+alternation (l2 - 2nd instr, l3 - next)
     split (l1) (l2)
     l1: ...
     jmp (l3)
@@ -21,14 +21,14 @@ alternation
         op b
         end
 
-zeroorone
+zeroorone (l2 - next)
     split (l1) (l2)
     l1: ...
     l2:
 
     no defer
 
-zeroormany
+zeroormany (l3 - next)
     l1: split (l2) (l3)
     l2: ...
     jmp (l1)
@@ -53,3 +53,7 @@ match
 
 
 start pc, next pc
+
+
+literal
+zeroorone,zeroormany,oneormany -> literal

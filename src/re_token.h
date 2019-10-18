@@ -12,14 +12,17 @@ typedef enum {
     eTokenCharClass,
     eTokenStringLiteral,
     eTokenCharAny,
+    eTokenMatch,
+    eTokenSplit,
+    eTokenJmp,
+    eTokenSave,
     eTokenConcatenation,
     eTokenAlternative,
     eTokenZeroOrOne,
     eTokenZeroOrMany,
     eTokenOneOrMany,
     eTokenSubExprStart,
-    eTokenSubExprEnd,
-    eTokenMatch
+    eTokenSubExprEnd
 } eRegexToken;
 
 typedef struct regex_token_s regex_token_t;
@@ -31,6 +34,7 @@ struct regex_token_s {
         unsigned char *bitmap;
         int group;
     };
+    int pc;
     regex_token_t *out_a;
     regex_token_t *out_b;
     regex_token_t *next;

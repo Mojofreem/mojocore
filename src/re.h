@@ -12,7 +12,7 @@ struct regex_compile_ctx_s {
     const char *pattern;
     int position;
     regex_token_t *tokens;
-    regex_state_t *state_tree;
+//    regex_state_t *state_tree;
     regex_subexpr_name_t *subexpr_list;
 };
 

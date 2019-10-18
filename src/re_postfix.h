@@ -16,6 +16,7 @@ typedef enum {
     eCharAny
 } eRegexOpCode;
 
+/*
 typedef struct regex_state_s regex_state_t;
 struct regex_state_s {
     eRegexOpCode opcode;
@@ -29,9 +30,9 @@ struct regex_state_s {
     regex_state_t *out_a;
     regex_state_t *out_b;
 };
+*/
 
-
-eRegexCompileStatus regexShuntingYard(regex_token_t **tokens, regex_state_t **nfa_stack);
+eRegexCompileStatus regexShuntingYard(regex_token_t **tokens /*, regex_state_t **nfa_stack*/);
 
 
 #endif // _RE_POSTFIX_HEADER_
