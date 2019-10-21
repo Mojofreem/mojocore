@@ -87,7 +87,6 @@ struct regex_compile_ctx_s {
     const char *pattern;
     int position;
     regex_token_t *tokens;
-//    regex_state_t *state_tree;
     regex_subexpr_name_t *subexpr_list;
 };
 
@@ -103,14 +102,11 @@ struct regex_vm_s {
     int *program;
     char **string_table;
     int string_tbl_size;
-    //int string_tbl_count;
     unsigned char **class_table;
     int class_tbl_size;
-    //int class_tbl_count;
     char **group_table;
     int group_tbl_size;
     int size;
-    //int pc;
 };
 
 typedef struct regex_vm_build_s regex_vm_build_t;
@@ -280,12 +276,6 @@ char *regexGetPatternStr(const char **pattern, int len) {
 
 // Character class parsing handlers /////////////////////////////////////////
 
-// Note: character classes are stored as 32 byte bitmaps (unsigned char bitmap[32];)
-
-void mapClear(unsigned char *bitmap) {
-    memset(bitmap, 0, 32);
-}
-
 void mapSet(unsigned char *bitmap, int pos) {
     unsigned int idx = pos / 8u;
     unsigned int bit = pos % 8u;
@@ -323,7 +313,7 @@ eRegexCompileStatus regexParseCharClass(const char **pattern, unsigned char *bit
     int last = 0;
     int next;
 
-    mapClear(bitmap);
+    memset(bitmap, 0, 32);
 
     if(*pattern == '\0') {
         return eCompileCharClassIncomplete;
@@ -490,70 +480,6 @@ int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
             return !preceeding;
         default:
             return 0;
-    }
-}
-
-void regexTokenPrint(regex_token_t *token, regex_subexpr_name_t *subexpr, int newlines) {
-    const char *str = NULL;
-
-#define HAS_NEWLINE()   (newlines ? "\n" : "")
-
-    switch(token->tokenType) {
-        case eTokenCharLiteral:
-            printf("CHAR(%c)%s", token->c, HAS_NEWLINE());
-            break;
-        case eTokenCharClass:
-            printf("CLASS[");
-            regexPrintCharClass((unsigned char *)(token->str));
-            printf("]%s", HAS_NEWLINE());
-            break;
-        case eTokenStringLiteral:
-            printf("STRING(\"%s\")%s", token->str, HAS_NEWLINE());
-            break;
-        case eTokenCharAny:
-            printf("ANY%s", HAS_NEWLINE());
-            break;
-        case eTokenConcatenation:
-            printf("CONCAT%s", HAS_NEWLINE());
-            break;
-        case eTokenAlternative:
-            printf("ALTERNATIVE%s", HAS_NEWLINE());
-            break;
-        case eTokenZeroOrOne:
-            printf("ZERO_OR_ONE%s", HAS_NEWLINE());
-            break;
-        case eTokenZeroOrMany:
-            printf("ZERO_OR_MANY%s", HAS_NEWLINE());
-            break;
-        case eTokenOneOrMany:
-            printf("ONE_OR_MANY%s", HAS_NEWLINE());
-            break;
-        case eTokenSubExprStart:
-            if(subexpr != NULL) {
-                str = regexSubexprLookupName(subexpr, token->c);
-            }
-            if(str != NULL) {
-                printf("SUBEXPR #%d <%s>%s", token->c, str, HAS_NEWLINE());
-            } else {
-                printf("SUBEXPR #%d%s", token->c, HAS_NEWLINE());
-            }
-            break;
-        case eTokenSubExprEnd:
-            printf("SUBEXPR #%d END%s", token->c, HAS_NEWLINE());
-            break;
-        case eTokenMatch:
-            printf("MATCH!%s", HAS_NEWLINE());
-            break;
-        default:
-            printf("UNKNOWN! <%d>%s", token->tokenType, HAS_NEWLINE());
-            break;
-    }
-#undef HAS_NEWLINE
-}
-
-void regexTokenChainPrint(regex_token_t *tokens, regex_subexpr_name_t *subexpr) {
-    for(; tokens != NULL; tokens = tokens->next) {
-        regexTokenPrint(tokens, subexpr, 1);
     }
 }
 
@@ -824,13 +750,6 @@ regex_token_t *regexTokenStackPop(regex_token_t **stack) {
     return entry;
 }
 
-int regexTokenStackSize(regex_token_t *stack) {
-    int count = 0;
-
-    for(; stack != NULL; stack = stack->next, count++);
-    return count;
-}
-
 eRegexToken regexTokenStackPeekType(regex_token_t *stack) {
     if(stack == NULL) {
         return eTokenNone;
@@ -867,7 +786,6 @@ int regexStackTypeGreaterOrEqualToToken(regex_token_t *stack, eRegexToken tokenT
     eRegexTokenPriority stackPriority;
 
     stackPriority = regexGetTokenTypePriority(regexTokenStackPeekType(stack));
-    //printf("Priority s[%d] t[%d]\n", stackPriority, regexGetTokenTypePriority(tokenType));
     return (stackPriority >= regexGetTokenTypePriority(tokenType));
 }
 
@@ -1128,31 +1046,9 @@ int regexOperatorMatchCreate(regex_fragment_t **stack) {
     return 1;
 }
 
-int regexFragmentStackSize(regex_fragment_t *fragments) {
-    int depth = 0;
-
-    for(; fragments != NULL; depth++, fragments = fragments->next);
-    return depth;
-}
-
 int regexHasSufficientOperands(regex_fragment_t *fragments, int arity) {
     for(; ((fragments != NULL) && (arity)); arity--, fragments = fragments->next);
     return arity == 0;
-}
-
-void regexPrintOperatorStack(regex_token_t *operators) {
-    printf("Operator stack: ");
-    for(;operators != NULL; operators = operators->next) {
-        switch(operators->tokenType) {
-            case eTokenAlternative: printf("| "); break;
-            case eTokenConcatenation: printf(". "); break;
-            case eTokenZeroOrOne: printf("? "); break;
-            case eTokenZeroOrMany: printf("* "); break;
-            case eTokenOneOrMany: printf("+ "); break;
-            default: printf("%% "); break;
-        }
-    }
-    printf("\n");
 }
 
 eRegexCompileStatus regexOperatorApply(regex_token_t **operators, eRegexOpApply apply, eRegexToken tokenType, regex_fragment_t **operands) {
@@ -1162,40 +1058,34 @@ eRegexCompileStatus regexOperatorApply(regex_token_t **operators, eRegexOpApply 
           (apply == OP_GREATER_OR_EQUAL && regexStackTypeGreaterOrEqualToToken(*operators, tokenType))) {
         operator = regexTokenStackPop(operators);
         if(!regexHasSufficientOperands(*operands, regexGetOperatorArity(operator))) {
-            printf("Expected %d operands\n", regexGetOperatorArity(operator));
             return eCompileMissingOperand;
         }
         switch(operator->tokenType) {
             case eTokenZeroOrOne:
-                printf("Apply ?\n");
                 if(!regexOperatorZeroOrOneCreate(operands, operator)) {
                     return eCompileOutOfMem;
                 }
                 break;
 
             case eTokenZeroOrMany:
-                printf("Apply *\n");
                 if(!regexOperatorZeroOrMoreCreate(operands, operator)) {
                     return eCompileOutOfMem;
                 }
                 break;
 
             case eTokenOneOrMany:
-                printf("Apply +\n");
                 if(!regexOperatorOneOrMoreCreate(operands, operator)) {
                     return eCompileOutOfMem;
                 }
                 break;
 
             case eTokenConcatenation:
-                printf("Apply #\n");
                 if(!regexOperatorConcatenationCreate(operands, operator)) {
                     return eCompileOutOfMem;
                 }
                 break;
 
             case eTokenAlternative:
-                printf("Apply |\n");
                 if(!regexOperatorAlternationCreate(operands, operator)) {
                     return eCompileOutOfMem;
                 }
@@ -1214,8 +1104,6 @@ int regexGroupFromSubexpression(int subexpr) {
 
 #define SET_YARD_RESULT(res)    status = res; goto ShuntingYardFailure;
 
-void regexNFANodePrint(regex_token_t *state);
-
 eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_fragment_t **root_stack, int sub_expression) {
     regex_token_t *token = NULL, *operators = NULL;
     regex_fragment_t *operands = NULL, *subexpr;
@@ -1231,10 +1119,8 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
     }
 
     while((token = regexTokenStackPop(tokens)) != NULL) {
-        regexTokenPrint(token, NULL, 1);
         switch(token->tokenType) {
             default:
-                printf("ERROR! Unrecognized token type [%d]\n", token->tokenType);
                 return eCompileInternalError;
             case eTokenCharLiteral:
             case eTokenCharClass:
@@ -1333,91 +1219,20 @@ void regexNFANodeClear(regex_token_t *token, int value) {
     }
 }
 
-void regexNFANodePrint(regex_token_t *token) {
-    if(token != NULL && token->pc == -2) {
-        return;
-    }
-    printf("%p  ", token);
-    if(token == NULL) {
-        printf("NULL\n");
-        return;
-    }
-    if(token->pc == -1) {
-        token->pc = -2;
-    }
-    switch(token->tokenType) {
-        case eTokenCharLiteral:
-            printf("char(%c:%d)\n", (token->c < 32 || token->c > 127) ? '-' : token->c, token->c);
-            regexNFANodePrint(token->out_a);
-            break;
-        case eTokenStringLiteral:
-            printf("string(\"%s\")\n", token->str);
-            regexNFANodePrint(token->out_a);
-            break;
-        case eTokenCharClass:
-            printf("class(");
-            regexPrintCharClass(token->bitmap);
-            printf(")\n");
-            regexNFANodePrint(token->out_a);
-            break;
-        case eTokenCharAny:
-            printf("anychar\n");
-            regexNFANodePrint(token->out_a);
-            break;
-        case eTokenSave:
-            printf("save(%d)\n", token->group);
-            regexNFANodePrint(token->out_a);
-            break;
-        case eTokenSplit:
-            printf("split %p, %p\n", token->out_a, token->out_b);
-            regexNFANodePrint(token->out_a);
-            regexNFANodePrint(token->out_b);
-            break;
-        case eTokenMatch:
-            printf("match\n");
-            return;
-        case eTokenJmp:
-            printf("jmp %p\n", token->out_a);
-            return;
-        default:
-            printf("UNKNOWN [%d]!\n", token->tokenType);
-            return;
-    }
-}
-
-
-eRegexCompileStatus regexShuntingYard(regex_token_t **tokens /*, regex_state_t **nfa_stack*/) {
+eRegexCompileStatus regexShuntingYard(regex_token_t **tokens) {
     regex_fragment_t *stack = NULL;
     eRegexCompileStatus status = eCompileOk;
     regex_vm_t *vm;
 
-    printf("\n== Shunting yard ==============================\n\n");
-
-#if 1
     status = regexShuntingYardFragment(tokens, &stack, -1);
     if(status != eCompileOk) {
         return status;
     }
 
-    printf("\n== Generating VM program ======================\n\n");
-
     if((vm = regexVMCreate(stack->token)) == NULL) {
         return eCompileOutOfMem;
     }
-    printf("Printing program...\n");
     regexVMPrintProgram(stdout, vm);
-    //regexVMDestroy(vm);
-
-    printf("-------------------------------------------------\n");
-
-#if 0
-    regexNFANodeClear(stack->token, -3);
-    regexNFANodeClear(stack->token, -1);
-    printf("--------------------\n");
-    regexNFANodePrint(stack->token);
-    printf("--------------------\n");
-#endif
-#endif
 
     return status;
 }
@@ -1738,7 +1553,6 @@ int regexVMProgramGenerate(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_
             }
             return regexVMProgramGenerate(build, patch_list, token->out_b);
         default:
-            printf("UNKNOWN [%d]!\n", token->tokenType);
             return 0;
     }
 }
@@ -1748,7 +1562,6 @@ void regexVMPatchJumps(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list
 
     for(patch = *patch_list; patch != NULL; patch = next) {
         next = patch->next;
-        printf("Patch %d (of %d) to %d\n", patch->pc, build->pc, patch->token->pc);
         build->vm->program[patch->pc] = patch->token->pc;
         free(patch);
     }
@@ -1774,8 +1587,6 @@ regex_vm_t *regexVMCreate(regex_token_t *tokens) {
         // TODO - cleanup
         return NULL;
     }
-
-    printf("Patching jumps...\n");
 
     regexVMPatchJumps(&build, &patch_list);
 
@@ -1886,8 +1697,6 @@ eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx) {
         regexCompileCtxCleanup(ctx);
         return ctx->status;
     }
-
-    regexTokenChainPrint(ctx->tokens, ctx->subexpr_list);
 
     // Next, convert the infix form of the regular expression to postfix form,
     // and derive an NFA representation. We accomplish this using the shunting
