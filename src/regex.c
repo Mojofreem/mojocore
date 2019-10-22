@@ -29,6 +29,49 @@ typedef enum {
     eTokenSubExprEnd
 } eRegexToken;
 
+typedef enum {
+    ePriorityNone,
+    ePriorityLow,
+    ePriorityMedium,
+    ePriorityHigh
+} eRegexTokenPriority;
+
+typedef enum {
+    eReTerminal = 1,
+    eReNotTerminal = 0,
+    eRePreceeding = 2,
+    eReNotPreceeding = 3
+} eRegexTerminality;
+
+typedef struct regex_token_info_s regex_token_info_t;
+struct regex_token_info_s {
+    const char *nuemonic;
+    int textAdvance;
+    int opcodeSize;
+    int arity;
+    eRegexTokenPriority priority;
+    eRegexTerminality terminality;
+};
+
+regex_token_info_t regexTokenTable[] = {
+    {"eTokenNone", 0, 0, 0, ePriorityNone, eReNotTerminal},
+    {"eTokenCharLiteral", 0, 2, 0, ePriorityNone, eReTerminal},
+    {"eTokenCharClass", 0, 2, 0, ePriorityNone, eReTerminal},
+    {"eTokenStringLiteral", 0, 2, 0, ePriorityNone, eReTerminal},
+    {"eTokenCharAny", 0, 1, 0, ePriorityNone, eReTerminal},
+    {"eTokenMatch", 1, 1, 0, ePriorityNone, eReNotTerminal},
+    {"eTokenSplit", 1, 3, 0, ePriorityNone, eReNotTerminal},
+    {"eTokenJmp", 1, 2, 0, ePriorityNone, eReNotTerminal},
+    {"eTokenSave", 1, 2, 0, ePriorityNone, eReNotTerminal},
+    {"eTokenConcatenation", 0, 0, 2, ePriorityMedium, eReNotTerminal},
+    {"eTokenAlternative", 0, 0, 2, ePriorityMedium, eReNotTerminal},
+    {"eTokenZeroOrOne", 0, 0, 1, ePriorityHigh, eRePreceeding},
+    {"eTokenZeroOrMany", 0, 0, 1, ePriorityHigh, eRePreceeding},
+    {"eTokenOneOrMany", 0, 0, 1, ePriorityHigh, eRePreceeding},
+    {"eTokenSubExprStart", 0, 0, 0, ePriorityLow, eReNotPreceeding},
+    {"eTokenSubExprEnd", 0, 0, 0, ePriorityLow, eRePreceeding}
+};
+
 typedef struct regex_token_s regex_token_t;
 struct regex_token_s {
     eRegexToken tokenType;
@@ -42,13 +85,6 @@ struct regex_token_s {
     regex_token_t *out_a;
     regex_token_t *out_b;
     regex_token_t *next;
-};
-
-typedef struct regex_subexpr_name_s regex_subexpr_name_t;
-struct regex_subexpr_name_s {
-    int index;
-    regex_subexpr_name_t *next;
-    char name[0];
 };
 
 typedef enum {
@@ -65,18 +101,8 @@ typedef enum {
 } eRegexCompileStatus;
 
 void regexTokenDestroy(regex_token_t *token, int stack);
-void regexSubexprLookupFree(regex_subexpr_name_t *list);
-void regexTokenChainPrint(regex_token_t *tokens, regex_subexpr_name_t *subexpr);
-void regexTokenPrint(regex_token_t *token, regex_subexpr_name_t *subexpr, int newlines);
 int regexTokenCreate(regex_token_t **list, eRegexToken tokenType, int c, char *str);
-void regexPrintCharClass(unsigned char *bitmap);
 void regexPrintCharClassToFP(FILE *fp, unsigned char *bitmap);
-
-
-
-
-
-
 
 typedef struct regex_vm_s regex_vm_t;
 struct regex_vm_s {
@@ -110,18 +136,15 @@ struct regex_compile_ctx_s {
 };
 
 void regexCompileCtxInit(regex_compile_ctx_t *ctx, const char *pattern);
-void regexCompileCtxCleanup(regex_compile_ctx_t *ctx);
 const char *regexGetCompileStatusStr(eRegexCompileStatus status);
 
 eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx);
-
 
 eRegexCompileStatus regexTokenizePattern(const char *pattern,
                                          int *pos,
                                          regex_token_t **tokens,
                                          regex_vm_build_t *build);
 
-regex_vm_t *regexVMCreate(regex_token_t *tokens);
 void regexVMDestroy(regex_vm_build_t *build);
 
 void regexVMGenerateDeclaration(regex_vm_t *vm, const char *symbol, FILE *fp);
@@ -687,12 +710,6 @@ compileFailure:
     return result;
 }
 
-typedef enum {
-    ePriorityNone,
-    ePriorityLow,
-    ePriorityMedium,
-    ePriorityHigh
-} eRegexTokenPriority;
 
 typedef struct regex_ptrlist_s regex_ptrlist_t;
 struct regex_ptrlist_s {
@@ -1772,7 +1789,7 @@ void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
                 fprintf(fp, "jmp %d\n", vm->program[pc]);
                 break;
             default:
-                printf("UNKNOWN [%d]!\n", vm->program[pc]);
+                fprintf(fp, "UNKNOWN [%d]!\n", vm->program[pc]);
                 return;        }
     }
 }
@@ -1877,6 +1894,7 @@ typedef struct regex_eval_s regex_eval_t;
 struct regex_eval_s {
     const char *sp;
     regex_thread_t *thread;
+    regex_thread_t *queue;
     regex_vm_t *vm;
     const char **subexprs;
     regex_thread_t *pool;
@@ -1928,12 +1946,8 @@ int regexThreadCreate(regex_eval_t *eval, regex_thread_t *parent, int pc) {
     thread->pc = pc;
     thread->pos = -1;
 
-    if(eval->thread == NULL) {
-        eval->thread = thread;
-    } else {
-        for(walk = eval->thread; walk->next != NULL; walk = walk->next);
-        walk->next = thread;
-    }
+    thread->next = eval->queue;
+    eval->queue = thread;
 
     return 1;
 }
@@ -1957,6 +1971,7 @@ void regexThreadFree(regex_eval_t *eval, regex_thread_t *thread) {
 
 void regexEvalFree(regex_eval_t *eval) {
     regexThreadFree(NULL, eval->thread);
+    regexThreadFree(NULL, eval->queue);
     regexThreadFree(NULL, eval->pool);
     if(eval->subexprs != NULL) {
         free(eval->subexprs);
@@ -1995,6 +2010,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread) 
             case eTokenSave:
                 thread->pc++;
                 value = eval->vm->program[thread->pc];
+                printf("save %d\n", value);
                 if(value % 2) {
                     // Group end
                     thread->subexprs[value] = eval->sp;
@@ -2007,6 +2023,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread) 
                 thread->pc++;
                 break;
             case eTokenSplit:
+                printf("split\n");
                 pc_a = eval->vm->program[thread->pc + 1];
                 pc_b = eval->vm->program[thread->pc + 2];
                 if(!regexThreadCreate(eval, thread, pc_a)) {
@@ -2015,11 +2032,13 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread) 
                 thread->pc = pc_b;
                 break;
             case eTokenMatch:
+                printf("match\n");
                 if(*eval->sp == '\0') {
                     return eEvalMatch;
                 }
                 return eEvalNoMatch;
             case eTokenJmp:
+                printf("jmp\n");
                 thread->pc = eval->vm->program[thread->pc + 1];
                 break;
             default:
@@ -2028,6 +2047,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread) 
     }
     switch(eval->vm->program[thread->pc]) {
         case eTokenCharLiteral:
+            printf("char\n");
             thread->pc++;
             if(eval->vm->program[thread->pc] != *(eval->sp)) {
                 return eEvalNoMatch;
@@ -2042,6 +2062,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread) 
             if(thread->pos == -1) {
                 thread->pos = 0;
             }
+            printf("str[%d]\n", thread->pos);
             if(str[thread->pos] == *(eval->sp)) {
                 thread->pos++;
                 if(str[thread->pos] == '\0') {
@@ -2055,6 +2076,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread) 
             }
             break;
         case eTokenCharClass:
+            printf("class\n");
             thread->pc++;
             if((bitmap = regexVMClassTableEntryGet(eval->vm, eval->vm->program[thread->pc])) == NULL) {
                 return eEvalInternalError;
@@ -2066,6 +2088,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread) 
             }
             return eEvalMatch;
         case eTokenCharAny:
+            printf("any\n");
             thread->pc++;
             return eEvalMatch;
         default:
@@ -2075,36 +2098,44 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread) 
 
 int regexMatch(regex_vm_t *vm, const char *text, const char ***subexprs) {
     regex_eval_t *eval;
-    regex_thread_t *thread, *next, *last;
+    regex_thread_t *thread;
 
     if((eval = regexEvalCreate(vm)) == NULL) {
         return 0;
     }
 
-    for(eval->sp = text; (*eval->sp != '\0') && (eval->thread != NULL);) {
-        last = NULL;
-        for(thread = eval->thread; thread != NULL && thread->pc < vm->size; thread = next) {
-            next = thread->next;
+    if(!regexThreadCreate(eval, NULL, 0)) {
+        regexEvalFree(eval);
+        return 0;
+    }
+
+    for(eval->sp = text; (*eval->sp != '\0') && (eval->queue != NULL);) {
+        eval->thread = eval->queue;
+        eval->queue = NULL;
+        printf("[%c:%d]\n", *eval->sp, *eval->sp);
+        for(thread = eval->thread; thread != NULL && thread->pc < vm->size; thread = eval->thread) {
+            eval->thread = thread->next;
+            thread->next = NULL;
             switch(regexThreadProcess(eval, thread)) {
                 default:
                 case eEvalInternalError:
                 case eEvalOutOfMem:
+                    printf("DEATH!\n");
                     return -1;
                 case eEvalMatch:
                 case eEvalContinue:
+                    printf("good\n");
                     if((eval->vm->program[thread->pc] == eTokenMatch) && (*eval->sp == '\0')) {
                         goto FoundMatch;
                     }
-                    continue;
+                    thread->next = eval->queue;
+                    eval->queue = thread;
+                    break;
                 case eEvalNoMatch:
-                    if(last == NULL) {
-                        eval->thread = thread->next;
-                    } else {
-                        last->next = thread->next;
-                    }
+                    printf("nope\n");
+                    regexThreadFree(eval, thread);
                     continue;
             }
-            last = thread;
         }
         eval->sp++;
     }
