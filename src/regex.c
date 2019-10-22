@@ -97,6 +97,7 @@ struct regex_vm_build_s {
     int string_tbl_count;
     int class_tbl_count;
     int group_tbl_count;
+    int groups;
     int pc;
 };
 
@@ -126,7 +127,7 @@ void regexVMDestroy(regex_vm_build_t *build);
 void regexVMGenerateDeclaration(regex_vm_t *vm, const char *symbol, FILE *fp);
 void regexVMGenerateSource(regex_vm_t *vm, const char *symbol, FILE *fp);
 void regexVMPrintProgram(FILE *fp, regex_vm_t *vm);
-int regexVMGroupTableEntryAdd(regex_vm_t *vm, const char *group, int len, int index);
+int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int len, int index);
 
 
 /////////////////////////////////////////////////////////////////////////////
@@ -422,6 +423,7 @@ int regexGroupFromSubexpression(int subexpr) {
 int regexSubexprLookupEntryCreate(regex_vm_build_t *build, const char **pattern, int index) {
     int len;
 
+    index--;
     for(len = 0; (*pattern)[len] != '>' && (*pattern)[len] != '\0'; len++) {
         if(!regexIsAlnum((*pattern)[len])) {
             return -1;
@@ -431,7 +433,7 @@ int regexSubexprLookupEntryCreate(regex_vm_build_t *build, const char **pattern,
         return -1;
     }
 
-    if(!regexVMGroupTableEntryAdd(build->vm, *pattern, len, index)) {
+    if(!regexVMGroupTableEntryAdd(build, *pattern, len, index)) {
         return 0;
     }
     *pattern += len;
@@ -615,7 +617,8 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
 
                 case '(':
                     // Grouped subexpression, complex operator, resolves to a compound operand
-                    subexpr++;
+                    build->groups++;
+                    subexpr = build->groups;
                     str = NULL;
                     if(regexCheckNextPatternChar(&pattern, '?')) {
                         // Meta character subexpression modifier
@@ -1268,6 +1271,13 @@ int regexVMStringTableEntryAdd(regex_vm_build_t *build, const char *str) {
     return index;
 }
 
+const char *regexVMStringTableEntryGet(regex_vm_t *vm, int string_table_id) {
+    if(string_table_id >= vm->string_tbl_size) {
+        return NULL;
+    }
+    return vm->string_table[string_table_id];
+}
+
 void regexVMClassTableFree(regex_vm_build_t *build) {
     int k;
     if(build->vm->class_table != NULL) {
@@ -1309,6 +1319,13 @@ int regexVMClassTableEntryAdd(regex_vm_build_t *build, const unsigned char *bitm
     return index;
 }
 
+const unsigned char *regexVMClassTableEntryGet(regex_vm_t *vm, int class_table_id) {
+    if(class_table_id >= vm->class_tbl_size) {
+        return NULL;
+    }
+    return vm->class_table[class_table_id];
+}
+
 void regexVMGroupTableFree(regex_vm_build_t *build) {
     int k;
     if(build->vm->group_table != NULL) {
@@ -1323,30 +1340,37 @@ void regexVMGroupTableFree(regex_vm_build_t *build) {
     build->vm->group_tbl_size = 0;
 }
 
-int regexVMGroupTableEntryAdd(regex_vm_t *vm, const char *group, int len, int index) {
+int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int len, int index) {
     int add = DEF_VM_STRTBL_INC;
 
-    if(vm->group_tbl_size <= index) {
-        while((vm->group_tbl_size + add) <= index) {
+    if(build->vm->group_tbl_size <= index) {
+        while((build->vm->group_tbl_size + add) <= index) {
             add += DEF_VM_STRTBL_INC;
         }
-        if((vm->group_table = realloc(vm->group_table, (vm->group_tbl_size + add) * sizeof(char *))) == NULL) {
-            return -1;
+        if((build->vm->group_table = realloc(build->vm->group_table, (build->vm->group_tbl_size + add) * sizeof(char *))) == NULL) {
+            return 0;
         }
-        memset(vm->group_table + vm->group_tbl_size, 0, add * sizeof(char *));
-        vm->group_tbl_size += add;
+        memset(build->vm->group_table + build->vm->group_tbl_size, 0, add * sizeof(char *));
+        build->vm->group_tbl_size += add;
+        build->group_tbl_count += add;
     }
 
-    if((vm->group_table[index] = malloc(len + 1)) == NULL) {
-        return -1;
+    if((build->vm->group_table[index] = malloc(len + 1)) == NULL) {
+        return 0;
     }
-    strncpy(vm->group_table[index], group, len);
-    vm->group_table[index][len] = '\0';
-    vm->group_tbl_size += add;
+    strncpy(build->vm->group_table[index], group, len);
+    build->vm->group_table[index][len] = '\0';
+    build->vm->group_tbl_size += add;
 
-    printf("Added group (%d): [%s]\n", index, group);
+    return 1;
+}
 
-    return index;
+const char *regexVMGroupNameFromIndex(regex_vm_t *vm, int index) {
+    index = regexGroupFromSubexpression(index);
+    if((index < vm->group_tbl_size) && (index >= 0)) {
+        return vm->group_table[index];
+    }
+    return NULL;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1656,6 +1680,8 @@ void regexVMGenerateSource(regex_vm_t *vm, const char *symbol, FILE *fp) {
             }
             if(!(j % 8)) {
                 fputs("\n    ", fp);
+            } else {
+                fputc(' ', fp);
             }
             fprintf(fp, "0x%2.2X", vm->class_table[k][j]);
         }
@@ -1679,12 +1705,12 @@ void regexVMGenerateSource(regex_vm_t *vm, const char *symbol, FILE *fp) {
         } else {
             fprintf(fp, "    \"");
             regexEmitEscapedString(fp, vm->group_table[k]);
-            fprintf(fp, "\"\n,");
+            fprintf(fp, "\",\n");
         }
     }
     fprintf(fp, "};\n\n");
 
-    fprintf(fp, "regex_vm_t _&%s = {\n", symbol);
+    fprintf(fp, "regex_vm_t _%s = {\n", symbol);
     fprintf(fp, "    .program = _%s_program,\n", symbol);
     fprintf(fp, "    .size = %d,\n", vm->size);
     fprintf(fp, "    .string_table = _%s_string_table,\n", symbol);
@@ -1694,12 +1720,13 @@ void regexVMGenerateSource(regex_vm_t *vm, const char *symbol, FILE *fp) {
     fprintf(fp, "    .group_table = _%s_group_table,\n", symbol);
     fprintf(fp, "    .group_tbl_size = %d\n", vm->group_tbl_size);
     fprintf(fp, "};\n\n");
-    fprintf(fp, "regex_vm_t *%s = &_%s\n", symbol, symbol);
+    fprintf(fp, "regex_vm_t *%s = &_%s;\n", symbol, symbol);
 }
 
 void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
     int pc;
     int value;
+    const char *name;
 
     for(pc = 0; pc < vm->size; pc++) {
         fprintf(fp, "%3.3d  ", pc);
@@ -1724,7 +1751,13 @@ void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
                 break;
             case eTokenSave:
                 pc++;
-                fprintf(fp, "save %d\n", vm->program[pc]);
+                fprintf(fp, "save %d", vm->program[pc]);
+                value = vm->program[pc];
+                if((name = regexVMGroupNameFromIndex(vm, value)) != NULL) {
+                    fprintf(fp, " [%s]\n", name);
+                } else {
+                    fprintf(fp, "\n");
+                }
                 break;
             case eTokenSplit:
                 pc++;
@@ -1748,9 +1781,6 @@ void regexCompileCtxInit(regex_compile_ctx_t *ctx, const char *pattern) {
     memset(ctx, 0, sizeof(regex_compile_ctx_t));
     ctx->pattern = pattern;
     ctx->status = eCompileOk;
-}
-
-void regexCompileCtxCleanup(regex_compile_ctx_t *ctx) {
 }
 
 const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
@@ -1824,12 +1854,286 @@ eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx) {
     // Fixup the lookup tables
     build.vm->string_tbl_size = build.string_tbl_count;
     build.vm->class_tbl_size = build.class_tbl_count;
-    build.vm->group_tbl_size = build.group_tbl_count;
+    build.vm->group_tbl_size = build.groups;
 
     build.vm->size = build.pc;
     ctx->vm = build.vm;
 
     return eCompileOk;
+}
+
+/*
+regex_compile_ctx_t
+regexCompileCtxInit
+regexCompile
+*/
+
+typedef struct regex_thread_s regex_thread_t;
+struct regex_thread_s {
+    int pc;
+    int pos;
+    regex_thread_t *next;
+    const char *subexprs[0];
+};
+
+typedef struct regex_eval_s regex_eval_t;
+struct regex_eval_s {
+    const char *sp;
+    regex_thread_t *thread;
+    regex_vm_t *vm;
+    const char **subexprs;
+    regex_thread_t *pool;
+};
+
+void regexThreadCopySubexprs(int count, regex_thread_t *thread_a, regex_thread_t *thread_b) {
+    int k;
+
+    for(k = 0; k < count; k++) {
+        thread_b->subexprs[k] = thread_a->subexprs[k];
+    }
+}
+
+int regexThreadCreate(regex_eval_t *eval, regex_thread_t *parent, int pc) {
+    regex_thread_t *thread, *walk;
+
+    if(eval->pool != NULL) {
+        thread = eval->pool;
+        eval->pool = thread->next;
+        thread->next = NULL;
+    } else {
+        if((thread = malloc(sizeof(regex_thread_t) + (eval->vm->group_tbl_size * sizeof(char *)))) == NULL) {
+            return 0;
+        }
+        memset(thread, 0, sizeof(regex_thread_t) + (eval->vm->group_tbl_size * sizeof(char *)));
+    }
+    if(parent != NULL) {
+        regexThreadCopySubexprs(eval->vm->group_tbl_size, parent, thread);
+    }
+    thread->pc = pc;
+    thread->pos = -1;
+
+    if(eval->thread == NULL) {
+        eval->thread = thread;
+    } else {
+        for(walk = eval->thread; walk->next != NULL; walk = walk->next);
+        walk->next = thread;
+    }
+
+    printf("Thread create: %p\n", thread);
+
+    return 1;
+}
+
+void regexThreadFree(regex_eval_t *eval, regex_thread_t *thread) {
+    regex_thread_t *next;
+
+    printf("Thread free: %p\n", thread);
+
+    if(thread == NULL) {
+        return;
+    }
+    if(eval != NULL) {
+        thread->next = eval->pool;
+        eval->pool = thread;
+        return;
+    }
+    for(; thread != NULL; thread = next) {
+        next = thread->next;
+        free(thread);
+    }
+}
+
+void regexThreadInvalidate(regex_eval_t *eval, regex_thread_t **thread) {
+    regex_thread_t *next;
+
+    next = (*thread)->next;
+    if(eval->thread == *thread) {
+        eval->thread = (*thread)->next;
+    } else {
+        (*thread)->next = NULL;
+    }
+    regexThreadFree(eval, *thread);
+    *thread = next;
+}
+
+regex_eval_t *regexEvalCreate(regex_vm_t *vm) {
+    regex_eval_t *eval;
+
+    if((eval = malloc(sizeof(regex_eval_t))) == NULL) {
+        return NULL;
+    }
+    memset(eval, 0, sizeof(regex_eval_t));
+    if((eval->subexprs = malloc(sizeof(char *) * vm->group_tbl_size)) == NULL) {
+        free(eval);
+        return NULL;
+    }
+    memset(eval->subexprs, 0, sizeof(char *) * vm->group_tbl_size);
+    eval->vm = vm;
+    if(!regexThreadCreate(eval, NULL, 0)) {
+        free(eval->subexprs);
+        free(eval);
+        return NULL;
+    }
+    return eval;
+}
+
+void regexEvalFree(regex_eval_t *eval) {
+    regexThreadFree(NULL, eval->thread);
+    regexThreadFree(NULL, eval->pool);
+    if(eval->subexprs != NULL) {
+        free(eval->subexprs);
+        eval->subexprs = NULL;
+    }
+    free(eval);
+}
+
+int regexVMNoTextAdvance(int instr) {
+    switch(instr) {
+        case eTokenMatch:
+        case eTokenJmp:
+        case eTokenSplit:
+        case eTokenSave:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+int regexMatch(regex_vm_t *vm, const char *text, const char ***subexprs) {
+    regex_eval_t *eval;
+    regex_thread_t *thread;
+    const unsigned char *bitmap;
+    const char *str;
+    int value, pc_a, pc_b;
+
+    if((eval = regexEvalCreate(vm)) == NULL) {
+        return 0;
+    }
+
+    for(eval->sp = text; (*eval->sp != '\0') && (eval->thread != NULL);) {
+        if(eval->thread == NULL) {
+            goto noMatchFound;
+        }
+        for(thread = eval->thread; thread != NULL && thread->pc < vm->size; thread = (thread != NULL ? thread->next : NULL)) {
+            while(regexVMNoTextAdvance(eval->vm->program[thread->pc])) {
+                switch(eval->vm->program[thread->pc]) {
+                    case eTokenSave:
+                        thread->pc++;
+                        value = vm->program[thread->pc];
+                        if(value % 2) {
+                            // Group end
+                            printf("            save %d end\n", value);
+                            thread->subexprs[value] = eval->sp;
+                        } else {
+                            // Group start
+                            printf("            save %d start\n", value);
+                            if(thread->subexprs[value] == NULL) {
+                                thread->subexprs[value] = eval->sp;
+                            }
+                        }
+                        thread->pc++;
+                        break;
+                    case eTokenSplit:
+                        pc_a = vm->program[thread->pc + 1];
+                        pc_b = vm->program[thread->pc + 2];
+                        printf("            pre split %d [%d][%d][%d]\n", thread->pc, vm->program[thread->pc], pc_a, pc_b);
+                        //thread->pc++;
+                        if(!regexThreadCreate(eval, thread, pc_a)) {
+                            return 0;
+                        }
+                        printf("            split %d, %d\n", pc_a, pc_b);
+                        //thread->pc++;
+                        thread->pc = pc_b;
+                        break;
+                    case eTokenMatch:
+                        if(*eval->sp == '\0') {
+                            return 1;
+                        }
+                        printf("            sp = [%c:%d]\n", *eval->sp, *eval->sp);
+                        regexThreadInvalidate(eval, &thread);
+                        continue;
+                    case eTokenJmp:
+                        thread->pc++;
+                        thread->pc = vm->program[thread->pc];
+                        break;
+                    default:
+                        return 0;
+                }
+            }
+            switch(eval->vm->program[thread->pc]) {
+                case eTokenCharLiteral:
+                    thread->pc++;
+                    if(vm->program[thread->pc] != *(eval->sp)) {
+                        regexThreadInvalidate(eval, &thread);
+                    } else {
+                        thread->pc++;
+                        eval->sp++;
+                    }
+                    break;
+                case eTokenStringLiteral:
+                    printf("str lit\n");
+                    if((str = regexVMStringTableEntryGet(vm, vm->program[thread->pc + 1])) == NULL) {
+                        return -1;
+                    }
+                    if(thread->pos == -1) {
+                        printf("        First string pos\n");
+                        thread->pos = 0;
+                    } else {
+                        printf("        pos %d\n", thread->pos);
+                    }
+                    if(str[thread->pos] == *(eval->sp)) {
+                        printf("        str [%c] == [%c]\n", str[thread->pos], *eval->sp);
+                        thread->pos++;
+                        if(str[thread->pos] == '\0') {
+                            printf("        str match, increment\n");
+                            thread->pc += 2;
+                            printf("        pc = %d\n", thread->pc);
+                            thread->pos = -1;
+                        }
+                        eval->sp++;
+                    } else {
+                        printf("Invalid\n");
+                        printf("%p\n", thread);
+                        regexThreadInvalidate(eval, &thread);
+                        printf("eval %p\n", eval->thread);
+                    }
+                    break;
+                case eTokenCharClass:
+                    thread->pc++;
+                    if((bitmap = regexVMClassTableEntryGet(vm, vm->program[thread->pc])) == NULL) {
+                        return -1;
+                    }
+                    if(!mapCheck(bitmap, *(eval->sp))) {
+                        regexThreadInvalidate(eval, &thread);
+                    } else {
+                        thread->pc++;
+                        eval->sp++;
+                    }
+                    break;
+                case eTokenCharAny:
+                    thread->pc++;
+                    break;
+                default:
+                    printf("        B0rked! [%d]\n", *eval->sp);
+                    return 1;
+            }
+        }
+    }
+
+    printf("Fallout\n");
+
+    for(thread = eval->thread; thread != NULL; thread = thread->next) {
+        if(eval->vm->program[thread->pc] == eTokenMatch) {
+            // TODO - finalize the group subexpression values
+            // TODO - cleanup working space
+            printf("MATCH!\n");
+            return 1;
+        }
+    }
+
+noMatchFound:
+
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -1839,14 +2143,21 @@ int main(int argc, char **argv) {
     if(argc > 1) {
         if(regexCompile(&result) != eCompileOk) {
             printf("Compile failed: %s", regexGetCompileStatusStr(result.status));
-        } else {
+            return 1;
+        }
+        if(argc > 2) {
             regexVMPrintProgram(stdout, result.vm);
-            regexVMGenerateDeclaration(result.vm, "myparser", stdout);
-            regexVMGenerateSource(result.vm, "myparser", stdout);
+            if(regexMatch(result.vm, argv[2], NULL)) {
+                printf("Match OK\n");
+            } else {
+                printf("Match FAIL\n");
+            }
+            //regexVMGenerateDeclaration(result.vm, "myparser", stdout);
+            //regexVMGenerateSource(result.vm, "myparser", stdout);
         }
     }
 
-    regexCompileCtxCleanup(&result);
-
     return 0;
 }
+
+
