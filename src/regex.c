@@ -13,13 +13,13 @@
 typedef struct regex_vm_s regex_vm_t;
 struct regex_vm_s {
     int *program;
+    int size;
     char **string_table;
     int string_tbl_size;
     unsigned char **class_table;
     int class_tbl_size;
     char **group_table;
     int group_tbl_size;
-    int size;
 };
 
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
@@ -1234,19 +1234,18 @@ eRegexCompileStatus regexShuntingYard(regex_token_t **tokens) {
     return status;
 }
 
-void regexVMStringTableFree(regex_vm_build_t *build) {
+void regexVMStringTableFree(regex_vm_t *vm) {
     int k;
-    if(build->vm->string_table != NULL) {
-        for(k = 0; k < build->vm->string_tbl_size; k++) {
-            if(build->vm->string_table[k] != NULL) {
-                free(build->vm->string_table[k]);
+    if(vm->string_table != NULL) {
+        for(k = 0; k < vm->string_tbl_size; k++) {
+            if(vm->string_table[k] != NULL) {
+                free(vm->string_table[k]);
             }
         }
-        free(build->vm->string_table);
+        free(vm->string_table);
     }
-    build->vm->string_table = NULL;
-    build->vm->string_tbl_size = 0;
-    build->string_tbl_count = 0;
+    vm->string_table = NULL;
+    vm->string_tbl_size = 0;
 }
 
 int regexVMStringTableEntryAdd(regex_vm_build_t *build, const char *str) {
@@ -1280,19 +1279,18 @@ const char *regexVMStringTableEntryGet(regex_vm_t *vm, int string_table_id) {
     return vm->string_table[string_table_id];
 }
 
-void regexVMClassTableFree(regex_vm_build_t *build) {
+void regexVMClassTableFree(regex_vm_t *vm) {
     int k;
-    if(build->vm->class_table != NULL) {
-        for(k = 0; k < build->class_tbl_count; k++) {
-            if(build->vm->class_table[k] != NULL) {
-                free(build->vm->class_table[k]);
+    if(vm->class_table != NULL) {
+        for(k = 0; k < vm->class_tbl_size; k++) {
+            if(vm->class_table[k] != NULL) {
+                free(vm->class_table[k]);
             }
         }
-        free(build->vm->class_table);
+        free(vm->class_table);
     }
-    build->vm->class_table = NULL;
-    build->class_tbl_count = 0;
-    build->vm->class_tbl_size = 0;
+    vm->class_table = NULL;
+    vm->class_tbl_size = 0;
 }
 
 int regexVMClassTableEntryAdd(regex_vm_build_t *build, const unsigned char *bitmap) {
@@ -1328,18 +1326,18 @@ const unsigned char *regexVMClassTableEntryGet(regex_vm_t *vm, int class_table_i
     return vm->class_table[class_table_id];
 }
 
-void regexVMGroupTableFree(regex_vm_build_t *build) {
+void regexVMGroupTableFree(regex_vm_t *vm) {
     int k;
-    if(build->vm->group_table != NULL) {
-        for(k = 0; k < build->vm->group_tbl_size; k++) {
-            if(build->vm->group_table[k] != NULL) {
-                free(build->vm->group_table[k]);
+    if(vm->group_table != NULL) {
+        for(k = 0; k < vm->group_tbl_size; k++) {
+            if(vm->group_table[k] != NULL) {
+                free(vm->group_table[k]);
             }
         }
-        free(build->vm->group_table);
+        free(vm->group_table);
     }
-    build->vm->group_table = NULL;
-    build->vm->group_tbl_size = 0;
+    vm->group_table = NULL;
+    vm->group_tbl_size = 0;
 }
 
 int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int len, int index) {
@@ -1373,103 +1371,6 @@ const char *regexVMGroupNameFromIndex(regex_vm_t *vm, int index) {
         return vm->group_table[index];
     }
     return NULL;
-}
-
-/////////////////////////////////////////////////////////////////////////////
-
-int regexVMProgramAdd(regex_vm_build_t *build, eRegexToken opcode, int arg1, int arg2) {
-    int size;
-
-    switch(opcode) {
-        case eTokenCharLiteral: size = 2; break;
-        case eTokenCharClass: size = 2; break;
-        case eTokenStringLiteral: size = 2; break;
-        case eTokenCharAny: size = 1; break;
-        case eTokenSplit: size = 3; break;
-        case eTokenJmp: size = 2; break;
-        case eTokenSave: size = 2; break;
-        case eTokenMatch: size = 1; break;
-        default: return 0;
-    }
-
-    if((build->vm->size - build->pc) <= size) {
-        if((build->vm->program = realloc(build->vm->program, (build->vm->size + DEF_VM_SIZE_INC) * sizeof(int))) == NULL) {
-            return 0;
-        }
-        memset(build->vm->program + build->vm->size, 0, DEF_VM_SIZE_INC * sizeof(int));
-        build->vm->size += DEF_VM_SIZE_INC;
-    }
-
-    build->vm->program[build->pc] = opcode;
-    build->pc++;
-    if(size > 1) {
-        build->vm->program[build->pc] = arg1;
-        build->pc++;
-        if(size > 2) {
-            build->vm->program[build->pc] = arg2;
-            build->pc++;
-        }
-    }
-    return 1;
-}
-
-int regexVMInstrCharLiteralCreate(regex_vm_build_t *build, int c) {
-    return regexVMProgramAdd(build, eTokenCharLiteral, c, 0);
-}
-
-int regexVMInstrStringLiteralCreate(regex_vm_build_t *build, const char *str) {
-    int index;
-
-    if((index = regexVMStringTableEntryAdd(build, str)) == -1) {
-        return 0;
-    }
-
-    return regexVMProgramAdd(build, eTokenStringLiteral, index, 0);
-}
-
-int regexVMInstrClassLiteralCreate(regex_vm_build_t *build, const unsigned char *bitmap) {
-    int index;
-
-    if((index = regexVMClassTableEntryAdd(build, bitmap)) == -1) {
-        return 0;
-    }
-
-    return regexVMProgramAdd(build, eTokenCharClass, index, 0);
-}
-
-int regexVMInstrCharAnyLiteralCreate(regex_vm_build_t *build) {
-    return regexVMProgramAdd(build, eTokenCharAny, 0, 0);
-}
-
-int regexVMInstrSplitCreate(regex_vm_build_t *build, int idx_a, int idx_b) {
-    return regexVMProgramAdd(build, eTokenSplit, idx_a, idx_b);
-}
-
-int regexVMInstrSaveCreate(regex_vm_build_t *build, int group) {
-    return regexVMProgramAdd(build, eTokenSave, group, 0);
-}
-
-int regexVMInstrMatchCreate(regex_vm_build_t *build) {
-    return regexVMProgramAdd(build, eTokenMatch, 0, 0);
-}
-
-int regexVMInstrJmpCreate(regex_vm_build_t *build, int idx) {
-    return regexVMProgramAdd(build, eTokenJmp, idx, 0);
-}
-
-void regexWalkAllTokens(regex_token_t *token, int value) {
-    if(token != NULL) {
-        if(token->pc == value) {
-            return;
-        }
-        token->pc = value;
-        if(token->out_a != NULL) {
-            regexWalkAllTokens(token->out_a, value);
-        }
-        if(token->out_b != NULL) {
-            regexWalkAllTokens(token->out_b, value);
-        }
-    }
 }
 
 // VM Patch list management functions ///////////////////////////////////////
@@ -1515,10 +1416,63 @@ void regexVMPatchJumps(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list
     *patch_list = NULL;
 }
 
+/////////////////////////////////////////////////////////////////////////////
+
+int regexVMProgramAdd(regex_vm_build_t *build, eRegexToken opcode, int arg1, int arg2) {
+    int size;
+
+    switch(opcode) {
+        case eTokenCharLiteral: size = 2; break;
+        case eTokenCharClass: size = 2; break;
+        case eTokenStringLiteral: size = 2; break;
+        case eTokenCharAny: size = 1; break;
+        case eTokenSplit: size = 3; break;
+        case eTokenJmp: size = 2; break;
+        case eTokenSave: size = 2; break;
+        case eTokenMatch: size = 1; break;
+        default: return 0;
+    }
+
+    if((build->vm->size - build->pc) <= size) {
+        if((build->vm->program = realloc(build->vm->program, (build->vm->size + DEF_VM_SIZE_INC) * sizeof(int))) == NULL) {
+            return 0;
+        }
+        memset(build->vm->program + build->vm->size, 0, DEF_VM_SIZE_INC * sizeof(int));
+        build->vm->size += DEF_VM_SIZE_INC;
+    }
+
+    build->vm->program[build->pc] = opcode;
+    build->pc++;
+    if(size > 1) {
+        build->vm->program[build->pc] = arg1;
+        build->pc++;
+        if(size > 2) {
+            build->vm->program[build->pc] = arg2;
+            build->pc++;
+        }
+    }
+    return 1;
+}
+
+void regexWalkAllTokens(regex_token_t *token, int value) {
+    if(token != NULL) {
+        if(token->pc == value) {
+            return;
+        }
+        token->pc = value;
+        if(token->out_a != NULL) {
+            regexWalkAllTokens(token->out_a, value);
+        }
+        if(token->out_b != NULL) {
+            regexWalkAllTokens(token->out_b, value);
+        }
+    }
+}
+
 // VM bytecode generator ////////////////////////////////////////////////////
 
 int regexVMProgramGenerate(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list, regex_token_t *token) {
-    int idx_a, idx_b;
+    int idx_a = 0, idx_b = 0;
 
     if(token == NULL) {
         return 1;
@@ -1526,39 +1480,26 @@ int regexVMProgramGenerate(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_
     if(token->pc != VM_PC_UNVISITED) {
         return 1;
     }
+    token->pc = build->pc;
+
     switch(token->tokenType) {
         case eTokenCharLiteral:
-            token->pc = build->pc;
-            if(!regexVMInstrCharLiteralCreate(build, token->c)) {
-                return 0;
-            }
-            return regexVMProgramGenerate(build, patch_list, token->out_a);
+            idx_a = token->c;
+            break;
         case eTokenStringLiteral:
-            token->pc = build->pc;
-            if(!regexVMInstrStringLiteralCreate(build, token->str)) {
+            if((idx_a = regexVMStringTableEntryAdd(build, token->str)) == -1) {
                 return 0;
             }
-            return regexVMProgramGenerate(build, patch_list, token->out_a);
+            break;
         case eTokenCharClass:
-            token->pc = build->pc;
-            if(!regexVMInstrClassLiteralCreate(build, token->bitmap)) {
+            if((idx_a = regexVMClassTableEntryAdd(build, token->bitmap)) == -1) {
                 return 0;
             }
-            return regexVMProgramGenerate(build, patch_list, token->out_a);
-        case eTokenCharAny:
-            token->pc = build->pc;
-            if(!regexVMInstrCharAnyLiteralCreate(build)) {
-                return 0;
-            }
-            return regexVMProgramGenerate(build, patch_list, token->out_a);
+            break;
         case eTokenSave:
-            token->pc = build->pc;
-            if(!regexVMInstrSaveCreate(build, token->group)) {
-                return 0;
-            }
-            return regexVMProgramGenerate(build, patch_list, token->out_a);
+            idx_a = token->group;
+            break;
         case eTokenSplit:
-            token->pc = build->pc;
             if((idx_a = token->out_a->pc) == VM_PC_UNVISITED) {
                 if(!regexAddPCPatchEntry(patch_list, token->out_a, build->pc + 1)) {
                     return 0;
@@ -1569,33 +1510,32 @@ int regexVMProgramGenerate(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_
                     return 0;
                 }
             }
-            if(!regexVMInstrSplitCreate(build, idx_a, idx_b)) {
-                return 0;
-            }
-            if(!regexVMProgramGenerate(build, patch_list, token->out_a)) {
-                return 0;
-            }
-            return regexVMProgramGenerate(build, patch_list, token->out_b);
-        case eTokenMatch:
-            token->pc = build->pc;
-            if(!regexVMInstrMatchCreate(build)) {
-                return 0;
-            }
-            return 1;
+            break;
         case eTokenJmp:
-            token->pc = build->pc;
             if((idx_a = token->out_a->pc) == VM_PC_UNVISITED) {
                 if(!regexAddPCPatchEntry(patch_list, token->out_a, build->pc + 1)) {
                     return 0;
                 }
             }
-            if(!regexVMInstrJmpCreate(build, idx_a)) {
-                return 0;
-            }
-            return regexVMProgramGenerate(build, patch_list, token->out_b);
+            break;
         default:
-            return 0;
+            // Fall through
+            break;
     }
+
+    if(!regexVMProgramAdd(build, token->tokenType, idx_a, idx_b)) {
+        return 0;
+    }
+
+    if(token->tokenType == eTokenSplit) {
+        if(!regexVMProgramGenerate(build, patch_list, token->out_a)) {
+            return 0;
+        }
+        return regexVMProgramGenerate(build, patch_list, token->out_b);
+    }
+
+    return regexVMProgramGenerate(build, patch_list, token->out_a);
+
 }
 
 int regexVMBuildInit(regex_vm_build_t *build) {
@@ -1607,10 +1547,14 @@ int regexVMBuildInit(regex_vm_build_t *build) {
     return 1;
 }
 
+void regexVMFree(regex_vm_t *vm) {
+    regexVMStringTableFree(vm);
+    regexVMClassTableFree(vm);
+    regexVMGroupTableFree(vm);
+
+}
 void regexVMBuildDestroy(regex_vm_build_t *build) {
-    regexVMStringTableFree(build);
-    regexVMClassTableFree(build);
-    regexVMGroupTableFree(build);
+    regexVMFree(build->vm);
     free(build);
 }
 
