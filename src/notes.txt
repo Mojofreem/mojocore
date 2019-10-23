@@ -65,3 +65,24 @@ start pc, next pc
 
 literal
 zeroorone,zeroormany,oneormany -> literal
+
+
+#define MOJO_REGEX_COMPILE_IMPLEMENTATION
+#define MOJO_REGEX_EVALUATE_IMPLEMENTATION
+
+#include "regex.h"
+
+regexCompile
+regexMatch
+    complete
+    fulfillment
+regexVMGenerateDeclaration
+regexVMGenerateDefinition
+regexGroupCountGet
+regexGroupNameLookup
+regexGroupIndexLookup
+regexGroupValueGet
+
+
+
+
