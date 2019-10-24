@@ -10,45 +10,25 @@
 #include <string.h>
 
 /*
-Regex VM Bytecode (v1)
+Regex VM Bytecode (v2)
 
-    Program stack is an array of 32 bit ints
-    Operators and operands are represented in independent stack entries.
-    Bytecode:
-        eTokenCharLiteral       1
-            1 operand: character literal to match
-        eTokenCharClass         2
-            1 operand: index of the character class to match
-        eTokenStringLiteral     3
-            1 operand: index of the string table entry to match
-        eTokenCharAny           4
-            0 operands
-        eTokenMatch             5
-            0 operands
-        eTokenSplit             6
-            2 operands: program counter indexes to continue evaluation from
-        eTokenJmp               7
-            1 operand: program counter index to transition to
-        eTokenSave              8
-            1 operand: the group index to save the current text position to
-
-Regex VM Bytecode (v2) (REGEX_USE_COMPACT_VM)
-
-    A more compact storage arrangement. Each operation is encoded into a single
-    program stack entry.
-    All operations are encoded as a single 32 bit int value:
+    Each operation is encoded into a single 32 bit int value:
 
          32    -     18 17     -     4 3- 0
         |--------------|--------------|----|
         |14 bits (op a)|14 bits (op b)|4bit|
         | Operand A    | Operand B    | Op |
 
-    Each operation has the same opcode as v1, but now all opcodes have their
-    operands encoded within a single instruction.
-
- */
-
-#define REGEX_USE_COMPACT_VM
+    Operators:               opcode     Operand A               Operand B
+        eTokenCharLiteral       1       char to match
+        eTokenCharClass         2       class idx to match
+        eTokenStringLiteral     3       str idx to match
+        eTokenCharAny           4
+        eTokenMatch             5
+        eTokenSplit             6       program counter         program counter
+        eTokenJmp               7       program counter
+        eTokenSave              8       subexpression number
+*/
 
 typedef struct regex_vm_s regex_vm_t;
 struct regex_vm_s {
@@ -96,12 +76,13 @@ typedef struct regex_match_s regex_match_t;
 struct regex_match_s {
     const char *text;
     regex_vm_t *vm;
-    const char **subexprs;
+    const char *subexprs[0];
 };
 
-//regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete);
+regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete);
 void regexMatchFree(regex_match_t *match);
 const char *regexGroupValueGet(regex_match_t *match, int group, int *len);
+const char *regexGroupValueGetByName(regex_match_t *match, const char *name, int *len);
 
 #endif // MOJO_REGEX_EVALUATE_IMPLEMENTATION
 
@@ -1413,9 +1394,18 @@ const char *regexVMGroupNameFromIndex(regex_vm_t *vm, int index) {
     return NULL;
 }
 
-// VM Patch list management functions ///////////////////////////////////////
+int regexVMGroupNameLookup(regex_vm_t *vm, const char *name) {
+    int k;
 
-#ifdef REGEX_USE_COMPACT_VM
+    for(k = 0; k < vm->group_tbl_size; k++) {
+        if(!strcmp(vm->group_table[k], name)) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+// VM Patch list management functions ///////////////////////////////////////
 
 #define REGEX_VM_INSTR_DECODE2(var,vm,pc)   (var)[0] = (vm)->program[(pc)] & 0xFU; \
                                             (var)[1] = ((vm)->program[(pc)] & 0x3FFF0U) >> 4U; \
@@ -1491,7 +1481,7 @@ int regexVMProgramAdd(regex_vm_build_t *build, eRegexToken opcode, unsigned int 
 
     REGEX_VM_INSTR_ENCODE2(build->vm, build->pc, opcode, arg1, arg2);
     build->pc++;
-    
+
     return 1;
 }
 
@@ -1754,354 +1744,6 @@ void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
                 return;        }
     }
 }
-#else
-typedef struct regex_vm_pc_patch_s regex_vm_pc_patch_t;
-struct regex_vm_pc_patch_s {
-    regex_token_t *token;
-    int pc;
-    regex_vm_pc_patch_t *next;
-};
-
-int regexAddPCPatchEntry(regex_vm_pc_patch_t **patch_list, regex_token_t *token, int index) {
-    regex_vm_pc_patch_t *entry;
-
-    if((entry = malloc(sizeof(regex_vm_pc_patch_t))) == NULL) {
-        return 0;
-    }
-    memset(entry, 0, sizeof(regex_vm_pc_patch_t));
-    entry->pc = index;
-    entry->token = token;
-    entry->next = *patch_list;
-    *patch_list = entry;
-    return 1;
-}
-
-void regexVMPatchListFree(regex_vm_pc_patch_t *patch_list) {
-    regex_vm_pc_patch_t *next;
-
-    for(; patch_list != NULL; patch_list = next) {
-        next = patch_list;
-        free(patch_list);
-    }
-}
-
-void regexVMPatchJumps(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list) {
-    regex_vm_pc_patch_t *patch, *next;
-
-    for(patch = *patch_list; patch != NULL; patch = next) {
-        next = patch->next;
-        build->vm->program[patch->pc] = patch->token->pc;
-        free(patch);
-    }
-    *patch_list = NULL;
-}
-
-/////////////////////////////////////////////////////////////////////////////
-
-int regexVMProgramAdd(regex_vm_build_t *build, eRegexToken opcode, int arg1, int arg2) {
-    int size;
-
-    switch(opcode) {
-        case eTokenCharLiteral: size = 2; break;
-        case eTokenCharClass: size = 2; break;
-        case eTokenStringLiteral: size = 2; break;
-        case eTokenCharAny: size = 1; break;
-        case eTokenSplit: size = 3; break;
-        case eTokenJmp: size = 2; break;
-        case eTokenSave: size = 2; break;
-        case eTokenMatch: size = 1; break;
-        default: return 0;
-    }
-
-    if((build->vm->size - build->pc) <= size) {
-        if((build->vm->program = realloc(build->vm->program, (build->vm->size + DEF_VM_SIZE_INC) * sizeof(int))) == NULL) {
-            return 0;
-        }
-        memset(build->vm->program + build->vm->size, 0, DEF_VM_SIZE_INC * sizeof(int));
-        build->vm->size += DEF_VM_SIZE_INC;
-    }
-
-    build->vm->program[build->pc] = opcode;
-    build->pc++;
-    if(size > 1) {
-        build->vm->program[build->pc] = arg1;
-        build->pc++;
-        if(size > 2) {
-            build->vm->program[build->pc] = arg2;
-            build->pc++;
-        }
-    }
-    return 1;
-}
-
-void regexWalkAllTokens(regex_token_t *token, int value) {
-    if(token != NULL) {
-        if(token->pc == value) {
-            return;
-        }
-        token->pc = value;
-        if(token->out_a != NULL) {
-            regexWalkAllTokens(token->out_a, value);
-        }
-        if(token->out_b != NULL) {
-            regexWalkAllTokens(token->out_b, value);
-        }
-    }
-}
-
-// VM bytecode generator ////////////////////////////////////////////////////
-
-int regexVMProgramGenerate(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list, regex_token_t *token) {
-    int idx_a = 0, idx_b = 0;
-
-    if(token == NULL) {
-        return 1;
-    }
-    if(token->pc != VM_PC_UNVISITED) {
-        return 1;
-    }
-    token->pc = build->pc;
-
-    switch(token->tokenType) {
-        case eTokenCharLiteral:
-            idx_a = token->c;
-            break;
-        case eTokenStringLiteral:
-            if((idx_a = regexVMStringTableEntryAdd(build, token->str)) == -1) {
-                return 0;
-            }
-            break;
-        case eTokenCharClass:
-            if((idx_a = regexVMClassTableEntryAdd(build, token->bitmap)) == -1) {
-                return 0;
-            }
-            break;
-        case eTokenSave:
-            idx_a = token->group;
-            break;
-        case eTokenSplit:
-            if((idx_a = token->out_a->pc) == VM_PC_UNVISITED) {
-                if(!regexAddPCPatchEntry(patch_list, token->out_a, build->pc + 1)) {
-                    return 0;
-                }
-            }
-            if((idx_b = token->out_b->pc) == VM_PC_UNVISITED) {
-                if(!regexAddPCPatchEntry(patch_list, token->out_b, build->pc + 2)) {
-                    return 0;
-                }
-            }
-            break;
-        case eTokenJmp:
-            if((idx_a = token->out_a->pc) == VM_PC_UNVISITED) {
-                if(!regexAddPCPatchEntry(patch_list, token->out_a, build->pc + 1)) {
-                    return 0;
-                }
-            }
-            break;
-        default:
-            // Fall through
-            break;
-    }
-
-    if(!regexVMProgramAdd(build, token->tokenType, idx_a, idx_b)) {
-        return 0;
-    }
-
-    if(token->tokenType == eTokenSplit) {
-        if(!regexVMProgramGenerate(build, patch_list, token->out_a)) {
-            return 0;
-        }
-        return regexVMProgramGenerate(build, patch_list, token->out_b);
-    }
-
-    return regexVMProgramGenerate(build, patch_list, token->out_a);
-
-}
-
-int regexVMBuildInit(regex_vm_build_t *build) {
-    memset(build, 0, sizeof(regex_vm_build_t));
-    if((build->vm = malloc(sizeof(regex_vm_t))) == NULL) {
-        return 0;
-    }
-    memset(build->vm, 0, sizeof(regex_vm_t));
-    return 1;
-}
-
-void regexVMFree(regex_vm_t *vm) {
-    regexVMStringTableFree(vm);
-    regexVMClassTableFree(vm);
-    regexVMGroupTableFree(vm);
-    free(vm);
-}
-
-void regexVMBuildDestroy(regex_vm_build_t *build) {
-    regexVMFree(build->vm);
-    free(build);
-}
-
-void regexVMGenerateDeclaration(regex_vm_t *vm, const char *symbol, FILE *fp) {
-    fprintf(fp, "extern regex_vm_t *%s;\n", symbol);
-}
-
-#define MAX_VM_INSTR_PER_ROW    8
-
-void regexEmitEscapedString(FILE *fp, const char *str) {
-    for(; *str != '\0'; str++) {
-        if((*str < 32) || (*str > 127)) {
-            switch(*str) {
-                case '\n': fprintf(fp, "\\n"); break;
-                case '\r': fprintf(fp, "\\r"); break;
-                case '\t': fprintf(fp, "\\t"); break;
-                case '\f': fprintf(fp, "\\f"); break;
-                case '\v': fprintf(fp, "\\v"); break;
-                case '\a': fprintf(fp, "\\a"); break;
-                default:
-                    fprintf(fp, "\\x%2.2X\"\"", *str);
-                    break;
-            }
-        } else {
-            fputc(*str, fp);
-        }
-    }
-}
-
-void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
-    int k, j;
-
-    fprintf(fp, "int _%s_program[] = {", symbol);
-    for(k = 0; k < vm->size; k++) {
-        if(k != 0) {
-            fputc(',', fp);
-        }
-        if(!(k % MAX_VM_INSTR_PER_ROW)) {
-            fputs("\n    ", fp);
-        } else {
-            fputc(' ', fp);
-        }
-        fprintf(fp, "0x%.2X", vm->program[k]);
-    }
-    fprintf(fp, "\n};\n\n");
-
-    fprintf(fp, "char *_%s_string_table[] = {\n", symbol);
-    for(k = 0; k < vm->string_tbl_size; k++) {
-        if(vm->string_table[k] == NULL) {
-            fprintf(fp, "    NULL%s\n", (((k + 1) != vm->string_tbl_size) ? "," : ""));
-        } else {
-            fprintf(fp, "    \"");
-            regexEmitEscapedString(fp, vm->string_table[k]);
-            fprintf(fp, "\"%s\n", (((k + 1) != vm->string_tbl_size) ? "," : ""));
-        }
-    }
-    fprintf(fp, "};\n\n");
-
-    for(k = 0; k < vm->class_tbl_size; k++) {
-        if(vm->class_table[k] == NULL) {
-            continue;
-        }
-        fprintf(fp, "unsigned char _%s_class_entry_%d[] = {", symbol, k);
-        for(j = 0; j < 32; j++) {
-            if(j != 0) {
-                fputc(',', fp);
-            }
-            if(!(j % 8)) {
-                fputs("\n    ", fp);
-            } else {
-                fputc(' ', fp);
-            }
-            fprintf(fp, "0x%2.2X", vm->class_table[k][j]);
-        }
-        fprintf(fp, "\n};\n\n");
-    }
-
-    fprintf(fp, "unsigned char *_%s_class_table[] = {\n", symbol);
-    for(k = 0; k < vm->class_tbl_size; k++) {
-        if(vm->class_table[k] == NULL) {
-            fprintf(fp, "    NULL,\n");
-        } else {
-            fprintf(fp, "    _%s_class_entry_%d,\n", symbol, k);
-        }
-    }
-    fprintf(fp, "};\n\n");
-
-    fprintf(fp, "char *_%s_group_table[] = {\n", symbol);
-    for(k = 0; k < vm->group_tbl_size; k++) {
-        if(vm->group_table[k] == NULL) {
-            fprintf(fp, "    NULL,\n");
-        } else {
-            fprintf(fp, "    \"");
-            regexEmitEscapedString(fp, vm->group_table[k]);
-            fprintf(fp, "\",\n");
-        }
-    }
-    fprintf(fp, "};\n\n");
-
-    fprintf(fp, "regex_vm_t _%s = {\n", symbol);
-    fprintf(fp, "    .program = _%s_program,\n", symbol);
-    fprintf(fp, "    .size = %d,\n", vm->size);
-    fprintf(fp, "    .string_table = _%s_string_table,\n", symbol);
-    fprintf(fp, "    .string_tbl_size = %d,\n", vm->string_tbl_size);
-    fprintf(fp, "    .class_table = _%s_class_table,\n", symbol);
-    fprintf(fp, "    .class_tbl_size = %d,\n", vm->class_tbl_size);
-    fprintf(fp, "    .group_table = _%s_group_table,\n", symbol);
-    fprintf(fp, "    .group_tbl_size = %d\n", vm->group_tbl_size);
-    fprintf(fp, "};\n\n");
-    fprintf(fp, "regex_vm_t *%s = &_%s;\n", symbol, symbol);
-}
-
-void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
-    int pc;
-    int value;
-    const char *name;
-
-    for(pc = 0; pc < vm->size; pc++) {
-        fprintf(fp, "%3.3d  ", pc);
-        switch(vm->program[pc]) {
-            case eTokenCharLiteral:
-                pc++;
-                value = vm->program[pc];
-                fprintf(fp, "char (%c:%d)\n", (value < 32 || value > 127) ? '-' : value, value);
-                break;
-            case eTokenStringLiteral:
-                pc++;
-                fprintf(fp, "string(\"%s\")\n", vm->string_table[vm->program[pc]]);
-                break;
-            case eTokenCharClass:
-                pc++;
-                fprintf(fp, "class([");
-                regexPrintCharClassToFP(fp, vm->class_table[vm->program[pc]]);
-                fprintf(fp, "])\n");
-                break;
-            case eTokenCharAny:
-                fprintf(fp, "anychar\n");
-                break;
-            case eTokenSave:
-                pc++;
-                fprintf(fp, "save %d", vm->program[pc]);
-                value = vm->program[pc];
-                if((name = regexVMGroupNameFromIndex(vm, value)) != NULL) {
-                    fprintf(fp, " [%s]\n", name);
-                } else {
-                    fprintf(fp, "\n");
-                }
-                break;
-            case eTokenSplit:
-                pc++;
-                fprintf(fp, "split %d, %d\n", vm->program[pc], vm->program[pc + 1]);
-                pc++;
-                break;
-            case eTokenMatch:
-                fprintf(fp, "match\n");
-                break;
-            case eTokenJmp:
-                pc++;
-                fprintf(fp, "jmp %d\n", vm->program[pc]);
-                break;
-            default:
-                fprintf(fp, "UNKNOWN [%d]!\n", vm->program[pc]);
-                return;        }
-    }
-}
-#endif
 
 const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
     switch(status) {
@@ -2186,13 +1828,21 @@ eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern) 
     return eCompileOk;
 }
 
-#if 0
-// Each branch of the evaluation follows a thread. The pc keeps track of the
-// program counter for the thread. Pos is used to track submatches for string
-// literals. subexprs is an array of group start/stop markers.
+int regexGroupCountGet(regex_vm_t *vm) {
+    return vm->group_tbl_size;
+}
+
+const char *regexGroupNameLookup(regex_vm_t *vm, int group) {
+    return regexVMGroupNameFromIndex(vm, group);
+}
+
+int regexGroupIndexLookup(regex_vm_t *vm, const char *name) {
+    return regexVMGroupNameLookup(vm, name);
+}
+
 typedef struct regex_thread_s regex_thread_t;
 struct regex_thread_s {
-    int pc;
+    unsigned int pc;
     int pos;
     regex_thread_t *next;
     const char *subexprs[0];
@@ -2212,11 +1862,11 @@ void regexThreadCopySubexprs(int count, regex_thread_t *dest, regex_thread_t *sr
     int k;
 
     for(k = 0; k < count; k++) {
-        src->subexprs[k] = dest->subexprs[k];
+        dest->subexprs[k] = src->subexprs[k];
     }
 }
 
-regex_eval_t *regexEvalCreate(regex_vm_t *vm) {
+regex_eval_t *regexEvalCreate(regex_vm_t *vm, const char *pattern) {
     regex_eval_t *eval;
 
     if((eval = malloc(sizeof(regex_eval_t))) == NULL) {
@@ -2224,18 +1874,19 @@ regex_eval_t *regexEvalCreate(regex_vm_t *vm) {
     }
     memset(eval, 0, sizeof(regex_eval_t));
 
-    if((eval->subexprs = malloc(sizeof(char *) * vm->group_tbl_size)) == NULL) {
+    if((eval->subexprs = malloc(sizeof(char *) * 2 * vm->group_tbl_size)) == NULL) {
         free(eval);
         return NULL;
     }
-    memset(eval->subexprs, 0, sizeof(char *) * vm->group_tbl_size);
+    memset(eval->subexprs, 0, sizeof(char *) * 2 * vm->group_tbl_size);
 
     eval->vm = vm;
+    eval->sp = pattern;
 
     return eval;
 }
 
-int regexThreadCreate(regex_eval_t *eval, regex_thread_t *parent, int pc) {
+int regexThreadCreate(regex_eval_t *eval, regex_thread_t *parent, unsigned int pc, int queued) {
     regex_thread_t *thread, *walk;
 
     if(eval->pool != NULL) {
@@ -2243,19 +1894,24 @@ int regexThreadCreate(regex_eval_t *eval, regex_thread_t *parent, int pc) {
         eval->pool = thread->next;
         thread->next = NULL;
     } else {
-        if((thread = malloc(sizeof(regex_thread_t) + (eval->vm->group_tbl_size * sizeof(char *)))) == NULL) {
+        if((thread = malloc(sizeof(regex_thread_t) + (eval->vm->group_tbl_size * 2 * sizeof(char *)))) == NULL) {
             return 0;
         }
     }
-    memset(thread, 0, sizeof(regex_thread_t) + (eval->vm->group_tbl_size * sizeof(char *)));
+    memset(thread, 0, sizeof(regex_thread_t) + (eval->vm->group_tbl_size * 2 * sizeof(char *)));
     if(parent != NULL) {
-        regexThreadCopySubexprs(eval->vm->group_tbl_size, thread, parent);
+        regexThreadCopySubexprs(eval->vm->group_tbl_size * 2, thread, parent);
     }
     thread->pc = pc;
     thread->pos = -1;
 
-    thread->next = eval->queue;
-    eval->queue = thread;
+    if(queued) {
+        thread->next = eval->queue;
+        eval->queue = thread;
+    } else {
+        thread->next = eval->thread;
+        eval->thread = thread;
+    }
 
     return 1;
 }
@@ -2288,8 +1944,8 @@ void regexEvalFree(regex_eval_t *eval) {
     free(eval);
 }
 
-int regexVMNoTextAdvance(int instr) {
-    switch(instr) {
+int regexVMNoTextAdvance(unsigned int instr) {
+    switch(instr & 0xFU) {
         case eTokenMatch:
         case eTokenJmp:
         case eTokenSplit:
@@ -2308,85 +1964,72 @@ typedef enum {
     eEvalContinue = 2
 } eRegexEvalResult;
 
-eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread) {
+eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, int complete) {
     const unsigned char *bitmap;
     const char *str;
-    int value, pc_a, pc_b;
+    unsigned int instr[3];
 
     while(regexVMNoTextAdvance(eval->vm->program[thread->pc])) {
-        switch(eval->vm->program[thread->pc]) {
+        REGEX_VM_INSTR_DECODE2(instr, eval->vm, thread->pc);
+        switch(instr[0]) {
             case eTokenSave:
-                thread->pc++;
-                value = eval->vm->program[thread->pc];
-                printf("save %d\n", value);
-                if(value % 2) {
+                if(instr[1] % 2) {
                     // Group end
-                    thread->subexprs[value] = eval->sp;
+                    thread->subexprs[instr[1]] = eval->sp;
                 } else {
                     // Group start
-                    if(thread->subexprs[value] == NULL) {
-                        thread->subexprs[value] = eval->sp;
+                    if(thread->subexprs[instr[1]] == NULL) {
+                        thread->subexprs[instr[1]] = eval->sp;
                     }
                 }
                 thread->pc++;
                 break;
             case eTokenSplit:
-                printf("split\n");
-                pc_a = eval->vm->program[thread->pc + 1];
-                pc_b = eval->vm->program[thread->pc + 2];
-                if(!regexThreadCreate(eval, thread, pc_a)) {
+                if(!regexThreadCreate(eval, thread, instr[1], 0)) {
                     return eEvalOutOfMem;
                 }
-                thread->pc = pc_b;
-                break;
+                thread->pc = instr[2];
+                continue;
             case eTokenMatch:
-                printf("match\n");
-                if(*eval->sp == '\0') {
+                if(!complete || *eval->sp == '\0') {
                     return eEvalMatch;
                 }
                 return eEvalNoMatch;
             case eTokenJmp:
-                printf("jmp\n");
-                thread->pc = eval->vm->program[thread->pc + 1];
-                break;
+                thread->pc = instr[1];
+                continue;
             default:
                 return eEvalInternalError;
         }
     }
-    switch(eval->vm->program[thread->pc]) {
+    REGEX_VM_INSTR_DECODE2(instr, eval->vm, thread->pc);
+    switch(instr[0]) {
         case eTokenCharLiteral:
-            printf("char\n");
-            thread->pc++;
-            if(eval->vm->program[thread->pc] != *(eval->sp)) {
+            if(instr[1] != *(eval->sp)) {
                 return eEvalNoMatch;
             } else {
                 thread->pc++;
             }
             return eEvalMatch;
         case eTokenStringLiteral:
-            if((str = regexVMStringTableEntryGet(eval->vm, eval->vm->program[thread->pc + 1])) == NULL) {
+            if((str = regexVMStringTableEntryGet(eval->vm, instr[1])) == NULL) {
                 return eEvalInternalError;
             }
             if(thread->pos == -1) {
                 thread->pos = 0;
             }
-            printf("str[%d]\n", thread->pos);
             if(str[thread->pos] == *(eval->sp)) {
                 thread->pos++;
                 if(str[thread->pos] == '\0') {
-                    thread->pc += 2;
+                    thread->pc++;
                     thread->pos = -1;
                     return eEvalMatch;
                 }
                 return eEvalContinue;
-            } else {
-                return eEvalNoMatch;
             }
-            break;
+            return eEvalNoMatch;
         case eTokenCharClass:
-            printf("class\n");
-            thread->pc++;
-            if((bitmap = regexVMClassTableEntryGet(eval->vm, eval->vm->program[thread->pc])) == NULL) {
+            if((bitmap = regexVMClassTableEntryGet(eval->vm, instr[1])) == NULL) {
                 return eEvalInternalError;
             }
             if(!mapCheck(bitmap, *(eval->sp))) {
@@ -2396,7 +2039,6 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread) 
             }
             return eEvalMatch;
         case eTokenCharAny:
-            printf("any\n");
             thread->pc++;
             return eEvalMatch;
         default:
@@ -2404,61 +2046,113 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread) 
     }
 }
 
-int regexMatch(regex_vm_t *vm, const char *text, const char ***subexprs) {
+regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete) {
+    regex_match_t *match;
     regex_eval_t *eval;
     regex_thread_t *thread;
+    int k;
 
-    if((eval = regexEvalCreate(vm)) == NULL) {
-        return 0;
+    if((eval = regexEvalCreate(vm, text)) == NULL) {
+        return NULL;
     }
 
-    if(!regexThreadCreate(eval, NULL, 0)) {
+    if(!regexThreadCreate(eval, NULL, 0, 1)) {
         regexEvalFree(eval);
-        return 0;
+        return NULL;
     }
 
-    for(eval->sp = text; (*eval->sp != '\0') && (eval->queue != NULL);) {
+    for(; *eval->sp != '\0'; eval->sp++) {
         eval->thread = eval->queue;
         eval->queue = NULL;
-        printf("[%c:%d]\n", *eval->sp, *eval->sp);
-        for(thread = eval->thread; thread != NULL && thread->pc < vm->size; thread = eval->thread) {
+        for(thread = eval->thread; thread != NULL; thread = eval->thread) {
             eval->thread = thread->next;
-            thread->next = NULL;
-            switch(regexThreadProcess(eval, thread)) {
+            switch(regexThreadProcess(eval, thread, complete)) {
                 default:
                 case eEvalInternalError:
                 case eEvalOutOfMem:
-                    printf("DEATH!\n");
-                    return -1;
+                    regexEvalFree(eval);
+                    return NULL;
                 case eEvalMatch:
                 case eEvalContinue:
-                    printf("good\n");
-                    if((eval->vm->program[thread->pc] == eTokenMatch) && (*eval->sp == '\0')) {
-                        goto FoundMatch;
+                    if(eval->vm->program[thread->pc] == eTokenMatch) {
+                        if((complete && (*eval->sp == '\0')) || (!complete)) {
+                            goto FoundMatch;
+                        }
                     }
                     thread->next = eval->queue;
                     eval->queue = thread;
                     break;
                 case eEvalNoMatch:
-                    printf("nope\n");
                     regexThreadFree(eval, thread);
                     continue;
             }
         }
-        eval->sp++;
     }
 
+    for(thread = eval->thread; thread != NULL; thread = thread->next) {
+        if((eval->vm->program[thread->pc] & 0xFU) == eTokenMatch) {
+            goto FoundMatch;
+        }
+    }
+    for(thread = eval->queue; thread != NULL; thread = thread->next) {
+        if((eval->vm->program[thread->pc] & 0xFU) == eTokenMatch) {
+            goto FoundMatch;
+        }
+    }
     regexEvalFree(eval);
-    return 0;
+    return NULL;
 
 FoundMatch:
 
-    // TODO - copy subexpression markers
+    // Expects "thread" to be the success thread
+    if((match = malloc(sizeof(regex_match_t) + (sizeof(char *) * 2 * vm->group_tbl_size))) == NULL) {
+        return NULL;
+    }
+    memset(match, 0, sizeof(regex_match_t));
+    match->vm = vm;
+    match->text = text;
+    for(k = 0; k < (vm->group_tbl_size * 2); k++) {
+        match->subexprs[k] = thread->subexprs[k];
+    }
     regexEvalFree(eval);
-    return 1;
+
+    return match;
 }
 
-#endif
+void regexMatchFree(regex_match_t *match) {
+    free(match);
+}
+
+const char *regexGroupValueGet(regex_match_t *match, int group, int *len) {
+    int start, end;
+
+    if((group < 0) || (group > match->vm->group_tbl_size)) {
+        if(len != NULL) {
+            *len = 0;
+        }
+        return NULL;
+    }
+
+    start = regexSubexprStartFromGroup(group);
+    end = regexSubexprEndFromGroup(group);
+
+    if((match->subexprs[start] == NULL) || (match->subexprs[end])) {
+        if(len != NULL) {
+            *len = 0;
+        }
+        return NULL;
+    }
+
+    if(len != NULL) {
+        *len = match->subexprs[end] - match->subexprs[start];
+    }
+
+    return match->subexprs[start];
+}
+
+const char *regexGroupValueGetByName(regex_match_t *match, const char *name, int *len) {
+    return regexGroupValueGet(match, regexGroupIndexLookup(match->vm, name), len);
+}
 
 int main(int argc, char **argv) {
     regex_compile_ctx_t result;
@@ -2470,15 +2164,15 @@ int main(int argc, char **argv) {
         }
         if(argc > 2) {
             regexVMPrintProgram(stdout, result.vm);
-            /*
-            if(regexMatch(result.vm, argv[2], NULL)) {
+
+            if(regexMatch(result.vm, argv[2], 0)) {
                 printf("Match OK\n");
             } else {
                 printf("Match FAIL\n");
             }
-            */
-            regexVMGenerateDeclaration(result.vm, "myparser", stdout);
-            regexVMGenerateDefinition(result.vm, "myparser", stdout);
+
+            //regexVMGenerateDeclaration(result.vm, "myparser", stdout);
+            //regexVMGenerateDefinition(result.vm, "myparser", stdout);
         }
     }
 
