@@ -84,5 +84,9 @@ regexGroupIndexLookup
 regexGroupValueGet
 
 
-
+non complete matches should return the range the matched on
+group numbering begins at 1
+group "0" is the entire matched expression (not neccessarily the same as the
+    input text, depending on the value of "complete")
+    
 
