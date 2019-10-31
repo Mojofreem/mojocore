@@ -1976,14 +1976,10 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                 if(instr[1] % 2) {
                     // Group end
                     thread->subexprs[instr[1]] = eval->sp;
-                    printf("%p  save[end]  %d  %p\n", thread, instr[1], eval->sp);
                 } else {
                     // Group start
                     if(thread->subexprs[instr[1]] == NULL) {
                         thread->subexprs[instr[1]] = eval->sp;
-                        printf("%p  save[start]  %d  %p\n", thread, instr[1], eval->sp);
-                    } else {
-                        printf("%p  save[start]  %d  ignored\n", thread, instr[1]);
                     }
                 }
                 thread->pc++;
@@ -2066,7 +2062,6 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete) {
     }
 
     for(; *eval->sp != '\0'; eval->sp++) {
-        printf("[%c:%d]\n", *eval->sp, *eval->sp);
         eval->thread = eval->queue;
         eval->queue = NULL;
         for(thread = eval->thread; thread != NULL; thread = eval->thread) {
@@ -2104,7 +2099,9 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete) {
             goto FoundMatch;
         }
     }
+
     regexEvalFree(eval);
+
     return NULL;
 
 FoundMatch:
@@ -2119,7 +2116,6 @@ FoundMatch:
     match->pos = eval->sp;
     for(k = 0; k < (vm->group_tbl_size * 2); k++) {
         match->subexprs[k] = thread->subexprs[k];
-        printf("subexpr %d: %p\n", k, match->subexprs[k]);
     }
     regexEvalFree(eval);
 
@@ -2138,7 +2134,6 @@ const char *regexGroupValueGet(regex_match_t *match, int group, int *len) {
     }
 
     if((group < 0) || (group > match->vm->group_tbl_size)) {
-        printf("group out of range\n");
         return NULL;
     }
 
@@ -2155,8 +2150,6 @@ const char *regexGroupValueGet(regex_match_t *match, int group, int *len) {
 
     start = regexSubexprStartFromGroup(group);
     end = regexSubexprEndFromGroup(group);
-
-    printf("group %d, start %d, end %d\n", group, start, end);
     if((match->subexprs[start] == NULL) || (match->subexprs[end] == NULL)) {
         if(len != NULL) {
             *len = 0;
@@ -2165,7 +2158,6 @@ const char *regexGroupValueGet(regex_match_t *match, int group, int *len) {
     }
 
     if(len != NULL) {
-        //*len = 3;
         *len = match->subexprs[end] - match->subexprs[start];
     }
 
@@ -2175,6 +2167,9 @@ const char *regexGroupValueGet(regex_match_t *match, int group, int *len) {
 const char *regexGroupValueGetByName(regex_match_t *match, const char *name, int *len) {
     return regexGroupValueGet(match, regexGroupIndexLookup(match->vm, name), len);
 }
+
+//#define REGEX_TEST_MAIN
+#ifdef REGEX_TEST_MAIN
 
 void regexDumpMatch(regex_match_t *match) {
     int k, len;
@@ -2211,7 +2206,10 @@ int main(int argc, char **argv) {
         if(argc > 2) {
             regexVMPrintProgram(stdout, result.vm);
 
-            match = regexMatch(result.vm, argv[2], 0);
+            if((match = regexMatch(result.vm, argv[2], 0)) == NULL) {
+                printf("No match\n");
+                return 1;
+            }
             regexDumpMatch(match);
             regexMatchFree(match);
 
@@ -2223,6 +2221,7 @@ int main(int argc, char **argv) {
     return 0;
 }
 
+#endif // REGEX_TEST_MAIN
 
 #endif // MOJO_REGEX_IMPLEMENTATION
 #endif // _MOJO_REGEX_HEADER_
