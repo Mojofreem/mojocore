@@ -75,6 +75,7 @@ eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern);
 typedef struct regex_match_s regex_match_t;
 struct regex_match_s {
     const char *text;
+    const char *pos;
     regex_vm_t *vm;
     const char *subexprs[0];
 };
@@ -1387,11 +1388,10 @@ int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int le
 }
 
 const char *regexVMGroupNameFromIndex(regex_vm_t *vm, int index) {
-    index = regexGroupFromSubexpression(index);
-    if((index < vm->group_tbl_size) && (index >= 0)) {
-        return vm->group_table[index];
+    if((index < 1) || (index > vm->group_tbl_size)) {
+        return NULL;
     }
-    return NULL;
+    return vm->group_table[index - 1];
 }
 
 int regexVMGroupNameLookup(regex_vm_t *vm, const char *name) {
@@ -1399,7 +1399,7 @@ int regexVMGroupNameLookup(regex_vm_t *vm, const char *name) {
 
     for(k = 0; k < vm->group_tbl_size; k++) {
         if(!strcmp(vm->group_table[k], name)) {
-            return k;
+            return k + 1;
         }
     }
     return -1;
@@ -2066,6 +2066,7 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete) {
     }
 
     for(; *eval->sp != '\0'; eval->sp++) {
+        printf("[%c:%d]\n", *eval->sp, *eval->sp);
         eval->thread = eval->queue;
         eval->queue = NULL;
         for(thread = eval->thread; thread != NULL; thread = eval->thread) {
@@ -2115,6 +2116,7 @@ FoundMatch:
     memset(match, 0, sizeof(regex_match_t));
     match->vm = vm;
     match->text = text;
+    match->pos = eval->sp;
     for(k = 0; k < (vm->group_tbl_size * 2); k++) {
         match->subexprs[k] = thread->subexprs[k];
         printf("subexpr %d: %p\n", k, match->subexprs[k]);
@@ -2131,16 +2133,29 @@ void regexMatchFree(regex_match_t *match) {
 const char *regexGroupValueGet(regex_match_t *match, int group, int *len) {
     int start, end;
 
-    if((group < 0) || (group > (match->vm->group_tbl_size / 2))) {
+    if(len != NULL) {
+        *len = 0;
+    }
+
+    if((group < 0) || (group > match->vm->group_tbl_size)) {
         printf("group out of range\n");
-        if(len != NULL) {
-            *len = 0;
-        }
         return NULL;
+    }
+
+    if(group == 0) {
+        // Special group (the complete matched text)
+        if(match->pos == NULL) {
+            return NULL;
+        }
+        if(len != NULL) {
+            *len = match->pos - match->text + 1;
+        }
+        return match->text;
     }
 
     start = regexSubexprStartFromGroup(group);
     end = regexSubexprEndFromGroup(group);
+
     printf("group %d, start %d, end %d\n", group, start, end);
     if((match->subexprs[start] == NULL) || (match->subexprs[end] == NULL)) {
         if(len != NULL) {
@@ -2150,8 +2165,8 @@ const char *regexGroupValueGet(regex_match_t *match, int group, int *len) {
     }
 
     if(len != NULL) {
-        *len = 3;
-        //*len = match->subexprs[end] - match->subexprs[start];
+        //*len = 3;
+        *len = match->subexprs[end] - match->subexprs[start];
     }
 
     return match->subexprs[start];
@@ -2172,12 +2187,15 @@ void regexDumpMatch(regex_match_t *match) {
     }
     printf("Match found\n");
     printf("    %d groups\n", regexGroupCountGet(match->vm));
-    for(k = 0; k < regexGroupCountGet(match->vm); k++) {
+    for(k = 0; k <= regexGroupCountGet(match->vm); k++) {
         if((ptr = regexGroupValueGet(match, k, &len)) == NULL) {
             printf("        %d [%s]: no match\n", k, regexGroupNameLookup(match->vm, k));
         } else {
             printf("        %d [%s]: [%*.*s]\n", k, regexGroupNameLookup(match->vm, k), len, len, ptr);
         }
+    }
+    if((ptr = regexGroupValueGetByName(match, "foolio", &len)) != NULL) {
+        printf("Foolio group is [%*.*s]\n", len, len, ptr);
     }
 }
 
