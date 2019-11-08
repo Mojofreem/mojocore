@@ -10,6 +10,45 @@
 #include <string.h>
 
 /*
+
+    Character escape sequences
+    --------------------------
+        \a alarm (bell)
+        \b backspace
+        \e escape
+        \f formfeed
+        \n newline
+        \r carraige return
+        \t tab
+        \v vertical tab
+        \0 null char
+        \x## hex byte
+        \u#### unicode char point
+
+    \B byte (differs from ., in that the latter MAY match multibyte (UTF8))
+
+    \d [0-9]
+    \D [^0-9]
+    \s whitespace
+    \S non-whitespace
+    \w word char (what is the char class?)
+    \W non word char
+    \X full unicode glyph (may be multiple chars)
+
+    ^  start of string (assertion, non consuming)
+    $  end of string (assertion, non consuming)
+
+    (?P<name>...)  named subexpressions
+    (?:...) non capturing subexpressions
+    (?*...) compound subexpressions
+    (?i) case insensitive match
+
+Todo:
+    properly handle unicode chars (we decode the escape value, but the lexer
+        does not properly deal with the multiple bytes)
+    unicode compilation toggle - do NOT generate unicode char classes in non
+        unicode mode
+
 Regex VM Bytecode (v2)
 
     Each operation is encoded into a single 32 bit int value:
@@ -49,6 +88,7 @@ typedef enum {
     eCompileCharClassRangeIncomplete,
     eCompileCharClassIncomplete,
     eCompileEscapeCharIncomplete,
+    eCompileInvalidEscapeChar,
     eCompileMalformedSubExprName,
     eCompileUnsupportedMeta,
     eCompileOutOfMem,
@@ -171,6 +211,62 @@ struct character_s {
     int escaped;
 };
 
+int regexIsMeta(int c) {
+    switch(c) {
+        case '|':   // alternation
+        case '?':   // zero or one
+        case '.':   // character (may be multi byte for UTF8)
+        case '*':   // zero or more (kleene)
+        case '^':   // start of string assertion
+        case '+':   // one or more
+        case '(':   // subexpression start
+        case '[':   // character class start
+        case ')':   // subexpression end
+        case '$':   // end of string assertion
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+int regexIsClassMeta(int c) {
+    switch(c) {
+        case 'd': // digit
+        case 'D': // non digit
+        case 's': // whitespace
+        case 'S': // non whitespace
+        case 'w': // word character
+        case 'W': // non word character
+        case 'X': // full unicode glyph (base + markers)
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+int regexIsAlnum(char c) {
+    return (((c >= 'a') && (c <= 'z')) ||       // a - z
+            ((c >= 'A') && (c <= 'Z')) ||       // A - Z
+            ((c >= '0') && (c <= '9')));        // 0 - 9
+}
+
+int regexIsHexdigit(char c) {
+    return (((c >= 'a') && (c <= 'f')) ||       // a - f
+            ((c >= 'A') && (c <= 'F')) ||       // A - F
+            ((c >= '0') && (c <= '9')));        // 0 - 9
+}
+
+int regexGetHexValue(char c) {
+    if ((c >= 'a') && (c <= 'f')) {
+        return c - 'a' + 10;
+    } else if((c >= 'A') && (c <= 'F')) {
+        return c - 'A' + 10;
+    } else if((c >= '0') && (c <= '9')) {
+        return c - '0';
+    }
+    return 0; // This should never be reached if c is a hex digit
+}
+
 character_t regexGetNextPatternChar(const char **pattern) {
     character_t result = {
             .c = -1,
@@ -182,58 +278,54 @@ character_t regexGetNextPatternChar(const char **pattern) {
         return result;
     }
     if(**pattern == '\\') {
-        result.escaped = 1;
         (*pattern)++;
         if(**pattern == '\0') {
             return result;
         }
         switch(**pattern) {
-            case 'a': result.c = '\a'; break;
-            case 'b': result.c = '\b'; break;
-            case 'e': result.c = '\x1B'; break;
-            case 'f': result.c = '\f'; break;
-            case 'n': result.c = '\n'; break;
-            case 'r': result.c = '\r'; break;
-            case 't': result.c = '\t'; break;
-            case 'v': result.c = '\v'; break;
-            case 'x':
-                // Hexidecimal encoding
-                (*pattern)++;
+            case '0': result.c = '\0'; break;   // null
+            case 'a': result.c = '\a'; break;   // alarm (bell)
+            case 'b': result.c = '\b'; break;   // backspace
+            case 'e': result.c = '\x1B'; break; // escape
+            case 'f': result.c = '\f'; break;   // formfeed
+            case 'n': result.c = '\n'; break;   // newline
+            case 'r': result.c = '\r'; break;   // carraige return
+            case 't': result.c = '\t'; break;   // tab
+            case 'u':                           // unicode codepoint
+                // Unicode is not supported in this iteration
                 val = 0;
-                for(k = 0; k < 2; k++) {
+                for(k = 0; k < 4; k++) {
+                    (*pattern)++;
                     val *= 16;
-                    if((**pattern >= 0) && (**pattern <= 9)) {
-                        val += **pattern - '0';
-                    } else if((**pattern >= 'A') && (**pattern <= 'F')) {
-                        val += (**pattern - 'A') + 10;
-                    } else if((**pattern >= 'a') && (**pattern <= 'f')) {
-                        val += (**pattern - 'a') + 10;
+                    if(regexIsHexdigit(**pattern)) {
+                        val += regexGetHexValue(**pattern);
                     } else {
                         return result;
                     }
                 }
-                result.c = (char)val;
+                result.c = val;
                 break;
-            case 'u':
-                // Unicode is not supported in this iteration
-                return result;
-            default:
-                if((**pattern >= '0') && (**pattern <= '9')) {
-                    // Octal encoded escape character
-                    val = 0;
-                    for(k = 0; k < 3; k++) {
-                        if((**pattern >= '0') && (**pattern <= '9')) {
-                            val *= 8;
-                            val += **pattern - '0';
-                        } else {
-                            return result;
-                        }
-                        (*pattern)++;
+            case 'v': result.c = '\v'; break;   // vertical tab
+            case 'x':                           // hexidecimal encoded byte
+                val = 0;
+                for(k = 0; k < 2; k++) {
+                    (*pattern)++;
+                    val *= 16;
+                    if(regexIsHexdigit(**pattern)) {
+                        val += regexGetHexValue(**pattern);
+                    } else {
+                        return result;
                     }
-                    result.c = (char)(val);
-                } else {
-                    // Assume an overzealous escape regime
+                }
+                result.c = (unsigned char)val;
+                break;
+            default: // could be a meta char, or a meta class
+                if(regexIsMeta(**pattern) || regexIsClassMeta(**pattern)) {
+                    result.escaped = 1;
                     result.c = **pattern;
+                } else {
+                    // improperly escaped character, or unsupported meta char
+                    return result;
                 }
                 break;
         }
@@ -250,17 +342,6 @@ int regexCheckNextPatternChar(const char **pattern, char c) {
     }
     (*pattern)++;
     return 1;
-}
-
-int regexIsAlnum(char c) {
-    return (((c >= 'a') && (c <= 'z')) ||
-            ((c >= 'A') && (c <= 'Z')) ||
-            ((c >= '0') && (c <= '9')));
-}
-
-int regexIsMeta(int c) {
-    return ((c == '|') || (c == '?') || (c == '.') || (c == '*') ||
-            (c == '+') || (c == '(') || (c == '[') || (c == ')'));
 }
 
 // String literal parsing handlers //////////////////////////////////////////
@@ -280,7 +361,7 @@ int regexGetPatternStrLen(const char **pattern) {
             // Incomplete escape char
             return -1;
         }
-        if(!c.escaped && regexIsMeta(c.c)) {
+        if(!c.escaped && (regexIsMeta(c.c) || regexIsClassMeta(c.c))) {
             *pattern = orig;
             return count;
         }
@@ -654,7 +735,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                     if(regexCheckNextPatternChar(&pattern, '?')) {
                         // Meta character subexpression modifier
                         if(regexCheckNextPatternChar(&pattern, 'i')) {
-                            // Case insensitive sub expression
+                            // Case insensitive matching (NOT an actual sub expression)
                             // TODO
                         } else if(regexCheckNextPatternChar(&pattern, 'P')) {
                             // Named sub expression
@@ -664,6 +745,12 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                             if((response = regexSubexprLookupEntryCreate(build, &pattern, subexpr)) != 1) {
                                 SET_RESULT((response == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName));
                             }
+                        } else if(regexCheckNextPatternChar(&pattern, ':')) {
+                            // Non-capturing subexpression
+                            // TODO
+                        } else if(regexCheckNextPatternChar(&pattern, '*')) {
+                            // Compound capturing subexpression
+                            // TODO
                         } else {
                             SET_RESULT(eCompileUnsupportedMeta);
                         }
@@ -2168,7 +2255,7 @@ const char *regexGroupValueGetByName(regex_match_t *match, const char *name, int
     return regexGroupValueGet(match, regexGroupIndexLookup(match->vm, name), len);
 }
 
-//#define REGEX_TEST_MAIN
+#define REGEX_TEST_MAIN
 #ifdef REGEX_TEST_MAIN
 
 void regexDumpMatch(regex_match_t *match) {
