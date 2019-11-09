@@ -96,7 +96,7 @@ struct regex_vm_s {
     int size;                       // number of instructions in the program
     char **string_table;            // table of string literals used in the pattern
     int string_tbl_size;            // number of strings in the string table
-    unsigned char **class_table;    // table of character class bitmaps (32 bytes each)
+    unsigned int **class_table;    // table of character class bitmaps (32 bytes each)
     int class_tbl_size;             // number of bitmaps in the class table
     char **group_table;             // table of subexpression group names
     int group_tbl_size;             // number of groups in the group table
@@ -230,7 +230,7 @@ struct regex_token_s {
     union {
         int c;
         char *str;
-        unsigned char *bitmap;
+        unsigned int *bitmap;
         int group;
     };
     int pc;
@@ -365,6 +365,7 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
             case 'n': result.c = '\n'; // newline
             case 'r': result.c = '\r'; // carraige return
             case 't': result.c = '\t'; // tab
+            case '-': result.c = '-';  // escaped dash for character class ranges
             case 'v': result.c = '\v'; // vertical tab
                 result.state = eRegexPatternEscapedChar;
                 return result;
@@ -442,63 +443,12 @@ struct character_s {
     int escaped;
 };
 
-int regexIsMeta(int c) {
-    switch(c) {
-        case '|':   // alternation
-        case '?':   // zero or one
-        case '.':   // character (may be multi byte for UTF8)
-        case '*':   // zero or more (kleene)
-        case '^':   // start of string assertion
-        case '+':   // one or more
-        case '(':   // subexpression start
-        case '[':   // character class start
-        case ')':   // subexpression end
-        case '$':   // end of string assertion
-            return 1;
-        default:
-            return 0;
-    }
-}
-
-int regexIsClassMeta(int c) {
-    switch(c) {
-        case 'd': // digit
-        case 'D': // non digit
-        case 's': // whitespace
-        case 'S': // non whitespace
-        case 'w': // word character
-        case 'W': // non word character
-        case 'X': // full unicode glyph (base + markers)
-            return 1;
-        default:
-            return 0;
-    }
-}
-
 int regexIsAlnum(char c) {
     return (((c >= 'a') && (c <= 'z')) ||       // a - z
             ((c >= 'A') && (c <= 'Z')) ||       // A - Z
             ((c >= '0') && (c <= '9')));        // 0 - 9
 }
 
-int regexIsHexdigit(char c) {
-    return (((c >= 'a') && (c <= 'f')) ||       // a - f
-            ((c >= 'A') && (c <= 'F')) ||       // A - F
-            ((c >= '0') && (c <= '9')));        // 0 - 9
-}
-
-int regexGetHexValue(char c) {
-    if ((c >= 'a') && (c <= 'f')) {
-        return c - 'a' + 10;
-    } else if((c >= 'A') && (c <= 'F')) {
-        return c - 'A' + 10;
-    } else if((c >= '0') && (c <= '9')) {
-        return c - '0';
-    }
-    return 0; // This should never be reached if c is a hex digit
-}
-
-#if 1
 character_t regexGetNextPatternChar(const char **pattern) {
     parseChar_t pc;
     character_t result = {
@@ -531,7 +481,7 @@ character_t regexGetNextPatternChar(const char **pattern) {
     }
 }
 
-int regexCheckNextPatternChar(const char **pattern, char c) {
+int parseCheckNextPatternChar(const char **pattern, char c) {
     parseChar_t pc;
 
     pc = parseGetNextPatternChar(pattern);
@@ -541,87 +491,6 @@ int regexCheckNextPatternChar(const char **pattern, char c) {
     parsePatternCharAdvance(pattern);
     return 1;
 }
-
-#else
-
-character_t regexGetNextPatternChar(const char **pattern) {
-    character_t result = {
-            .c = -1,
-            .escaped = 0
-    };
-    int k, val;
-
-    if(**pattern == '\0') {
-        return result;
-    }
-    if(**pattern == '\\') {
-        (*pattern)++;
-        if(**pattern == '\0') {
-            return result;
-        }
-        switch(**pattern) {
-            case '0': result.c = '\0'; break;   // null
-            case 'a': result.c = '\a'; break;   // alarm (bell)
-            case 'b': result.c = '\b'; break;   // backspace
-            case 'e': result.c = '\x1B'; break; // escape
-            case 'f': result.c = '\f'; break;   // formfeed
-            case 'n': result.c = '\n'; break;   // newline
-            case 'r': result.c = '\r'; break;   // carraige return
-            case 't': result.c = '\t'; break;   // tab
-            case 'u':                           // unicode codepoint
-                // Unicode is not supported in this iteration
-                val = 0;
-                for(k = 0; k < 4; k++) {
-                    (*pattern)++;
-                    val *= 16;
-                    if(regexIsHexdigit(**pattern)) {
-                        val += regexGetHexValue(**pattern);
-                    } else {
-                        return result;
-                    }
-                }
-                result.c = val;
-                break;
-            case 'v': result.c = '\v'; break;   // vertical tab
-            case 'x':                           // hexidecimal encoded byte
-                val = 0;
-                for(k = 0; k < 2; k++) {
-                    (*pattern)++;
-                    val *= 16;
-                    if(regexIsHexdigit(**pattern)) {
-                        val += regexGetHexValue(**pattern);
-                    } else {
-                        return result;
-                    }
-                }
-                result.c = (unsigned char)val;
-                break;
-            default: // could be a meta char, or a meta class
-                if(regexIsMeta(**pattern) || regexIsClassMeta(**pattern)) {
-                    result.escaped = 1;
-                    result.c = **pattern;
-                } else {
-                    // improperly escaped character, or unsupported meta char
-                    return result;
-                }
-                break;
-        }
-    } else {
-        result.c = **pattern;
-    }
-    (*pattern)++;
-    return result;
-}
-
-int regexCheckNextPatternChar(const char **pattern, char c) {
-    if(**pattern == '\0' || **pattern != c) {
-        return 0;
-    }
-    (*pattern)++;
-    return 1;
-}
-
-#endif
 
 /////////////////////////////////////////////////////////////////////////////
 // String literal parsing handlers
@@ -721,83 +590,32 @@ char *parseGetPatternStr(const char **pattern, int len, int size) {
     return str;
 }
 
-#if 1
-
-int regexGetPatternStrLen(const char **pattern) {
-    return PARSE_DEC_CHAR_COUNT(parseGetPatternStrLen(pattern));
-}
-
-#else
-
-int regexGetPatternStrLen(const char **pattern) {
-    const char *orig = *pattern;
-    int count = 0;
-    character_t c;
-
-    for(;;) {
-        if(**pattern == '\0') {
-            *pattern = orig;
-            return count;
-        }
-        c = regexGetNextPatternChar(pattern);
-        if(c.c == -1) {
-            // Incomplete escape char
-            return -1;
-        }
-        if(!c.escaped && (regexIsMeta(c.c) || regexIsClassMeta(c.c))) {
-            *pattern = orig;
-            return count;
-        }
-        count++;
-    }
-}
-#endif
-
-char *regexGetPatternStr(const char **pattern, int len) {
-    char *str, *ptr;
-    character_t c;
-
-    if((str = _regexAlloc(len + 1, _regexMemContext)) == NULL) {
-        return NULL;
-    }
-    ptr = str;
-
-    for(; len; len--) {
-        if(**pattern == '\0') {
-            return str;
-        }
-        c = regexGetNextPatternChar(pattern);
-        *ptr = (char)(c.c);
-        ptr++;
-    }
-    *ptr = '\0';
-    return str;
-}
-
 // Character class parsing handlers /////////////////////////////////////////
 
-void mapSet(unsigned char *bitmap, int pos) {
-    unsigned int idx = pos / 8u;
-    unsigned int bit = pos % 8u;
+#define CHAR_CLASS_BITMAP_TYPE unsigned char
+
+void charClassBitmapSet(unsigned int *bitmap, int pos) {
+    unsigned int idx = pos / 32u;
+    unsigned int bit = pos % 32u;
 
     bitmap[idx] |= (1u << bit);
 }
 
-int mapCheck(const unsigned char *bitmap, int pos) {
-    unsigned int idx = pos / 8u;
-    unsigned int bit = pos % 8u;
+int charClassBitmapCheck(const unsigned int *bitmap, int pos) {
+    unsigned int idx = pos / 32u;
+    unsigned int bit = pos % 32u;
 
     return (int)(bitmap[idx] & (1u << bit));
 }
 
-void mapInvert(unsigned char *bitmap) {
-    for(int k = 0; k < 32; k++) {
-        bitmap[k] ^= (unsigned char)0xFF;
+void charClassBitmapInvert(unsigned int *bitmap) {
+    for(int k = 0; k < 4; k++) {
+        bitmap[k] ^= (unsigned int)0xFFFFFFFFu;
     }
 }
 
-unsigned char *mapCopy(unsigned char *bitmap) {
-    unsigned char *copy;
+unsigned int *charClassBitmapCopy(unsigned int *bitmap) {
+    unsigned int *copy;
 
     if((copy = _regexAlloc(32, _regexMemContext)) == NULL) {
         return NULL;
@@ -806,8 +624,8 @@ unsigned char *mapCopy(unsigned char *bitmap) {
     return copy;
 }
 
-eRegexCompileStatus regexParseCharClass(const char **pattern, unsigned char *bitmap) {
-    character_t c;
+eRegexCompileStatus parseCharClass(const char **pattern, unsigned int *bitmap) {
+    parseChar_t c;
     int invert = 0;
     int range = 0;
     int last = 0;
@@ -815,69 +633,80 @@ eRegexCompileStatus regexParseCharClass(const char **pattern, unsigned char *bit
 
     memset(bitmap, 0, 32);
 
-    if(*pattern == '\0') {
+    c = parseGetNextPatternChar(pattern);
+    parsePatternCharAdvance(pattern);
+    if(c.state == eRegexPatternEnd) {
         return eCompileCharClassIncomplete;
     }
 
-    c = regexGetNextPatternChar(pattern);
-    if(!c.escaped && c.c == '^') {
+    if(c.state == eRegexPatternMetaChar && c.c == '^') {
         invert = 1;
-        c = regexGetNextPatternChar(pattern);
+        c = parseGetNextPatternChar(pattern);
+        parsePatternCharAdvance(pattern);
     }
 
     for(;;) {
-        if(c.c == -1) {
-            if(c.escaped) {
+        switch(c.state) {
+            case eRegexPatternInvalid:
                 return eCompileEscapeCharIncomplete;
-            }
-            return eCompileCharClassIncomplete;
+
+            case eRegexPatternChar:
+                if(c.c == ']') {
+                    if(range == 2) {
+                        return eCompileCharClassRangeIncomplete;
+                    }
+                    if(invert) {
+                        charClassBitmapInvert(bitmap);
+                    }
+                    return eCompileOk;
+                }
+                // intentional fall through
+            case eRegexPatternMetaChar:
+            case eRegexPatternEscapedChar:
+                if(range == 0) {
+                    last = c.c;
+                    charClassBitmapSet(bitmap, last);
+                    range = 1;
+                } else if(range == 1) {
+                    if(c.state != eRegexPatternEscapedChar && c.c == '-') {
+                        range = 2;
+                    } else {
+                        last = c.c;
+                        charClassBitmapSet(bitmap, last);
+                    }
+                } else {
+                    next = c.c;
+                    for(; last <= next; last++) {
+                        charClassBitmapSet(bitmap, last);
+                    }
+                    range = 0;
+                }
+                break;
+
+            case eRegexPatternUnicode:
+                // TODO - special case handling
+
+            case eRegexPatternMetaClass:
+                return eCompileInvalidEscapeChar;
+
+            case eRegexPatternEnd:
+                if(range == 2) {
+                    return eCompileCharClassRangeIncomplete;
+                }
+                return eCompileCharClassIncomplete;
         }
-        if(!c.escaped && c.c == ']') {
-            // End of the char class
-            break;
-        }
-        if(range == 0) {
-            last = c.c;
-            mapSet(bitmap, last);
-            range = 1;
-        } else if(range == 1) {
-            if(!c.escaped && c.c == '-') {
-                range = 2;
-            } else {
-                last = c.c;
-                mapSet(bitmap, last);
-            }
-        } else {
-            next = c.c;
-            for(; last <= next; last++) {
-                mapSet(bitmap, last);
-            }
-            range = 0;
-        }
-        if(*pattern == '\0') {
-            if(range == 2) {
-                return eCompileCharClassRangeIncomplete;
-            }
-            return eCompileCharClassIncomplete;
-        }
-        c = regexGetNextPatternChar(pattern);
+        c = parseGetNextPatternChar(pattern);
+        parsePatternCharAdvance(pattern);
     }
-    if(range == 2) {
-        return eCompileCharClassRangeIncomplete;
-    }
-    if(invert) {
-        mapInvert(bitmap);
-    }
-    return eCompileOk;
 }
 
-void regexPrintCharClassToFP(FILE *fp, unsigned char *bitmap) {
+void regexPrintCharClassToFP(FILE *fp, unsigned int *bitmap) {
     int k;
     int run;
 
     for(k = 0; k < 256; k++) {
-        if(mapCheck(bitmap, k)) {
-            for(run = k + 1; run < 256 && mapCheck(bitmap, run); run++);
+        if(charClassBitmapCheck(bitmap, k)) {
+            for(run = k + 1; run < 256 && charClassBitmapCheck(bitmap, run); run++);
             run--;
             fprintf(fp, "%c", ((k < 32) || (k > 127)) ? '.' : k);
             if(run - k > 3) {
@@ -888,7 +717,7 @@ void regexPrintCharClassToFP(FILE *fp, unsigned char *bitmap) {
     }
 }
 
-void regexPrintCharClass(unsigned char *bitmap) {
+void regexPrintCharClass(unsigned int *bitmap) {
     regexPrintCharClassToFP(stdout, bitmap);
 }
 
@@ -1043,13 +872,13 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                                          int *pos,
                                          regex_token_t **tokens,
                                          regex_vm_build_t *build) {
-    eRegexCompileStatus result = eCompileOk;
+    eRegexCompileStatus result;
     const char *start = pattern;
-    character_t c;
+    parseChar_t c;
     int response;
     int len;
     char *str;
-    unsigned char bitmap[32];
+    unsigned int bitmap[4], *ptr;
     eRegexCompileStatus status;
     int subexpr = 0;
 
@@ -1060,153 +889,149 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
     for(; *pattern != '\0';) {
         // Get the next character in the pattern. The helper function assists
         // in disambiguating escaped characters.
-        c = regexGetNextPatternChar(&pattern);
-        if(c.c == -1) {
-            SET_RESULT(eCompileEscapeCharIncomplete);
-        }
+        c = parseGetNextPatternChar(&pattern);
+        parsePatternCharAdvance(&pattern);
 
-        if(!c.escaped) {
-            switch(c.c) {
-                case '.':
-                    // Operand, the meta "ANY" char
-                    if(!regexTokenCreate(tokens, eTokenCharAny, 0, 0)) {
-                        SET_RESULT(eCompileOutOfMem);
-                    }
-                    continue;
+        switch(c.state) {
+            case eRegexPatternEnd:
+                goto endOfPattern;
 
-                case '[':
-                    // Operand, character class
-                    if((status = regexParseCharClass(&pattern, bitmap)) != eCompileOk) {
-                        SET_RESULT(status);
-                    }
-                    if((str = (char *)mapCopy(bitmap)) == NULL) {
-                        SET_RESULT(eCompileOutOfMem);
-                    }
-                    if(!regexTokenCreate(tokens, eTokenCharClass, 0, str)) {
-                        SET_RESULT(eCompileOutOfMem);
-                    }
-                    continue;
-
-                case '?':
-                    if(!regexTokenCreate(tokens, eTokenZeroOrOne, 0, 0)) {
-                        SET_RESULT(eCompileOutOfMem);
-                    }
-                    continue;
-
-                case '*':
-                    if(!regexTokenCreate(tokens, eTokenZeroOrMany, 0, 0)) {
-                        SET_RESULT(eCompileOutOfMem);
-                    }
-                    continue;
-
-                case '+':
-                    if(!regexTokenCreate(tokens, eTokenOneOrMany, 0, 0)) {
-                        SET_RESULT(eCompileOutOfMem);
-                    }
-                    continue;
-
-                case '|':
-                    if(!regexTokenCreate(tokens, eTokenAlternative, 0, 0)) {
-                        SET_RESULT(eCompileOutOfMem);
-                    }
-                    continue;
-
-                case '(':
-                    // Grouped subexpression, complex operator, resolves to a compound operand
-                    build->groups++;
-                    subexpr = build->groups;
-                    str = NULL;
-                    if(regexCheckNextPatternChar(&pattern, '?')) {
-                        // Meta character subexpression modifier
-                        if(regexCheckNextPatternChar(&pattern, 'i')) {
-                            // Case insensitive matching (NOT an actual sub expression)
-                            // TODO
-                        } else if(regexCheckNextPatternChar(&pattern, 'P')) {
-                            // Named sub expression
-                            if(!regexCheckNextPatternChar(&pattern, '<')) {
-                                SET_RESULT(eCompileMalformedSubExprName);
-                            }
-                            if((response = regexSubexprLookupEntryCreate(build, &pattern, subexpr)) != 1) {
-                                SET_RESULT((response == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName));
-                            }
-                        } else if(regexCheckNextPatternChar(&pattern, ':')) {
-                            // Non-capturing subexpression
-                            // TODO
-                        } else if(regexCheckNextPatternChar(&pattern, '*')) {
-                            // Compound capturing subexpression
-                            // TODO
-                        } else {
-                            SET_RESULT(eCompileUnsupportedMeta);
-                        }
-                    }
-                    if(!regexTokenCreate(tokens, eTokenSubExprStart, subexpr, NULL)) {
-                        SET_RESULT(eCompileOutOfMem);
-                    }
-                    continue;
-
-                case ')':
-                    // End of grouped subexpression
-                    if(!regexTokenCreate(tokens, eTokenSubExprEnd, 0, 0)) {
-                        SET_RESULT(eCompileOutOfMem);
-                    }
-                    continue;
-
-                default:
-                    // Operand, unnecessary escaping, fall through to "regular character"...
-                    break;
-            }
-        }
-#if 0
-        // Operand, either character literal or string literal
-        switch(len = regexGetPatternStrLen(&pattern)) {
-            case -1:
-            SET_RESULT(eCompileEscapeCharIncomplete);
-            case 0:
-                if(!regexTokenCreate(tokens, eTokenCharLiteral, (char)(c.c), 0)) {
-                    SET_RESULT(eCompileOutOfMem);
-                }
-                break;
-            default:
-                len++;
-                if(c.escaped) {
-                    pattern--;
-                }
-                pattern--;
-                if((str = regexGetPatternStr(&pattern, len)) == NULL) {
-                    SET_RESULT(eCompileOutOfMem);
-                }
-                if(!regexTokenCreate(tokens, eTokenStringLiteral, 0, str)) {
-                    SET_RESULT(eCompileOutOfMem);
-                }
-        }
-#else
-        // Operand, either character literal or string literal
-        switch(len = parseGetPatternStrLen(&pattern)) {
-            case -1:
+            case eRegexPatternInvalid:
                 SET_RESULT(eCompileEscapeCharIncomplete);
 
-            case 0:
-                if(!regexTokenCreate(tokens, eTokenCharLiteral, (char)(c.c), 0)) {
-                    SET_RESULT(eCompileOutOfMem);
+            case eRegexPatternMetaChar:
+                switch(c.c) {
+                    case '.':
+                        // Operand, the meta "ANY" char
+                        if(!regexTokenCreate(tokens, eTokenCharAny, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
+                    case '[':
+                        // Operand, character class
+                        if((status = parseCharClass(&pattern, bitmap)) != eCompileOk) {
+                            SET_RESULT(status);
+                        }
+                        if((ptr = charClassBitmapCopy(bitmap)) == NULL) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        if(!regexTokenCreate(tokens, eTokenCharClass, 0, (char *)ptr)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
+                    case '?':
+                        if(!regexTokenCreate(tokens, eTokenZeroOrOne, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
+                    case '*':
+                        if(!regexTokenCreate(tokens, eTokenZeroOrMany, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
+                    case '+':
+                        if(!regexTokenCreate(tokens, eTokenOneOrMany, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
+                    case '|':
+                        if(!regexTokenCreate(tokens, eTokenAlternative, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
+                    case '(':
+                        // Grouped subexpression, complex operator, resolves to a compound operand
+                        build->groups++;
+                        subexpr = build->groups;
+                        str = NULL;
+                        if(parseCheckNextPatternChar(&pattern, '?')) {
+                            // Meta character subexpression modifier
+                            if(parseCheckNextPatternChar(&pattern, 'i')) {
+                                // Case insensitive matching (NOT an actual sub expression)
+                                // TODO
+                            } else if(parseCheckNextPatternChar(&pattern, 'P')) {
+                                // Named sub expression
+                                if(!parseCheckNextPatternChar(&pattern, '<')) {
+                                    SET_RESULT(eCompileMalformedSubExprName);
+                                }
+                                if((response = regexSubexprLookupEntryCreate(build, &pattern, subexpr)) != 1) {
+                                    SET_RESULT((response == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName));
+                                }
+                            } else if(parseCheckNextPatternChar(&pattern, ':')) {
+                                // Non-capturing subexpression
+                                // TODO
+                            } else if(parseCheckNextPatternChar(&pattern, '*')) {
+                                // Compound capturing subexpression
+                                // TODO
+                            } else {
+                                SET_RESULT(eCompileUnsupportedMeta);
+                            }
+                        }
+                        if(!regexTokenCreate(tokens, eTokenSubExprStart, subexpr, NULL)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
+                    case ')':
+                        // End of grouped subexpression
+                        if(!regexTokenCreate(tokens, eTokenSubExprEnd, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
+                    default:
+                        // Unexpected meta character
+                        SET_RESULT(eCompileInternalError);
                 }
+                continue;
+
+            case eRegexPatternMetaClass:
+                // TODO
                 break;
 
-            default:
-                len++;
-                if(c.escaped) {
-                    pattern--;
+            case eRegexPatternChar:
+            case eRegexPatternUnicode:
+            case eRegexPatternEscapedChar:
+                // Operand, either character literal or string literal
+                len = parseGetPatternStrLen(&pattern);
+                switch(PARSE_DEC_CHAR_COUNT(len)) {
+                    case -1:
+                        SET_RESULT(eCompileEscapeCharIncomplete);
+
+                    case 0:
+                        if(!regexTokenCreate(tokens,eTokenCharLiteral, (char)(c.c), 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        break;
+
+                    default:
+                        len++;
+                        if(c.state == eRegexPatternEscapedChar) {
+                            pattern--;
+                        } else if(c.state == eRegexPatternUnicode) {
+                            // Increment the utf8 byte accommodation
+                            len += (int)((unsigned int)(parseUtf8EncodingByteLen(c.c) - 1) << 16u);
+                            pattern -= 5;
+                        }
+                        pattern--;
+                        if((str = parseGetPatternStr(&pattern, PARSE_DEC_CHAR_COUNT(len), PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len))) == NULL) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        if(!regexTokenCreate(tokens, eTokenStringLiteral, 0, str)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
                 }
-                pattern--;
-                if((str = regexGetPatternStr(&pattern, len)) == NULL) {
-                    SET_RESULT(eCompileOutOfMem);
-                }
-                if(!regexTokenCreate(tokens, eTokenStringLiteral, 0, str)) {
-                    SET_RESULT(eCompileOutOfMem);
-                }
+                continue;
         }
-#endif
     }
 
+endOfPattern:
     SET_RESULT(eCompileOk);
 
 compileFailure:
@@ -1812,7 +1637,7 @@ void regexVMClassTableFree(regex_vm_t *vm) {
     vm->class_tbl_size = 0;
 }
 
-int regexVMClassTableEntryAdd(regex_vm_build_t *build, const unsigned char *bitmap) {
+int regexVMClassTableEntryAdd(regex_vm_build_t *build, const unsigned int *bitmap) {
     int index;
 
     for(index = 0; index < build->class_tbl_count; index++) {
@@ -1822,10 +1647,10 @@ int regexVMClassTableEntryAdd(regex_vm_build_t *build, const unsigned char *bitm
     }
 
     if(build->vm->class_tbl_size <= build->class_tbl_count ) {
-        if((build->vm->class_table = realloc(build->vm->class_table, (build->vm->class_tbl_size + DEF_VM_STRTBL_INC) * sizeof(char *))) == NULL) {
+        if((build->vm->class_table = realloc(build->vm->class_table, (build->vm->class_tbl_size + DEF_VM_STRTBL_INC) * sizeof(unsigned int *))) == NULL) {
             return -1;
         }
-        memset(build->vm->class_table + build->vm->class_tbl_size, 0, DEF_VM_STRTBL_INC * sizeof(char *));
+        memset(build->vm->class_table + build->vm->class_tbl_size, 0, DEF_VM_STRTBL_INC * sizeof(unsigned int *));
         build->vm->class_tbl_size += DEF_VM_STRTBL_INC;
     }
 
@@ -1838,7 +1663,7 @@ int regexVMClassTableEntryAdd(regex_vm_build_t *build, const unsigned char *bitm
     return index;
 }
 
-const unsigned char *regexVMClassTableEntryGet(regex_vm_t *vm, int class_table_id) {
+const unsigned int *regexVMClassTableEntryGet(regex_vm_t *vm, int class_table_id) {
     if(class_table_id >= vm->class_tbl_size) {
         return NULL;
     }
@@ -2146,22 +1971,14 @@ void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
         if(vm->class_table[k] == NULL) {
             continue;
         }
-        fprintf(fp, "unsigned char _%s_class_entry_%d[] = {", symbol, k);
-        for(j = 0; j < 32; j++) {
-            if(j != 0) {
-                fputc(',', fp);
-            }
-            if(!(j % 8)) {
-                fputs("\n    ", fp);
-            } else {
-                fputc(' ', fp);
-            }
-            fprintf(fp, "0x%2.2X", vm->class_table[k][j]);
+        fprintf(fp, "unsigned int _%s_class_entry_%d[] = {", symbol, k);
+        for(j = 0; j < 4; j++) {
+            fprintf(fp, "%s0x%8.8X%s", (j != 0 ? ", " : ""), vm->class_table[k][j], (j == 3 ? "\n" : ""));
         }
         fprintf(fp, "\n};\n\n");
     }
 
-    fprintf(fp, "unsigned char *_%s_class_table[] = {\n", symbol);
+    fprintf(fp, "unsigned int *_%s_class_table[] = {\n", symbol);
     for(k = 0; k < vm->class_tbl_size; k++) {
         if(vm->class_table[k] == NULL) {
             fprintf(fp, "    NULL,\n");
@@ -2463,7 +2280,7 @@ typedef enum {
 } eRegexEvalResult;
 
 eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, int complete) {
-    const unsigned char *bitmap;
+    const unsigned int *bitmap;
     const char *str;
     unsigned int instr[3];
 
@@ -2530,7 +2347,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
             if((bitmap = regexVMClassTableEntryGet(eval->vm, instr[1])) == NULL) {
                 return eEvalInternalError;
             }
-            if(!mapCheck(bitmap, *(eval->sp))) {
+            if(!charClassBitmapCheck(bitmap, *(eval->sp))) {
                 return eEvalNoMatch;
             } else {
                 thread->pc++;
