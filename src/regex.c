@@ -57,6 +57,7 @@
 Todo:
     properly handle unicode chars (we decode the escape value, but the lexer
         does not properly deal with the multiple bytes)
+    multipass char class parsing, to separate ascii and unicode handling
     unicode compilation toggle - do NOT generate unicode char classes in non
         unicode mode
 
@@ -436,49 +437,10 @@ void parsePatternCharAdvance(const char **pattern) {
     }
 }
 
-
-typedef struct character_s character_t;
-struct character_s {
-    int c;
-    int escaped;
-};
-
 int regexIsAlnum(char c) {
     return (((c >= 'a') && (c <= 'z')) ||       // a - z
             ((c >= 'A') && (c <= 'Z')) ||       // A - Z
             ((c >= '0') && (c <= '9')));        // 0 - 9
-}
-
-character_t regexGetNextPatternChar(const char **pattern) {
-    parseChar_t pc;
-    character_t result = {
-        .c = -1,
-        .escaped = 0
-    };
-
-    pc = parseGetNextPatternChar(pattern);
-    if(pc.state == eRegexPatternEnd) {
-        return result;
-    }
-
-    parsePatternCharAdvance(pattern);
-    switch(pc.state) {
-        case eRegexPatternEscapedChar:
-        case eRegexPatternMetaClass:
-        case eRegexPatternUnicode:
-            result.escaped = 1;
-            result.c = pc.c;
-            return result;
-
-        default:
-        case eRegexPatternInvalid:
-            return result;
-
-        case eRegexPatternChar:
-        case eRegexPatternMetaChar:
-            result.c = pc.c;
-            return result;
-    }
 }
 
 int parseCheckNextPatternChar(const char **pattern, char c) {
@@ -590,9 +552,9 @@ char *parseGetPatternStr(const char **pattern, int len, int size) {
     return str;
 }
 
-// Character class parsing handlers /////////////////////////////////////////
-
-#define CHAR_CLASS_BITMAP_TYPE unsigned char
+/////////////////////////////////////////////////////////////////////////////
+// Character class parsing handlers
+/////////////////////////////////////////////////////////////////////////////
 
 void charClassBitmapSet(unsigned int *bitmap, int pos) {
     unsigned int idx = pos / 32u;
@@ -624,6 +586,7 @@ unsigned int *charClassBitmapCopy(unsigned int *bitmap) {
     return copy;
 }
 
+// TODO - integrate proper utf8 handling
 eRegexCompileStatus parseCharClass(const char **pattern, unsigned int *bitmap) {
     parseChar_t c;
     int invert = 0;
@@ -721,7 +684,9 @@ void regexPrintCharClass(unsigned int *bitmap) {
     regexPrintCharClassToFP(stdout, bitmap);
 }
 
-// Subexpression name table /////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////
+// Subexpression name table
+/////////////////////////////////////////////////////////////////////////////
 
 // The subexpression group number is derived from it's pattern order. This
 // group number can be used to derive the expression number, via the following
@@ -733,13 +698,6 @@ int regexSubexprStartFromGroup(int group) {
 
 int regexSubexprEndFromGroup(int group) {
     return ((group - 1) * 2) + 1;
-}
-
-int regexGroupFromSubexpression(int subexpr) {
-    if(subexpr % 2) {
-        subexpr -= 1;
-    }
-    return subexpr / 2;
 }
 
 // Parses the subexpression name pointed to by pattern, creates a
@@ -769,7 +727,9 @@ int regexSubexprLookupEntryCreate(regex_vm_build_t *build, const char **pattern,
     return 1;
 }
 
-// Token management functions //////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////
+// Token management functions
+/////////////////////////////////////////////////////////////////////////////
 
 int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
     switch(token->tokenType) {
@@ -1135,7 +1095,9 @@ int regexGetOperatorArity(regex_token_t *token) {
     }
 }
 
-// NFA form regex support ///////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////
+// NFA form regex support
+/////////////////////////////////////////////////////////////////////////////
 
 regex_fragment_t *regexFragmentCreate(regex_token_t *token, regex_ptrlist_t *list) {
     regex_fragment_t *fragment;
@@ -1918,6 +1880,7 @@ void regexVMGenerateDeclaration(regex_vm_t *vm, const char *symbol, FILE *fp) {
 
 #define MAX_VM_INSTR_PER_ROW    8
 
+// TODO - recode exploded utf8 values
 void regexEmitEscapedString(FILE *fp, const char *str) {
     for(; *str != '\0'; str++) {
         if((*str < 32) || (*str > 127)) {
@@ -1971,9 +1934,9 @@ void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
         if(vm->class_table[k] == NULL) {
             continue;
         }
-        fprintf(fp, "unsigned int _%s_class_entry_%d[] = {", symbol, k);
+        fprintf(fp, "unsigned int _%s_class_entry_%d[] = {\n", symbol, k);
         for(j = 0; j < 4; j++) {
-            fprintf(fp, "%s0x%8.8X%s", (j != 0 ? ", " : ""), vm->class_table[k][j], (j == 3 ? "\n" : ""));
+            fprintf(fp, "%s0x%8.8X", (j != 0 ? ", " : "    "), vm->class_table[k][j]);
         }
         fprintf(fp, "\n};\n\n");
     }
