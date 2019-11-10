@@ -2578,8 +2578,8 @@ int main(int argc, char **argv) {
             regexDumpMatch(match);
             regexMatchFree(match);
 
-            //regexVMGenerateDeclaration(result.vm, "myparser", stdout);
-            //regexVMGenerateDefinition(result.vm, "myparser", stdout);
+            regexVMGenerateDeclaration(result.vm, "myparser", stdout);
+            regexVMGenerateDefinition(result.vm, "myparser", stdout);
         }
     }
 
