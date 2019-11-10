@@ -2022,7 +2022,7 @@ void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
             continue;
         }
         fprintf(fp, "unsigned int _%s_class_entry_%d[] = {\n", symbol, k);
-        for(j = 0; j < 4; j++) {
+        for(j = 0; j < 8; j++) {
             fprintf(fp, "%s0x%8.8X", (j != 0 ? ", " : "    "), vm->class_table[k][j]);
         }
         fprintf(fp, "\n};\n\n");

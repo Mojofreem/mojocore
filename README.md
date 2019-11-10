@@ -11,62 +11,70 @@ The design was influenced by the following references:
 * http://www.reedbeta.com/blog/the-shunting-yard-algorithm/
 
 Supported operations:
-* `(...)` - grouping operators, must be balanced
-* `[ab]` - character class
-* `a|b` - alternative
-* `a?`  - zero or one
-* `a*`  - zero or many
-* `a+`  - one or many
-* `.`   - any character except newline
+
+| Operator | Description                          |
+| -------- | ------------------------------------ |
+| `(...)`  | grouping operators, must be balanced |
+| `[ab]`   | character class                      |
+| `a|b`    | alternative                          |
+| `a?`     | zero or one                          |
+| `a*`     | zero or many                         |
+| `a+`     | one or many                          |
+| `.`      | any character except newline         |
 
 Meta and control characters may be escaped (by prefixing with backslash) to include
  their literal values. Escaping a non standard control character or a non-meta
  character is an error. Supported escape values are:
-* `\a` - alarm (bell)
-* `\b` - backspace
-* `\e` - escape (0x1B)
-* `\f` - formfeed
-* `\n` - newline
-* `\r` - return
-* `\t` - tab
-* `\v` - vertical tab
-* `\0` - null char
-* `\.` - period
-* `\(` - literal open parenthesis
-* `\[` - literal open bracket
-* `\|` - literal pipe
-* `\?` - literal question mark
-* `\+` - literal plus sign
-* `\*` - literal asterisk
-* `\x##` - hex byte
-* `\u####` - unicode char point (_not yet fully supported_)
+
+| Escape   | Value                    |
+| -------- | -------------------------|
+| `\a`     | alarm (bell)             |
+| `\b`     | backspace                |
+| `\e`     | escape (0x1B)            |
+| `\f`     | formfeed                 |
+| `\n`     | newline                  |
+| `\r`     | return                   |
+| `\t`     | tab                      |
+| `\v`     | vertical tab             |
+| `\0`     | null char                |
+| `\.`     | period                   |
+| `\(`     | literal open parenthesis |
+| `\[`     | literal open bracket     |
+| `\|`     | literal pipe             |
+| `\?`     | literal question mark    |
+| `\+`     | literal plus sign        |
+| `\*`     | literal asterisk         |
+| `\x##`   | hex byte                 |
+| `\u####` | unicode char point (_not yet fully supported_) |
 
 Meta classes are shortcuts for common character classes. Currently implemented
 meta classes are:
 
-* `\d` - `[0-9]`
-* `\D` - `[^0-9]`
-* `\s` - `[ \t\r\n\f\v]`
-* `\S` - `[^ \t\r\n\f\v]`
-* `\w` - `[a-zA-Z0-9_]`
-* `\W` - `[^a-zA-Z0-9_]`
+| Escape | Meta class value |
+| ------ | ---------------- | 
+| `\d`   | `[0-9]`          |
+| `\D`   | `[^0-9]`         |
+| `\s`   | `[ \t\r\n\f\v]`  |
+| `\S`   | `[^ \t\r\n\f\v]` |
+| `\w`   | `[a-zA-Z0-9_]`   |
+| `\W`   | `[^a-zA-Z0-9_]`  |
 
 Subexpressions (groups) are supported. Group capture is available. The current
 implementation captures that longest superset of an subexpression and it's
 plurality modifier (+, *, ?). For example, given the pattern:
 
-    `abc(foo)+def`
+* `abc(foo)+def`
 
 there is a single subexpression (_number 1, as group 0 always refers to the entire
 matched pattern_). Thus, given the evaluation string:
 
-    `abcfoofoofoodef`
+* `abcfoofoofoodef`
 
 the captured value of group 1 is `foofoofoo`.
 
 Named groups are supported using PCRE syntax:
 
-    `(?P<name>...)`
+* `(?P<name>...)`
 
 The current implementation is primarily limited to the ASCII character set and
 conventions. Unicode utf8 support is planned.
@@ -268,15 +276,15 @@ char *_myparser_string_table[] = {
 };
 
 unsigned int _myparser_class_entry_0[] = {
-    0x00000000, 0x03FF0000, 0x87FFFFFE, 0x07FFFFFE
+    0x00000000, 0x03FF0000, 0x87FFFFFE, 0x07FFFFFE, 0x00000000, 0x00000000, 0x00000000, 0x00000000
 };
 
 unsigned int _myparser_class_entry_1[] = {
-    0x00000000, 0x00000000, 0x00000000, 0x00000F00
+    0x00000000, 0x00000000, 0x00000000, 0x00000F00, 0x00000000, 0x00000000, 0x00000000, 0x00000000
 };
 
 unsigned int _myparser_class_entry_2[] = {
-    0x00000000, 0x03FF0000, 0x00000000, 0x00000000
+    0x00000000, 0x03FF0000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000
 };
 
 unsigned int *_myparser_class_table[] = {
