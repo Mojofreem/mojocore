@@ -572,7 +572,7 @@ int charClassBitmapCheck(const unsigned int *bitmap, int pos) {
 }
 
 void charClassBitmapInvert(unsigned int *bitmap) {
-    for(int k = 0; k < 4; k++) {
+    for(int k = 0; k < 8; k++) {
         bitmap[k] ^= (unsigned int)0xFFFFFFFFu;
     }
 }
@@ -668,7 +668,7 @@ eRegexCompileStatus parseCharClass(const char **pattern, unsigned int *bitmap) {
 int regexTokenCreate(regex_token_t **list, eRegexToken tokenType, int c, char *str);
 
 int parseCharClassAndCreateToken(eRegexCompileStatus *status, const char **pattern, regex_token_t **tokens) {
-    unsigned int bitmap[4], *ptr;
+    unsigned int bitmap[8], *ptr;
 
     // Operand, character class
     if((*status = parseCharClass(pattern, bitmap)) != eCompileOk) {
@@ -860,7 +860,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
     int response;
     int len;
     char *str;
-    unsigned int bitmap[4], *ptr;
+    unsigned int bitmap[8], *ptr;
     eRegexCompileStatus status;
     int subexpr = 0;
 
@@ -891,7 +891,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         continue;
 
                     case '[':
-#if 1
+#if 0
                         // Operand, character class
                         if((status = parseCharClass(&pattern, bitmap)) != eCompileOk) {
                             SET_RESULT(status);
