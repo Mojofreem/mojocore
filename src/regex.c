@@ -10,7 +10,7 @@
 #include <string.h>
 
 /*
-    Flags
+    Flags (TODO)
     --------------------------
     unicode
         Handle UTF8 encoded glyphs explicitly. Properly treat multibyte chars
@@ -20,10 +20,13 @@
     nocapture
         Subexpressions are not captured. Simplifies compilation, parsing, and
         lowers runtime memory overhead.
+    dotall
+        . matches ANY character (default is any EXCEPT newline)
 
 
     Character escape sequences
     --------------------------
+    (implemented)
         \a alarm (bell)
         \b backspace
         \e escape
@@ -35,24 +38,25 @@
         \0 null char
         \x## hex byte
         \u#### unicode char point
+        \d [0-9]
+        \D [^0-9]
+        \s [ \t\f\v\r\n]
+        \S [^ \t\f\v\r\n]
+        \w [a-zA-Z0-9_] - TODO adapt for unicode utf8 sequences
+        \W [^a-zA-Z0-9_] - TODO adapt for unicode utf8 sequences
 
-    \B byte (differs from ., in that the latter MAY match multibyte (UTF8))
-
-    \d [0-9]
-    \D [^0-9]
-    \s whitespace
-    \S non-whitespace
-    \w word char (what is the char class?)
-    \W non word char
-    \X full unicode glyph (may be multiple chars)
-
-    ^  start of string (assertion, non consuming)
-    $  end of string (assertion, non consuming)
+    TODO
+        \B byte (differs from ., in that the latter MAY match multibyte (UTF8))
+        \X full unicode glyph (may be multiple chars)
+        ^  start of string (assertion, non consuming)
+        $  end of string (assertion, non consuming)
+        \< match start of word (assertion, non consuming)
+        \> match end of word (assertion, non consuming)
 
     (?P<name>...)  named subexpressions
-    (?:...) non capturing subexpressions
-    (?*...) compound subexpressions
-    (?i) case insensitive match
+    (?:...) non capturing subexpressions - TODO
+    (?*...) compound subexpressions - TODO
+    (?i) case insensitive match - TODO
 
 Todo:
     properly handle unicode chars (we decode the escape value, but the lexer
@@ -80,7 +84,7 @@ Regex VM Bytecode (v2)
         eTokenJmp               7       program counter
         eTokenSave              8       subexpression number
 
-All VM programs are prefixed with:
+All VM programs are prefixed with: TODO
 
         0 split 1 3
         1 anychar
@@ -89,6 +93,7 @@ All VM programs are prefixed with:
     At runtime, if a partial match is requested, exceution begins at 0. If a
     full match is requested, execution begins at 3.
 
+Test: a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat abcdefgefgjfoo8167287catfoo
 */
 
 typedef struct regex_vm_s regex_vm_t;
@@ -397,8 +402,24 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
                 result.state = eRegexPatternEscapedChar;
                 return result;
 
+            case '\\':  // literal backslash
+            case '|':   // literal pipe
+            case '?':   // literal question mark
+            case '.':   // literal period
+            case '*':   // literal asterisk
+            case '^':   // literal caret
+            case '+':   // literal plus
+            case '(':   // literal open parenthesis
+            case '[':   // literal open bracket
+            case ')':   // literal close parenthesis
+            case '$':   // literal dollar sign
+                result.state = eRegexPatternEscapedChar;
+                result.c = *(*pattern + 1);
+                return result;
+
             default:
-                break;
+                result.state = eRegexPatternInvalid;
+                return result;
         }
     }
     switch(**pattern) {
@@ -856,11 +877,11 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                                          regex_vm_build_t *build) {
     eRegexCompileStatus result;
     const char *start = pattern;
+    const char *class;
     parseChar_t c;
     int response;
     int len;
     char *str;
-    unsigned int bitmap[8], *ptr;
     eRegexCompileStatus status;
     int subexpr = 0;
 
@@ -891,22 +912,9 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         continue;
 
                     case '[':
-#if 0
-                        // Operand, character class
-                        if((status = parseCharClass(&pattern, bitmap)) != eCompileOk) {
-                            SET_RESULT(status);
-                        }
-                        if((ptr = charClassBitmapCopy(bitmap)) == NULL) {
-                            SET_RESULT(eCompileOutOfMem);
-                        }
-                        if(!regexTokenCreate(tokens, eTokenCharClass, 0, (char *)ptr)) {
-                            SET_RESULT(eCompileOutOfMem);
-                        }
-#else
                         if(!parseCharClassAndCreateToken(&status, &pattern, tokens)) {
                             SET_RESULT(status);
                         }
-#endif
                         continue;
 
                     case '?':
@@ -983,18 +991,49 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                 // TODO
                 switch(c.c) {
                     case 'd': // digit
+                        class = "0-9]";
+                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
+                            SET_RESULT(status);
+                        }
+                        continue;
+
                     case 'D': // non digit
+                        class = "^0-9]";
+                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
+                            SET_RESULT(status);
+                        }
+                        continue;
+
                     case 's': // whitespace
+                        class = " \t\f\v\r\n]";
+                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
+                            SET_RESULT(status);
+                        }
+                        continue;
+
                     case 'S': // non whitespace
+                        class = "^ \t\f\v\r\n]";
+                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
+                            SET_RESULT(status);
+                        }
+                        continue;
+
                     case 'w': // word character
-                        // Derived from the unicode DB
-                        // TODO
-                        break;
+                        // TODO: derive from the unicode DB
+                        class = "a-zA-Z0-9_]";
+                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
+                            SET_RESULT(status);
+                        }
+                        continue;
 
                     case 'W': // non word character
+                        // TODO: derive from the unicode DB
                         // Derived from the unicode DB
-                        // TODO
-                        break;
+                        class = "^a-zA-Z0-9_]";
+                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
+                            SET_RESULT(status);
+                        }
+                        continue;
 
                     case 'X': // full unicode glyph (base + markers)
                         // Represented by a micro NFA
