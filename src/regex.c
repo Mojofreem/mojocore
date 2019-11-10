@@ -425,14 +425,15 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
 
 void parsePatternCharAdvance(const char **pattern) {
     if(**pattern == '\\') {
-        if(*(*pattern + 1) == 'x') {
+        if((*(*pattern + 1) == 'x') && (*(*pattern + 2) != '\0') && (*(*pattern + 3) != '\0')) {
             *pattern += 4; // \x##
-        } else if(*(*pattern + 1) == 'u') {
+        } else if((*(*pattern + 1) == 'u') && (*(*pattern + 2) != '\0') && (*(*pattern + 3) != '\0') &&
+                  (*(*pattern + 4) != '\0') && (*(*pattern + 5) != '\0')) {
             *pattern += 6; // \u####
-        } else {
+        } else if((*(*pattern + 1) != '\0')) {
             *pattern += 2;
         }
-    } else {
+    } else if(**pattern != '\0'){
         (*pattern)++;
     }
 }
@@ -648,6 +649,7 @@ eRegexCompileStatus parseCharClass(const char **pattern, unsigned int *bitmap) {
 
             case eRegexPatternUnicode:
                 // TODO - special case handling
+                break;
 
             case eRegexPatternMetaClass:
                 return eCompileInvalidEscapeChar;
@@ -661,6 +663,26 @@ eRegexCompileStatus parseCharClass(const char **pattern, unsigned int *bitmap) {
         c = parseGetNextPatternChar(pattern);
         parsePatternCharAdvance(pattern);
     }
+}
+
+int regexTokenCreate(regex_token_t **list, eRegexToken tokenType, int c, char *str);
+
+int parseCharClassAndCreateToken(eRegexCompileStatus *status, const char **pattern, regex_token_t **tokens) {
+    unsigned int bitmap[4], *ptr;
+
+    // Operand, character class
+    if((*status = parseCharClass(pattern, bitmap)) != eCompileOk) {
+        return 0;
+    }
+    if((ptr = charClassBitmapCopy(bitmap)) == NULL) {
+        *status = eCompileOutOfMem;
+        return 0;
+    }
+    if(!regexTokenCreate(tokens, eTokenCharClass, 0, (char *)ptr)) {
+        *status = eCompileOutOfMem;
+        return 0;
+    }
+    return 1;
 }
 
 void regexPrintCharClassToFP(FILE *fp, unsigned int *bitmap) {
@@ -869,6 +891,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         continue;
 
                     case '[':
+#if 1
                         // Operand, character class
                         if((status = parseCharClass(&pattern, bitmap)) != eCompileOk) {
                             SET_RESULT(status);
@@ -879,6 +902,11 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         if(!regexTokenCreate(tokens, eTokenCharClass, 0, (char *)ptr)) {
                             SET_RESULT(eCompileOutOfMem);
                         }
+#else
+                        if(!parseCharClassAndCreateToken(&status, &pattern, tokens)) {
+                            SET_RESULT(status);
+                        }
+#endif
                         continue;
 
                     case '?':
@@ -953,6 +981,26 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
 
             case eRegexPatternMetaClass:
                 // TODO
+                switch(c.c) {
+                    case 'd': // digit
+                    case 'D': // non digit
+                    case 's': // whitespace
+                    case 'S': // non whitespace
+                    case 'w': // word character
+                        // Derived from the unicode DB
+                        // TODO
+                        break;
+
+                    case 'W': // non word character
+                        // Derived from the unicode DB
+                        // TODO
+                        break;
+
+                    case 'X': // full unicode glyph (base + markers)
+                        // Represented by a micro NFA
+                        // TODO
+                        break;
+                }
                 break;
 
             case eRegexPatternChar:
