@@ -204,6 +204,13 @@ void regexSetMemoryAllocator(regexMemAllocator_t alloc, regexMemDeallocator_t de
 #define VM_PC_UNVISITED     ((int)-1)
 #define VM_PC_PENDING_ASSIGNMENT    ((int)-2)
 
+#define META_DIGITS_PATTERN     "0-9"
+#define META_WHITESPACE_PATTERN " \\t\\f\\v\\r\\n"
+#define META_WORD_PATTERN       "a-zA-Z0-9_"
+
+#define META_CLASS(pattern)     pattern "]"
+#define META_CLASS_INV(pattern) "^" pattern "]"
+
 typedef enum {
     eTokenNone,
     eTokenCharLiteral,
@@ -259,47 +266,105 @@ struct regex_vm_build_s {
 int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int len, int index);
 
 /////////////////////////////////////////////////////////////////////////////
-// Character parsing, assists with escaped chars
+// Token management functions
 /////////////////////////////////////////////////////////////////////////////
 
-int parseIsMetaChar(char c) {
-    switch(c) {
-        case '|':   // alternation
-        case '?':   // zero or one
-        case '.':   // character (may be multi byte for UTF8)
-        case '*':   // zero or more (kleene)
-        case '^':   // start of string assertion
-        case '+':   // one or more
-        case '(':   // subexpression start
-        case '[':   // character class start
-        case ')':   // subexpression end
-        case '$':   // end of string assertion
+int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
+    switch(token->tokenType) {
+        case eTokenCharLiteral:
+        case eTokenStringLiteral:
+        case eTokenCharClass:
+        case eTokenCharAny:
             return 1;
+        case eTokenZeroOrOne:
+        case eTokenZeroOrMany:
+        case eTokenOneOrMany:
+            return preceeding;
+        case eTokenSubExprEnd:
+            return preceeding;
+        case eTokenSubExprStart:
+            return !preceeding;
         default:
             return 0;
     }
 }
 
-int parseIsMetaClass(char c) {
-    switch(c) {
-        case 'd': // digit
-        case 'D': // non digit
-        case 's': // whitespace
-        case 'S': // non whitespace
-        case 'w': // word character
-        case 'W': // non word character
-        case 'X': // full unicode glyph (base + markers)
-            return 1;
-        default:
-            return 0;
+regex_token_t *regexAllocToken(eRegexToken tokenType, int c, char *str) {
+    regex_token_t *token;
+
+    if((token = _regexAlloc(sizeof(regex_token_t), _regexMemContext)) == NULL) {
+        return NULL;
+    }
+    memset(token, 0, sizeof(regex_token_t));
+    token->tokenType = tokenType;
+    if(str != NULL) {
+        token->str = str;
+    } else {
+        token->c = c;
+    }
+    return token;
+}
+
+int regexTokenCreate(regex_token_t **list, eRegexToken tokenType, int c, char *str) {
+    regex_token_t *token, *walk;
+
+    if((token = regexAllocToken(tokenType, c, str)) == NULL) {
+        return 0;
+    }
+
+    if(*list == NULL) {
+        *list = token;
+    } else {
+        for(walk = *list; walk->next != NULL; walk = walk->next);
+        if(regexTokenIsTerminal(token, 0) && regexTokenIsTerminal(walk, 1)) {
+            // Two adjacent terminals have an implicit concatenation
+            if((walk->next = regexAllocToken(eTokenConcatenation, 0, NULL)) == NULL) {
+                _regexDealloc(token, _regexMemContext);
+                return 0;
+            }
+            walk = walk->next;
+        }
+        walk->next = token;
+    }
+
+    return 1;
+}
+
+void regexTokenDestroy(regex_token_t *token, int stack) {
+    regex_token_t *next;
+
+    if(token == NULL) {
+        return;
+    }
+
+    if(stack) {
+        for(; token != NULL; token = next) {
+            next = token->next;
+            switch(token->tokenType) {
+                case eTokenCharClass:
+                case eTokenStringLiteral:
+                    if(token->str != NULL) {
+                        _regexDealloc(token->str, _regexMemContext);
+                    }
+                    break;
+                default:
+                    break;
+            }
+            _regexDealloc(token, _regexMemContext);
+        }
+    } else {
+        if(token->pc != VM_PC_UNVISITED) {
+            return;
+        }
+        token->pc = VM_PC_UNVISITED;
+        regexTokenDestroy(token->out_a, 0);
+        regexTokenDestroy(token->out_b, 0);
     }
 }
 
-int parseIsAlnum(char c) {
-    return (((c >= 'a') && (c <= 'z')) ||       // a - z
-            ((c >= 'A') && (c <= 'Z')) ||       // A - Z
-            ((c >= '0') && (c <= '9')));        // 0 - 9
-}
+/////////////////////////////////////////////////////////////////////////////
+// Character parsing, assists with escaped chars
+/////////////////////////////////////////////////////////////////////////////
 
 int parseIsHexdigit(char c) {
     return (((c >= 'a') && (c <= 'f')) ||       // a - f
@@ -323,6 +388,7 @@ typedef enum {
     eRegexPatternChar,
     eRegexPatternUnicode,
     eRegexPatternInvalid,
+    eRegexPatternInvalidEscape,
     eRegexPatternMetaChar,
     eRegexPatternMetaClass,
     eRegexPatternEscapedChar
@@ -459,7 +525,7 @@ void parsePatternCharAdvance(const char **pattern) {
     }
 }
 
-int regexIsAlnum(char c) {
+int parseIsAlnum(char c) {
     return (((c >= 'a') && (c <= 'z')) ||       // a - z
             ((c >= 'A') && (c <= 'Z')) ||       // A - Z
             ((c >= '0') && (c <= '9')));        // 0 - 9
@@ -469,6 +535,9 @@ int parseCheckNextPatternChar(const char **pattern, char c) {
     parseChar_t pc;
 
     pc = parseGetNextPatternChar(pattern);
+    if((pc.state == eRegexPatternEnd) || (pc.state == eRegexPatternInvalid)) {
+        return 0;
+    }
     if((pc.c == '\0') || (pc.c != c)) {
         return 0;
     }
@@ -536,6 +605,7 @@ int parseGetPatternStrLen(const char **pattern) {
                 break;
 
             case eRegexPatternInvalid:
+            case eRegexPatternInvalidEscape:
                 return -1;
 
         }
@@ -635,6 +705,9 @@ eRegexCompileStatus parseCharClass(const char **pattern, unsigned int *bitmap) {
             case eRegexPatternInvalid:
                 return eCompileEscapeCharIncomplete;
 
+            case eRegexPatternInvalidEscape:
+                return eCompileInvalidEscapeChar;
+
             case eRegexPatternChar:
                 if(c.c == ']') {
                     if(range == 2) {
@@ -685,8 +758,6 @@ eRegexCompileStatus parseCharClass(const char **pattern, unsigned int *bitmap) {
         parsePatternCharAdvance(pattern);
     }
 }
-
-int regexTokenCreate(regex_token_t **list, eRegexToken tokenType, int c, char *str);
 
 int parseCharClassAndCreateToken(eRegexCompileStatus *status, const char **pattern, regex_token_t **tokens) {
     unsigned int bitmap[8], *ptr;
@@ -751,7 +822,7 @@ int regexSubexprLookupEntryCreate(regex_vm_build_t *build, const char **pattern,
 
     index--;
     for(len = 0; (*pattern)[len] != '>' && (*pattern)[len] != '\0'; len++) {
-        if(!regexIsAlnum((*pattern)[len])) {
+        if(!parseIsAlnum((*pattern)[len])) {
             return -1;
         }
     }
@@ -768,103 +839,6 @@ int regexSubexprLookupEntryCreate(regex_vm_build_t *build, const char **pattern,
     (*pattern)++;
 
     return 1;
-}
-
-/////////////////////////////////////////////////////////////////////////////
-// Token management functions
-/////////////////////////////////////////////////////////////////////////////
-
-int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
-    switch(token->tokenType) {
-        case eTokenCharLiteral:
-        case eTokenStringLiteral:
-        case eTokenCharClass:
-        case eTokenCharAny:
-            return 1;
-        case eTokenZeroOrOne:
-        case eTokenZeroOrMany:
-        case eTokenOneOrMany:
-            return preceeding;
-        case eTokenSubExprEnd:
-            return preceeding;
-        case eTokenSubExprStart:
-            return !preceeding;
-        default:
-            return 0;
-    }
-}
-
-regex_token_t *regexAllocToken(eRegexToken tokenType, int c, char *str) {
-    regex_token_t *token;
-
-    if((token = _regexAlloc(sizeof(regex_token_t), _regexMemContext)) == NULL) {
-        return NULL;
-    }
-    memset(token, 0, sizeof(regex_token_t));
-    token->tokenType = tokenType;
-    if(str != NULL) {
-        token->str = str;
-    } else {
-        token->c = c;
-    }
-    return token;
-}
-
-int regexTokenCreate(regex_token_t **list, eRegexToken tokenType, int c, char *str) {
-    regex_token_t *token, *walk;
-
-    if((token = regexAllocToken(tokenType, c, str)) == NULL) {
-        return 0;
-    }
-
-    if(*list == NULL) {
-        *list = token;
-    } else {
-        for(walk = *list; walk->next != NULL; walk = walk->next);
-        if(regexTokenIsTerminal(token, 0) && regexTokenIsTerminal(walk, 1)) {
-            // Two adjacent terminals have an implicit concatenation
-            if((walk->next = regexAllocToken(eTokenConcatenation, 0, NULL)) == NULL) {
-                _regexDealloc(token, _regexMemContext);
-                return 0;
-            }
-            walk = walk->next;
-        }
-        walk->next = token;
-    }
-
-    return 1;
-}
-
-void regexTokenDestroy(regex_token_t *token, int stack) {
-    regex_token_t *next;
-
-    if(token == NULL) {
-        return;
-    }
-
-    if(stack) {
-        for(; token != NULL; token = next) {
-            next = token->next;
-            switch(token->tokenType) {
-                case eTokenCharClass:
-                case eTokenStringLiteral:
-                    if(token->str != NULL) {
-                        _regexDealloc(token->str, _regexMemContext);
-                    }
-                    break;
-                default:
-                    break;
-            }
-            _regexDealloc(token, _regexMemContext);
-        }
-    } else {
-        if(token->pc != VM_PC_UNVISITED) {
-            return;
-        }
-        token->pc = VM_PC_UNVISITED;
-        regexTokenDestroy(token->out_a, 0);
-        regexTokenDestroy(token->out_b, 0);
-    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -901,6 +875,9 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
 
             case eRegexPatternInvalid:
                 SET_RESULT(eCompileEscapeCharIncomplete);
+
+            case eRegexPatternInvalidEscape:
+                SET_RESULT(eCompileInvalidEscapeChar);
 
             case eRegexPatternMetaChar:
                 switch(c.c) {
@@ -988,31 +965,30 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                 continue;
 
             case eRegexPatternMetaClass:
-                // TODO
                 switch(c.c) {
                     case 'd': // digit
-                        class = "0-9]";
+                        class = META_CLASS(META_DIGITS_PATTERN);
                         if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
                             SET_RESULT(status);
                         }
                         continue;
 
                     case 'D': // non digit
-                        class = "^0-9]";
+                        class = META_CLASS_INV(META_DIGITS_PATTERN);
                         if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
                             SET_RESULT(status);
                         }
                         continue;
 
                     case 's': // whitespace
-                        class = " \t\f\v\r\n]";
+                        class = META_CLASS(META_WHITESPACE_PATTERN);
                         if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
                             SET_RESULT(status);
                         }
                         continue;
 
                     case 'S': // non whitespace
-                        class = "^ \t\f\v\r\n]";
+                        class = META_CLASS_INV(META_WHITESPACE_PATTERN);
                         if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
                             SET_RESULT(status);
                         }
@@ -1020,7 +996,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
 
                     case 'w': // word character
                         // TODO: derive from the unicode DB
-                        class = "a-zA-Z0-9_]";
+                        class = META_CLASS(META_WORD_PATTERN);
                         if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
                             SET_RESULT(status);
                         }
@@ -1029,7 +1005,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                     case 'W': // non word character
                         // TODO: derive from the unicode DB
                         // Derived from the unicode DB
-                        class = "^a-zA-Z0-9_]";
+                        class = META_CLASS_INV(META_WORD_PATTERN);
                         if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
                             SET_RESULT(status);
                         }
@@ -2021,9 +1997,10 @@ void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
         if(vm->class_table[k] == NULL) {
             continue;
         }
-        fprintf(fp, "unsigned int _%s_class_entry_%d[] = {\n", symbol, k);
+        fprintf(fp, "unsigned int _%s_class_entry_%d[] = {", symbol, k);
         for(j = 0; j < 8; j++) {
-            fprintf(fp, "%s0x%8.8X", (j != 0 ? ", " : "    "), vm->class_table[k][j]);
+            fprintf(fp, "%s0x%8.8X%s", (j % 4 ? " " : "\n    "),
+                    vm->class_table[k][j], (j != 7 ? "," : ""));
         }
         fprintf(fp, "\n};\n\n");
     }
@@ -2575,11 +2552,12 @@ int main(int argc, char **argv) {
                 printf("No match\n");
                 return 1;
             }
+
             regexDumpMatch(match);
             regexMatchFree(match);
 
-            regexVMGenerateDeclaration(result.vm, "myparser", stdout);
-            regexVMGenerateDefinition(result.vm, "myparser", stdout);
+            //regexVMGenerateDeclaration(result.vm, "myparser", stdout);
+            //regexVMGenerateDefinition(result.vm, "myparser", stdout);
         }
     }
 
