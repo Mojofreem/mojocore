@@ -16,7 +16,7 @@ Supported operations:
 | -------- | ------------------------------------ |
 | `(...)`  | grouping operators, must be balanced |
 | `[ab]`   | character class                      |
-| `a|b`    | alternative                          |
+| `a\|b`    | alternative                          |
 | `a?`     | zero or one                          |
 | `a*`     | zero or many                         |
 | `a+`     | one or many                          |
