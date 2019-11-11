@@ -40,7 +40,7 @@ Meta and control characters may be escaped (by prefixing with backslash) to incl
 | `\.`     | period                   |
 | `\(`     | literal open parenthesis |
 | `\[`     | literal open bracket     |
-| `\|`     | literal pipe             |
+| `\\\|`     | literal pipe             |
 | `\?`     | literal question mark    |
 | `\+`     | literal plus sign        |
 | `\*`     | literal asterisk         |
