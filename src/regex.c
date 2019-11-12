@@ -52,6 +52,17 @@
         $  end of string (assertion, non consuming)
         \< match start of word (assertion, non consuming)
         \> match end of word (assertion, non consuming)
+        eTokenUnicodeLiteral
+        eTokenAnyCharDotAll
+        unicode db -> digits, whitespace, uppercase, lowercase, combining marks
+            \M - combining mark (M_)
+            \N - numeric digit (N_)
+            \P - punctuation (P_)
+            \Z - any unicode whitespace (Z_)
+            \L - any unicode letter (L_)
+            \U - uppercase unicode letter (Lu)
+            \l - lowercase unicode letter (Ll)
+
 
     (?P<name>...)  named subexpressions
     (?:...) non capturing subexpressions - TODO
@@ -129,9 +140,10 @@ typedef enum {
     eCompileInternalError
 } eRegexCompileStatus;
 
-#define REGEX_FLAG_UNICODE          0x01
-#define REGEX_FLAG_CASE_INSENSITIVE 0x04
-#define REGEX_FLAG_NO_CAPTURE       0x08
+#define REGEX_UNICODE           0x01
+#define REGEX_CASE_INSENSITIVE  0x02
+#define REGEX_NO_CAPTURE        0x04
+#define REGEX_DOTALL            0x08
 
 typedef struct regex_compile_ctx_s regex_compile_ctx_t;
 struct regex_compile_ctx_s {
@@ -142,7 +154,8 @@ struct regex_compile_ctx_s {
 };
 
 const char *regexGetCompileStatusStr(eRegexCompileStatus status);
-eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern);
+eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
+                                 unsigned int flags);
 
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 
@@ -211,12 +224,24 @@ void regexSetMemoryAllocator(regexMemAllocator_t alloc, regexMemDeallocator_t de
 #define META_CLASS(pattern)     pattern "]"
 #define META_CLASS_INV(pattern) "^" pattern "]"
 
+const char *unicode_combining_marks;
+const char *unicode_numeric;
+const char *unicode_punctuation;
+const char *unicode_whitespace;
+const char *unicode_letter;
+const char *unicode_uppercase;
+const char *unicode_lowercase;
+
+
 typedef enum {
     eTokenNone,
     eTokenCharLiteral,
+    eTokenUnicodeLiteral,
     eTokenCharClass,
+    eTokenUnicodeClass,
     eTokenStringLiteral,
     eTokenCharAny,
+    eTokenCharAnyDotAll,
     eTokenMatch,
     eTokenSplit,
     eTokenJmp,
@@ -256,6 +281,7 @@ typedef struct regex_vm_build_s regex_vm_build_t;
 struct regex_vm_build_s {
     regex_vm_t *vm;
     regex_token_t *tokens;
+    unsigned int flags;
     int string_tbl_count;
     int class_tbl_count;
     int group_tbl_count;
@@ -842,6 +868,8 @@ int regexSubexprLookupEntryCreate(regex_vm_build_t *build, const char **pattern,
 }
 
 /////////////////////////////////////////////////////////////////////////////
+// Lexer - tokenizes the pattern into a token list (infix form)
+/////////////////////////////////////////////////////////////////////////////
 
 #define SET_RESULT(stat)  result = stat; goto compileFailure;
 
@@ -1063,6 +1091,10 @@ compileFailure:
     return result;
 }
 
+/////////////////////////////////////////////////////////////////////////////
+// Shunting yard implementation - convert infix to postfix to an NFA
+/////////////////////////////////////////////////////////////////////////////
+
 typedef struct regex_ptrlist_s regex_ptrlist_t;
 struct regex_ptrlist_s {
     regex_token_t **out;
@@ -1080,8 +1112,6 @@ typedef enum {
     OP_GREATER_OR_EQUAL,
     OP_ALL
 } eRegexOpApply;
-
-// Shunting yard implementation, to convert infix to postfix form ///////////
 
 void regexTokenStackPush(regex_token_t **stack, regex_token_t *token) {
     if(*stack == NULL) {
@@ -1603,6 +1633,10 @@ eRegexCompileStatus regexShuntingYard(regex_token_t **tokens) {
     return status;
 }
 
+/////////////////////////////////////////////////////////////////////////////
+// Regex VM builder and evaluator
+/////////////////////////////////////////////////////////////////////////////
+
 void regexVMStringTableFree(regex_vm_t *vm) {
     int k;
     if(vm->string_table != NULL) {
@@ -2086,6 +2120,10 @@ void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
     }
 }
 
+/////////////////////////////////////////////////////////////////////////////
+// Pattern compilation
+/////////////////////////////////////////////////////////////////////////////
+
 const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
     switch(status) {
         case eCompileOk: return "compiled successfully";
@@ -2104,7 +2142,8 @@ const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
 }
 
 // Return a compiled regex, or an error and position within the pattern
-eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern) {
+eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
+                                 unsigned int flags) {
     regex_vm_build_t build;
     regex_vm_pc_patch_t *patch_list = NULL;
 
@@ -2117,6 +2156,7 @@ eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern) 
         ctx->status = eCompileOutOfMem;
         return ctx->status;
     }
+    build.flags = flags;
 
     // Parse the regex pattern into a sequence of tokens (operators and operands)
     // The output of this stage is a sequence of lexical tokens in infix form
