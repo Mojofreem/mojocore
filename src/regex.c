@@ -121,6 +121,8 @@ Test: a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat abcdefgefgjfoo8167287catfoo
 
 /////////////////////////////////////////////////////////////////////////////
 
+#define REGEX_VM_MACHINE_VERSION    3
+
 typedef struct regex_vm_s regex_vm_t;
 struct regex_vm_s {
     int vm_version;                 // VM machine version
@@ -2507,6 +2509,7 @@ int regexVMBuildInit(regex_vm_build_t *build) {
         return 0;
     }
     memset(build->vm, 0, sizeof(regex_vm_t));
+    build->vm->vm_version = REGEX_VM_MACHINE_VERSION;
     return 1;
 }
 
@@ -2613,6 +2616,7 @@ void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
     fprintf(fp, "};\n\n");
 
     fprintf(fp, "regex_vm_t _%s = {\n", symbol);
+    fprintf(fp, "    .vm_version = %d,\n", vm->vm_version);
     fprintf(fp, "    .program = _%s_program,\n", symbol);
     fprintf(fp, "    .size = %d,\n", vm->size);
     fprintf(fp, "    .string_table = _%s_string_table,\n", symbol);
@@ -2985,6 +2989,10 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete) {
     regex_thread_t *thread;
     int k;
 
+    if(vm->vm_version != REGEX_VM_MACHINE_VERSION) {
+        return NULL;
+    }
+
     if((eval = regexEvalCreate(vm, text)) == NULL) {
         return NULL;
     }
@@ -3132,7 +3140,7 @@ int main(int argc, char **argv) {
     regex_match_t *match;
 
     if(argc > 1) {
-        if(regexCompile(&result, argv[1]) != eCompileOk) {
+        if(regexCompile(&result, argv[1], 0) != eCompileOk) {
             printf("Compile failed: %s", regexGetCompileStatusStr(result.status));
             return 1;
         }
