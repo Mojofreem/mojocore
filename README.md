@@ -317,7 +317,9 @@ regex_vm_t *myparser = &_myparser;
 * Support non-capturing subexpressions, `(?:...)`.
 * Support compound subexpressions, `(?*...)`. This would augment the existing
     group capture with explicit capture of each repetition of a subexpression.
-* Handle utf8 codepoints with the dot metacharacter.
+* Complete `\0` support: currently can be included in the pattern, but the
+    matcher treats input as a null terminated string (_so the `\0` can never
+    actually match_)
 * Explicitly match a single byte (`\B`?) (_differs from `.`, in that the `.`
     MAY match multibyte (utf8), and MAY NOT match `\n`_)
 * Start of string assertion `^` (_non consuming_)
@@ -327,13 +329,9 @@ regex_vm_t *myparser = &_myparser;
 * End of word assertion `\>`, that only matches when a word character preceeds a
     non-word character (_non consuming_)
 * Inline case insensitive match modifier `(?i)`
-* Match a full unicode glyph `\X` (_may be multiple chars, and may include
-    additional marker glyphs_)
-* Character classes that handle multibyte utf8 characters
 * Global case insensitive matching flag
 * Unanchored matches (_currently can be done with an explicit `.*` prefix_)
 * Counter repetition (_range_) plurality operator `{n,m}`
-* utf8 glyph parsing (_derive from unicode database character classes_)
 * Convert to a single file header library (_ala Sean Barrett's example_)
 * Optionally evaluate the NFA tree directly, and skip the VM generation
 * Pattern normalization:
@@ -341,15 +339,23 @@ regex_vm_t *myparser = &_myparser;
     * sequence of char literals reduced to a string literal
     * alternative char literals reduced to a char class (_ie., `a|b|c` -> `[abc]`_)
     * reduce redundant metacharacters (_ie., `(a*)*` -> `(a)*`_)
-* Flag: `unicode` - explicitly handle unicode (_with ascii being the default_).
-    This would simplify patterns that do not need utf8 support.
 * Flag: `caseinsensitive` - treat the entire pattern as case insensitive.
 * Flag: `nocapture` - subexpressions are not captured. Simplifies compilation,
     parsing, and lowers runtime memory overhead.
 * Flag: `dotall` - `.` matches ANY character (_default is any EXCEPT newline_)
-* Properly handle unicode chars (_we decode the escape value, but the lexer
-    does not properly deal with the multiple bytes_)
-* Multipass char class parsing, to separate ascii and unicode handling
+* unicode:
+    * Handle utf8 codepoints with the dot metacharacter.
+    * Match a full unicode glyph `\X` (_may be multiple chars, and may include
+        additional marker glyphs_)
+    * Character classes that handle multibyte utf8 characters
+    * utf8 glyph parsing (_derive from unicode database character classes_)
+    * Flag: `unicode` - explicitly handle unicode (_with ascii being the default_).
+        This would simplify patterns that do not need utf8 support.
+    * Properly handle unicode chars (_we decode the escape value, but the lexer
+        does not properly deal with the multiple bytes_)
+    * Multipass char class parsing, to separate ascii and unicode handling
+    * Update unicode db parser to handle arbitrary character groups and
+        property sets, prebuild unicode class trees
 
 ### Regex VM Bytecode (_v2_)
 

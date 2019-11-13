@@ -55,6 +55,7 @@
         eTokenUnicodeLiteral
         eTokenAnyCharDotAll
         unicode db -> digits, whitespace, uppercase, lowercase, combining marks
+            use PCRE notation?: \p{__}
             \M - combining mark (M_)
             \N - numeric digit (N_)
             \P - punctuation (P_)
@@ -106,6 +107,53 @@ All VM programs are prefixed with: TODO
 
 Test: a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat abcdefgefgjfoo8167287catfoo
 */
+
+/////////////////////////////////////////////////////////////////////////////
+// Unicode import concept
+/////////////////////////////////////////////////////////////////////////////
+
+// For utf8 encoded characters, trailing bytes have 6 bits of character data,
+// as the leading bits identify the byte as part of a multibyte codepoint.
+// This simplifies the unicode char class table entries to only need 64 bits
+// (8 bytes) to represent the byte.
+
+// | 4 byte lead | 3 byte lead | 2 byte lead | low byte |
+//                             |<---- 2 byte group ---->|
+//               |<------------ 3 byte group ---------->|
+// |<------------------ 4 byte group ------------------>|
+
+typedef struct unicode_2_byte_group_s unicode_2_byte_group_t;
+struct unicode_2_byte_group_s {
+    unsigned char prefix;
+    unsigned char *bitmap; // 8 byte bitfield
+};
+
+typedef struct unicode_3_byte_group_s unicode_3_byte_group_t;
+struct unicode_3_byte_group_s {
+    unsigned char *prefix;
+    int subgroup_count;
+    unicode_2_byte_group_t *subgroups;
+};
+
+typedef struct unicode_4_byte_group_s unicode_4_byte_group_t;
+struct unicode_4_byte_group_s {
+    unsigned char *prefix;
+    int subgroup_count;
+    unicode_3_byte_group_t *subgroups;
+};
+
+typedef struct unicode_charclass_tree_s unicode_charclass_tree_t;
+struct unicode_charclass_tree_s {
+    int four_byte_count;
+    unicode_4_byte_group_t *four_byte_groups;
+    int three_byte_count;
+    unicode_3_byte_group_t *three_byte_groups;
+    int two_byte_count;
+    unicode_2_byte_group_t *two_byte_groups;
+    unsigned char *one_byte_bitmap;
+};
+
+/////////////////////////////////////////////////////////////////////////////
 
 typedef struct regex_vm_s regex_vm_t;
 struct regex_vm_s {
