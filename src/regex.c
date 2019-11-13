@@ -38,7 +38,7 @@
         \0 null char
         \x## hex byte
         \u#### unicode codepoint
-        \U##### unicode codepoint > 0xFFFF
+        \U##### unicode codepoint > 0xFFFF - TODO
         \d [0-9]
         \D [^0-9]
         \s [ \t\f\v\r\n]
@@ -56,7 +56,6 @@
         eTokenUnicodeLiteral
         eTokenAnyCharDotAll
         unicode db -> digits, whitespace, uppercase, lowercase, combining marks
-            use PCRE notation?: \p{__}
             \p{M} - combining mark (M_)
             \p{N} - numeric digit (N_)
             \p{P} - punctuation (P_)
@@ -124,11 +123,12 @@ Test: a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat abcdefgefgjfoo8167287catfoo
 
 typedef struct regex_vm_s regex_vm_t;
 struct regex_vm_s {
+    int vm_version;                 // VM machine version
     unsigned int *program;          // VM encoded regex pattern
     int size;                       // number of instructions in the program
     char **string_table;            // table of string literals used in the pattern
     int string_tbl_size;            // number of strings in the string table
-    unsigned int **class_table;    // table of character class bitmaps (32 bytes each)
+    unsigned int **class_table;     // table of character class bitmaps (32 bytes each)
     int class_tbl_size;             // number of bitmaps in the class table
     char **group_table;             // table of subexpression group names
     int group_tbl_size;             // number of groups in the group table
@@ -510,8 +510,21 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
                 result.state = eRegexPatternEscapedChar;
                 return result;
 
-            case 'u': // unicode codepoint
+            case 'u': // unicode codepoint (0 - 0xFFFF)
                 for(k = 0, result.c = 0; k < 4; k++) {
+                    (*pattern)++;
+                    result.c *= 16;
+                    if(parseIsHexdigit(**pattern)) {
+                        result.c += parseGetHexValue(**pattern);
+                    } else {
+                        return result;
+                    }
+                }
+                result.state = eRegexPatternUnicode;
+                return result;
+
+            case 'U': // unicode codepoint (0x010000 - 0x10FFFF)
+                for(k = 0, result.c = 0; k < 6; k++) {
                     (*pattern)++;
                     result.c *= 16;
                     if(parseIsHexdigit(**pattern)) {
@@ -585,6 +598,10 @@ void parsePatternCharAdvance(const char **pattern) {
         } else if((*(*pattern + 1) == 'u') && (*(*pattern + 2) != '\0') && (*(*pattern + 3) != '\0') &&
                   (*(*pattern + 4) != '\0') && (*(*pattern + 5) != '\0')) {
             *pattern += 6; // \u####
+        } else if((*(*pattern + 1) == 'U') && (*(*pattern + 2) != '\0') && (*(*pattern + 3) != '\0') &&
+                  (*(*pattern + 4) != '\0') && (*(*pattern + 5) != '\0') && (*(*pattern + 6) != '\0') &&
+                  (*(*pattern + 7) != '\0')) {
+            *pattern += 8; // \U######
         } else if((*(*pattern + 1) != '\0')) {
             *pattern += 2;
         }

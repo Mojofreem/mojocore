@@ -115,6 +115,12 @@ class PropertySet(object):
                     merged = True
 
     def generate_class_def(self, fp):
+        def escape_char(codepoint):
+            return 'u' if codepoint <= 0xFFFF else 'U'
+
+        def padding(codepoint):
+            return 4 if codepoint <= 0xFFFF else 6
+
         print("const char *{} = \"\"\\\n    \"".format(self._symbol), end='', file=fp)
         line = 8  # 4 leading spaces, open quote, close quote, at least 2 trailing spaces
 
@@ -124,7 +130,8 @@ class PropertySet(object):
             if line + size > MAX_LINE_LEN:
                 print("\"\\\n    \"", end='', file=fp)
                 line = 8
-            print("\\{2}{0:0{1}X}".format(codepoint, 4, 'u' if codepoint <= 0xFFFF else 'U'), end='', file=fp)
+            print("\\{2}{0:0{1}X}".format(codepoint, padding(codepoint),
+                                          escape_char(codepoint)), end='', file=fp)
             line += size
 
         for coderange in self._ranges:
@@ -135,9 +142,10 @@ class PropertySet(object):
             if line + size > MAX_LINE_LEN:
                 print("\"\\\n    \"", end='', file=fp)
                 line = 8
-            print("\\{4}{0:0{1}X}-\\{5}{2:0{3}X}".format(coderange.start(), 4, coderange.end(), 4,
-                                                         'u' if coderange.start() <= 0xFFFF else 'U',
-                                                         'u' if coderange.end() <= 0xFFFF else 'U'), end='', file=fp)
+            print("\\{4}{0:0{1}X}-\\{5}{2:0{3}X}".format(coderange.start(), padding(coderange.start()),
+                                                         coderange.end(), padding(coderange.end()),
+                                                         escape_char(coderange.start()),
+                                                         escape_char(coderange.end())), end='', file=fp)
             line += size
 
         print("\";\n", file=fp)
