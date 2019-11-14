@@ -53,9 +53,9 @@
         \p{L} - any unicode letter (L_)
         \p{Lu} - uppercase unicode letter (Lu)
         \p{Ll} - lowercase unicode letter (Ll)
+        \B - match a byte (differs from . in that it always matches a single byte, even '\n')
 
     TODO
-        \B byte (differs from ., in that the latter MAY match multibyte (UTF8))
         \X full unicode glyph (may be multiple chars)
         ^  start of string (assertion, non consuming)
         $  end of string (assertion, non consuming)
@@ -65,6 +65,12 @@
         eTokenAnyCharDotAll
         unicode utf8 classes
             build NFA from class tree
+        eTokenCharAny - prevent match on newline without DOTALL flag
+        eTokenCharAny - handle multibyte utf8
+        eTokenCharLiteral - handle inverse
+        eTokenCharAnyDotAll
+        eTokenCall
+        eTokenReturn
 
     (?P<name>...)  named subexpressions
     (?:...) non capturing subexpressions - TODO
@@ -504,6 +510,7 @@ int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
         case eTokenCharLiteral:
         case eTokenStringLiteral:
         case eTokenCharClass:
+        case eTokenByte:
         case eTokenCharAny:
             return 1;
         case eTokenZeroOrOne:
@@ -1978,11 +1985,16 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                 continue;
 
             case eRegexPatternMetaClass:
-                if(c.c == 'X') {
-                    // full unicode glyph (base + markers)
-                    // Represented by a micro NFA
-                    // TODO
-                    break;
+                switch(c.c) {
+                    case 'X': // full unicode glyph (base + markers)
+                        // Represented by a micro NFA
+                        // TODO
+                        continue;
+                    case 'B': // explicit byte
+                        if(!regexTokenCreate(tokens, eTokenByte, 0, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
                 }
                 switch(c.c) {
                     case 'd': // digit
@@ -2121,6 +2133,7 @@ eRegexTokenPriority regexGetTokenTypePriority(eRegexToken tokenType) {
         case eTokenCharClass:
         case eTokenStringLiteral:
         case eTokenCharAny:
+        case eTokenByte:
         case eTokenMatch:
         default:
             return ePriorityNone;
@@ -2511,6 +2524,7 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
             case eTokenCharClass:
             case eTokenStringLiteral:
             case eTokenCharAny:
+            case eTokenByte:
             case eTokenMatch:
                 if(!regexOperatorLiteralCreate(&operands, token)) {
                     SET_YARD_RESULT(eCompileOutOfMem);
@@ -3556,6 +3570,9 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
             }
             return eEvalMatch;
         case eTokenCharAny:
+            thread->pc++;
+            return eEvalMatch;
+        case eTokenByte:
             thread->pc++;
             return eEvalMatch;
         default:
