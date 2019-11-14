@@ -740,11 +740,10 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
                 return result;
 
             case 'u': // unicode codepoint (0 - 0xFFFF)
-                for(k = 0, result.c = 0; k < 4; k++) {
-                    (*pattern)++;
+                for(k = 2, result.c = 0; k <= 5; k++) {
                     result.c *= 16;
-                    if(parseIsHexdigit(**pattern)) {
-                        result.c += parseGetHexValue(**pattern);
+                    if(parseIsHexdigit(*(*pattern + k))) {
+                        result.c += parseGetHexValue(*(*pattern + k));
                     } else {
                         return result;
                     }
@@ -753,11 +752,10 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
                 return result;
 
             case 'U': // unicode codepoint (0x010000 - 0x10FFFF)
-                for(k = 0, result.c = 0; k < 6; k++) {
-                    (*pattern)++;
+                for(k = 2, result.c = 0; k < 7; k++) {
                     result.c *= 16;
-                    if(parseIsHexdigit(**pattern)) {
-                        result.c += parseGetHexValue(**pattern);
+                    if(parseIsHexdigit(*(*pattern + k))) {
+                        result.c += parseGetHexValue(*(*pattern + k));
                     } else {
                         return result;
                     }
@@ -1654,7 +1652,6 @@ int parseCharClassAndCreateToken(eRegexCompileStatus *status, const char **patte
     int range = 0;
     int last = 0;
     int k;
-    //int unicode = 0; // flag indicating unicode characters in the class
     utf8_charclass_tree_t *utf8tree = NULL;
 
     memset(bitmap, 0, 32);
@@ -2056,7 +2053,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                 continue;
 
             case eRegexPatternUnicodeMetaClass:
-                printf("utf8 class: %c%c\n", (c.c & 0xFF00) >> 8, c.c & 0xFF);
+                printf("utf8 class: %c%c\n", c.c & 0xFF, (((c.c & 0xFF00) >> 8) ? ((c.c & 0xFF00) >> 8) : '_'));
                 if(!parseUnicodeClassAndCreateToken(&status, c.c, tokens)) {
                     SET_RESULT(status);
                 }
