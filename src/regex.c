@@ -86,7 +86,7 @@
         allow unregistering unicode char classes
         tag meta char class -> char class -> vm path, for better runtime debug
 
-Regex VM Bytecode (v4)
+Regex VM Bytecode (v5)
 
     Each operation is encoded into a single 32 bit int value:
 
@@ -96,7 +96,7 @@ Regex VM Bytecode (v4)
         | Operand A    | Operand B    | Op |
 
     Operators:               opcode     Operand A               Operand B
-        eTokenCharLiteral       1       char to match
+        eTokenCharLiteral       1       char to match           inverse flag
         eTokenCharClass         2       class idx to match
         eTokenStringLiteral     3       str idx to match
         eTokenCharAny           4
@@ -104,25 +104,54 @@ Regex VM Bytecode (v4)
         eTokenSplit             6       program counter         program counter
         eTokenJmp               7       program counter
         eTokenSave              8       subexpression number
-        eTokenUtf8Class         9       0 - low byte            utf8 class idx to match
-                                        1 - single byte
-                                        2 - high two byte
-                                        3 - high three byte
-                                        4 - high four byte
+        eTokenUtf8Class         9       utf8 idx to match
         eTokenCharAnyDotAll     A
         eTokenCall              B       program counter
         eTokenReturn            C
-        eTokenNotCharLiteral    D       char not to match
+        eTokenByte              D
         <reserved>              E
         <reserved>              F
 
-    Note aboute eTokenCall: this is a subroutine extension that allows common
-    repeating sequences to be factored out into a subroutine. The evaluation
-    implementation is limited to an effective call depth of 1 (to limit thread
-    overhead), so nested calls are NOT allowed. The initial design consideration
-    for this feature was to reduce overhead when using unicode character classes,
-    as they consist of a small NFA grouping in and of themselves, due to the
-    large and distributed range of characters.
+    Note about eTokenCharLiteral:
+        Matches the character specified. If the inverse flag is set, the logic
+        is inverted, and the instruction matches any character EXCEPT the
+        character specified.
+
+    Note about eTokenCharAny:
+        If the DOTALL flag is enabled, the eTokenCharAnyDotAll is generated
+        instead. In ASCII mode, this instruction matches any character _except_
+        newline. In Unicode mode, this instruction matches a single unicode
+        codepoint, which MAY match multiple bytes, but again, does NOT match
+        newline.
+
+    Note about eTokenUtf8Class:
+        This instruction represents the low byte of a utf8 encoding (for 2, 3,
+        and 4 byte encodings). For single byte encodings, a standard char class
+        is used. Multibyte codepoint are represented by compound VM
+        instructions.
+
+    Note about eTokenCharAnyDotAll:
+        This instruction matches any character, including newline. In unicode
+        mode, this matches a single codepoint, which MAY match multiple bytes.
+
+    Note about eTokenCall:
+        This instruction allows common repeating sequences to be factored out
+        into a subroutine. The evaluation implementation is limited to an
+        effective call depth of 1 (to limit thread overhead), so nested calls
+        are NOT allowed. The initial design consideration for this feature was
+        to reduce overhead when using unicode character classes, as they
+        consist of a generated sub-pattern in and of themselves, due to the
+        large and distributed range of branching byte sequence dependencies.
+
+    Note about eTokenReturn:
+        This instruction returns to the next consecutive instruction following
+        a previously issued eTokenCall instruction. If no previous eTokenCall
+        was issued, the instruction is considered a non match.
+
+    Note about eTokenByte:
+        This instruction explicitly matches the any single byte. This differs
+        from both eTokenCharAny and eTokenCharAnyDotAll in that it always
+        matches newline, and always matches a single byte.
 
 All VM programs are prefixed with: TODO
 
@@ -143,7 +172,7 @@ output utf8 class table
 
 /////////////////////////////////////////////////////////////////////////////
 
-#define REGEX_VM_MACHINE_VERSION    4
+#define REGEX_VM_MACHINE_VERSION    5
 
 typedef struct regex_vm_s regex_vm_t;
 struct regex_vm_s {
@@ -325,6 +354,7 @@ typedef enum {
     eTokenCharAnyDotAll,
     eTokenCall,
     eTokenReturn,
+    eTokenByte,
     // Abstractions, reduced down to the above VM opcodes
     eTokenUtf8Literal,
     eTokenUtf8AnyChar,
@@ -1575,112 +1605,6 @@ unsigned int *charClassBitmapCopy(unsigned int *bitmap) {
     }
     memcpy(copy, bitmap, 32);
     return copy;
-}
-
-// TODO - integrate proper utf8 handling
-eRegexCompileStatus parseCharClass(const char **pattern, unsigned int *bitmap) {
-    parseChar_t c;
-    int invert = 0;
-    int range = 0;
-    int last = 0;
-    int next;
-
-    memset(bitmap, 0, 32);
-
-    c = parseGetNextPatternChar(pattern);
-    if(parsePatternIsValid(&c)) {
-        parsePatternCharAdvance(pattern);
-    }
-    if(c.state == eRegexPatternEnd) {
-        return eCompileCharClassIncomplete;
-    }
-
-    if(c.state == eRegexPatternMetaChar && c.c == '^') {
-        invert = 1;
-        c = parseGetNextPatternChar(pattern);
-        if(parsePatternIsValid(&c)) {
-            parsePatternCharAdvance(pattern);
-        }
-    }
-
-    for(;;) {
-        switch(c.state) {
-            case eRegexPatternInvalid:
-                return eCompileEscapeCharIncomplete;
-
-            case eRegexPatternInvalidEscape:
-                return eCompileInvalidEscapeChar;
-
-            case eRegexPatternChar:
-                if(c.c == ']') {
-                    if(range == 2) {
-                        return eCompileCharClassRangeIncomplete;
-                    }
-                    if(invert) {
-                        charClassBitmapInvert(bitmap);
-                    }
-                    return eCompileOk;
-                }
-                // intentional fall through
-            case eRegexPatternMetaChar:
-            case eRegexPatternEscapedChar:
-                if(range == 0) {
-                    last = c.c;
-                    charClassBitmapSet(bitmap, last);
-                    range = 1;
-                } else if(range == 1) {
-                    if(c.state != eRegexPatternEscapedChar && c.c == '-') {
-                        range = 2;
-                    } else {
-                        last = c.c;
-                        charClassBitmapSet(bitmap, last);
-                    }
-                } else {
-                    next = c.c;
-                    for(; last <= next; last++) {
-                        charClassBitmapSet(bitmap, last);
-                    }
-                    range = 0;
-                }
-                break;
-
-            case eRegexPatternUnicode:
-                // TODO - special case handling
-                break;
-
-            case eRegexPatternMetaClass:
-            case eRegexPatternUnicodeMetaClass:
-                return eCompileInvalidEscapeChar;
-
-            case eRegexPatternEnd:
-                if(range == 2) {
-                    return eCompileCharClassRangeIncomplete;
-                }
-                return eCompileCharClassIncomplete;
-        }
-        c = parseGetNextPatternChar(pattern);
-        if(parsePatternIsValid(&c)) {
-            parsePatternCharAdvance(pattern);
-        }
-    }
-}
-
-int parseCharClassAndCreateToken(eRegexCompileStatus *status, const char **pattern, regex_token_t **tokens) {
-    unsigned int bitmap[8], *ptr;
-
-    // Operand, character class
-    if((*status = parseCharClass(pattern, bitmap)) != eCompileOk) {
-        return 0;
-    }
-    if((ptr = charClassBitmapCopy(bitmap)) == NULL) {
-        *status = eCompileOutOfMem;
-        return 0;
-    }
-    if(!regexTokenCreate(tokens, eTokenCharClass, 0, (char *)ptr, 0)) {
-        *status = eCompileOutOfMem;
-        return 0;
-    }
-    return 1;
 }
 
 /*
@@ -3266,7 +3190,9 @@ void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
         fprintf(fp, "%3.3d  ", pc);
         switch(instr[0]) {
             case eTokenCharLiteral:
-                fprintf(fp, "char (%c:%d)\n", (instr[1] < 32 || instr[1] > 127) ? '-' : instr[1], instr[1]);
+                fprintf(fp, "char (%c:%d)%s\n",
+                        ((instr[1] < 32 || instr[1] > 127) ? '-' : instr[1]), instr[1],
+                        (instr[2] ? " inverted" : ""));
                 break;
             case eTokenStringLiteral:
                 fputs("string(\"", fp);
@@ -3309,6 +3235,9 @@ void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
                 break;
             case eTokenReturn:
                 fprintf(fp, "return\n");
+                break;
+            case eTokenByte:
+                fprintf(fp, "byte\n");
                 break;
             default:
                 fprintf(fp, "UNKNOWN [%d]!\n", instr[0]);
