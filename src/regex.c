@@ -53,6 +53,7 @@
         \p{L} - any unicode letter (L_)
         \p{Lu} - uppercase unicode letter (Lu)
         \p{Ll} - lowercase unicode letter (Ll)
+        \p{__} - any unicode property set, when registered with regexRegUnicodeCharClass()
         \B - match a byte (differs from . in that it always matches a single byte, even '\n')
 
     TODO
@@ -68,7 +69,6 @@
         eTokenCharAny - prevent match on newline without DOTALL flag
         eTokenCharAny - handle multibyte utf8
         eTokenCharLiteral - handle inverse
-        eTokenCharAnyDotAll
         eTokenCall
         eTokenReturn
 
@@ -79,18 +79,23 @@
 
     TODO
         subexpression meta prefix rework
-        multiple prefixes may be defined, but must be at the head of the subexpression
-        (?P<name>...) and (?:...) are mutually exclusive (why name something unused?)
-        (?:...) and (?*...) are mutually exclusive (compound non-captures?)
+        multiple prefixes may be defined, but must be at the head of the
+            subexpression. (?P<name>...) and (?:...) are mutually exclusive
+            (why name something unused?). (?:...) and (?*...) are mutually
+            exclusive (compound non-captures?). Additional meta's must include
+            their own unique '?' prefix, ie.: (?:?P<name>...)
         unicode character classes
         multipass char class parsing, to separate ascii and unicode handling
         unicode compilation toggle - do NOT generate unicode char classes in non
             unicode mode
 
     TODO: Future work (refining, not MVP critical)
-        mark predefined unicode char classes to prevent attempte dealloc
+        mark predefined unicode char classes to prevent attempted dealloc
         allow unregistering unicode char classes
         tag meta char class -> char class -> vm path, for better runtime debug
+        update unicode parser script to parse arbitrary property sets/groups
+        refactor unicode char class registration to a single struct type
+            current has independent class id and class str values
 
 Regex VM Bytecode (v5)
 
@@ -1482,7 +1487,7 @@ int parseUtf8TreeGenerateRange(utf8_charclass_tree_t *tree,
     return 1;
 }
 
-int parseUtf8CharClassRange(utf8_charclass_tree_t *tree, int code_a, int code_b) {
+int parseUtf8CharClassRangeSet(utf8_charclass_tree_t *tree, int code_a, int code_b) {
     unsigned char b_a[5], b_b[5], b_r[5], b_r2[5];
     int k;
 
@@ -1584,24 +1589,8 @@ void regexCharClassUtf8TreeFree(utf8_charclass_tree_t *tree) {
     _regexDealloc(tree, _regexMemContext);
 }
 
-void charClassBitmapSet(unsigned int *bitmap, int pos) {
-    unsigned int idx = pos / 32u;
-    unsigned int bit = pos % 32u;
-
-    bitmap[idx] |= (1u << bit);
-}
-
 int charClassBitmapCheck(const unsigned int *bitmap, int pos) {
-    unsigned int idx = pos / 32u;
-    unsigned int bit = pos % 32u;
-
-    return (int)(bitmap[idx] & (1u << bit));
-}
-
-void charClassBitmapInvert(unsigned int *bitmap) {
-    for(int k = 0; k < 8; k++) {
-        bitmap[k] ^= (unsigned int)0xFFFFFFFFu;
-    }
+    return (int)(bitmap[pos / 32u] & (1u << pos % 32u));
 }
 
 unsigned int *charClassBitmapCopy(unsigned int *bitmap) {
@@ -1614,38 +1603,58 @@ unsigned int *charClassBitmapCopy(unsigned int *bitmap) {
     return copy;
 }
 
-/*
-For the psuedo unicode char class:
+/////////////////////////////////////////////////////////////////////////////
+//
+//    For the psuedo unicode char class:
+//
+//        "\u000a\u0bcd-\u0bce\u0bfg\uhijk-\uhijl\uhmno"
+//
+//    A tree is generated:
+//
+//        1 byte: a
+//        3 byte: b->c->d
+//                b->c->e
+//                b->f->g
+//        4 byte: h->i->j->k
+//                h->i->j->l
+//                h->m->n->o
+//
+//    And a sub sequence pattern is generated:
+//
+//        (?:[a]|b(?:c(?:[d]|[e])|f[g])|h(?:ij(?:[k]|[l])|mn[o]))
+//
+/////////////////////////////////////////////////////////////////////////////
 
-    "\u000a\u0bcd-\u0bce\u0bfg\uhijk-\uhijl\uhmno"
+int parseCharClassBitmapSet(utf8_charclass_tree_t *tree, unsigned int *bitmap, int c) {
+    if((c > 127) && (tree != NULL)) {
+        return parseUtf8CharClassCodepoint(tree, c);
+    }
+    bitmap[c / 32u] |= (1u << (c % 32u));
+    return 1;
+}
 
-A tree is generated:
-
-    1 byte: a
-    3 byte: b->c->d
-            b->c->e
-            b->f->g
-    4 byte: h->i->j->k
-            h->i->j->l
-            h->m->n->o
-
-And a sub sequence pattern is generated:
-
-    (?:[a]|b(?:c(?:[d]|[e])|f[g])|h(?:ij(?:[k]|[l])|mn[o]))
-*/
+int parseCharClassBitmapRangeSet(utf8_charclass_tree_t *tree, unsigned int *bitmap, int a, int b) {
+    if((b > 127) && (tree != NULL)) {
+        return parseUtf8CharClassRangeSet(tree, a, b);
+    }
+    for(; a <= b; a++) {
+        bitmap[a / 32u] |= (1u << (a % 32u));
+    }
+    return 1;
+}
 
 // The embedded flag indicates whether this class pattern is within the context
 // of an actual pattern expression, or is just the content of the pattern, from
 // a secodary source. An embedded pattern ends at the required ']' delimiter,
 // whereas a non embedded pattern does not contain a trailing delimiter.
-int parseCharClassAndCreateToken2(eRegexCompileStatus *status, const char **pattern, int embedded, regex_token_t **tokens) {
+int parseCharClassAndCreateToken(eRegexCompileStatus *status, const char **pattern, int embedded, regex_token_t **tokens) {
     unsigned int bitmap[8], *ptr;
     parseChar_t c;
     int invert = 0;
     int range = 0;
     int last = 0;
-    int next;
-    int unicode = 0; // flag indicating unicode characters in the class
+    int k;
+    //int unicode = 0; // flag indicating unicode characters in the class
     utf8_charclass_tree_t *utf8tree = NULL;
 
     memset(bitmap, 0, 32);
@@ -1684,7 +1693,6 @@ int parseCharClassAndCreateToken2(eRegexCompileStatus *status, const char **patt
                         return 0;
                     }
                     memset(utf8tree, 0, sizeof(utf8_charclass_tree_t));
-                    unicode = 1;
                 }
                 // intentional fall through
 
@@ -1702,19 +1710,25 @@ int parseCharClassAndCreateToken2(eRegexCompileStatus *status, const char **patt
             case eRegexPatternEscapedChar:
                 if(range == 0) {
                     last = c.c;
-                    charClassBitmapSet(bitmap, last);
+                    if(!parseCharClassBitmapSet(utf8tree, bitmap, last)) {
+                        *status = eCompileOutOfMem;
+                        return 0;
+                    }
                     range = 1;
                 } else if(range == 1) {
                     if(c.state != eRegexPatternEscapedChar && c.c == '-') {
                         range = 2;
                     } else {
                         last = c.c;
-                        charClassBitmapSet(bitmap, last);
+                        if(!parseCharClassBitmapSet(utf8tree, bitmap, last)) {
+                            *status = eCompileOutOfMem;
+                            return 0;
+                        }
                     }
                 } else {
-                    next = c.c;
-                    for(; last <= next; last++) {
-                        charClassBitmapSet(bitmap, last);
+                    if(!parseCharClassBitmapRangeSet(utf8tree, bitmap, last, c.c)) {
+                        *status = eCompileOutOfMem;
+                        return 0;
                     }
                     range = 0;
                 }
@@ -1744,14 +1758,27 @@ int parseCharClassAndCreateToken2(eRegexCompileStatus *status, const char **patt
 
 parseClassCompleted:
 
-    if(unicode) {
-        // TODO: Check bitmap for unicode overlap. If none, include BOTH utf8
-        //       class AND regular char class. If overlap, transfer char class
-        //       content to utf8 class
+    if(utf8tree != NULL) {
+        // Merge any entries in the single byte bitmap into the utf8 tree
+        for(k = 0; k < 256; k++) {
+            if(bitmap[k / 32u] & (1u << k % 32u)) {
+                utf8tree->one_byte[k / 8u] |= (1u << (k % 8u));
+            }
+        }
+
+        if(invert) {
+            for(k = 0; k < 32; k++) {
+                utf8tree->one_byte[k] ^= 0xFF;
+            }
+        }
+
+        // TODO: generate sub-pattern for the utf8 char class
     } else {
         // Strictly single byte, use a regular char class only
         if(invert) {
-            charClassBitmapInvert(bitmap);
+            for(k = 0; k < 8; k++) {
+                bitmap[k] ^= (unsigned int)0xFFFFFFFFu;
+            }
         }
 
         if((ptr = charClassBitmapCopy(bitmap)) == NULL) {
@@ -1781,7 +1808,7 @@ int parseUnicodeClassAndCreateToken(eRegexCompileStatus *status, int unicodeClas
         return 0;
     }
 
-    return parseCharClassAndCreateToken2(status, &classStr, 0, tokens);
+    return parseCharClassAndCreateToken(status, &classStr, 0, tokens);
 }
 
 void regexPrintCharClassToFP(FILE *fp, unsigned int *bitmap) {
@@ -1903,7 +1930,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         continue;
 
                     case '[':
-                        if(!parseCharClassAndCreateToken2(&status, &pattern, 1, tokens)) {
+                        if(!parseCharClassAndCreateToken(&status, &pattern, 1, tokens)) {
                             SET_RESULT(status);
                         }
                         continue;
@@ -2023,7 +2050,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         class = META_CLASS_INV(META_WORD_PATTERN);
                         break;
                 }
-                if(!parseCharClassAndCreateToken2(&status, &class, 0, tokens)) {
+                if(!parseCharClassAndCreateToken(&status, &class, 0, tokens)) {
                     SET_RESULT(status);
                 }
                 continue;
