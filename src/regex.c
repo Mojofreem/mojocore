@@ -71,11 +71,20 @@
     (?*...) compound subexpressions - TODO
     (?i) case insensitive match - TODO
 
-Todo:
-    unicode character classes
-    multipass char class parsing, to separate ascii and unicode handling
-    unicode compilation toggle - do NOT generate unicode char classes in non
-        unicode mode
+    TODO
+        subexpression meta prefix rework
+        multiple prefixes may be defined, but must be at the head of the subexpression
+        (?P<name>...) and (?:...) are mutually exclusive (why name something unused?)
+        (?:...) and (?*...) are mutually exclusive (compound non-captures?)
+        unicode character classes
+        multipass char class parsing, to separate ascii and unicode handling
+        unicode compilation toggle - do NOT generate unicode char classes in non
+            unicode mode
+
+    TODO: Future work (refining, not MVP critical)
+        mark predefined unicode char classes to prevent attempte dealloc
+        allow unregistering unicode char classes
+        tag meta char class -> char class -> vm path, for better runtime debug
 
 Regex VM Bytecode (v4)
 
@@ -101,11 +110,19 @@ Regex VM Bytecode (v4)
                                         3 - high three byte
                                         4 - high four byte
         eTokenCharAnyDotAll     A
-        <reserved>              B
-        <reserved>              C
-        <reserved>              D
+        eTokenCall              B       program counter
+        eTokenReturn            C
+        eTokenNotCharLiteral    D       char not to match
         <reserved>              E
         <reserved>              F
+
+    Note aboute eTokenCall: this is a subroutine extension that allows common
+    repeating sequences to be factored out into a subroutine. The evaluation
+    implementation is limited to an effective call depth of 1 (to limit thread
+    overhead), so nested calls are NOT allowed. The initial design consideration
+    for this feature was to reduce overhead when using unicode character classes,
+    as they consist of a small NFA grouping in and of themselves, due to the
+    large and distributed range of characters.
 
 All VM programs are prefixed with: TODO
 
@@ -290,10 +307,11 @@ void crc32(const void *data, size_t n_bytes, uint32_t* crc) {
 #define META_WHITESPACE_PATTERN " \\t\\f\\v\\r\\n"
 #define META_WORD_PATTERN       "a-zA-Z0-9_"
 
-#define META_CLASS(pattern)     pattern "]"
-#define META_CLASS_INV(pattern) "^" pattern "]"
+#define META_CLASS(pattern)     pattern
+#define META_CLASS_INV(pattern) "^" pattern
 
 typedef enum {
+    // Maps directly to VM opcodes
     eTokenNone,
     eTokenCharLiteral,
     eTokenCharClass,
@@ -305,6 +323,9 @@ typedef enum {
     eTokenSave,
     eTokenUtf8Class,
     eTokenCharAnyDotAll,
+    eTokenCall,
+    eTokenReturn,
+    // Abstractions, reduced down to the above VM opcodes
     eTokenUtf8Literal,
     eTokenUtf8AnyChar,
     eTokenConcatenation,
@@ -331,9 +352,10 @@ struct regex_token_s {
         char *str;
         unsigned int *bitmap;
         int group;
+        regex_token_t *sub_sequence;
     };
-    int pc;
-    int len;
+    int pc; // program counter index, for NFA -> VM
+    int len; // string length, to allow embedded \0 chars
     regex_token_t *out_a;
     regex_token_t *out_b;
     regex_token_t *next;
@@ -1661,6 +1683,160 @@ int parseCharClassAndCreateToken(eRegexCompileStatus *status, const char **patte
     return 1;
 }
 
+/*
+For the psuedo unicode char class:
+
+    "\u000a\u0bcd-\u0bce\u0bfg\uhijk-\uhijl\uhmno"
+
+A tree is generated:
+
+    1 byte: a
+    3 byte: b->c->d
+            b->c->e
+            b->f->g
+    4 byte: h->i->j->k
+            h->i->j->l
+            h->m->n->o
+
+And a sub sequence pattern is generated:
+
+    (?:[a]|b(?:c(?:[d]|[e])|f[g])|h(?:ij(?:[k]|[l])|mn[o]))
+*/
+
+// The embedded flag indicates whether this class pattern is within the context
+// of an actual pattern expression, or is just the content of the pattern, from
+// a secodary source. An embedded pattern ends at the required ']' delimiter,
+// whereas a non embedded pattern does not contain a trailing delimiter.
+int parseCharClassAndCreateToken2(eRegexCompileStatus *status, const char **pattern, int embedded, regex_token_t **tokens) {
+    unsigned int bitmap[8], *ptr;
+    parseChar_t c;
+    int invert = 0;
+    int range = 0;
+    int last = 0;
+    int next;
+    int unicode = 0; // flag indicating unicode characters in the class
+    utf8_charclass_tree_t *utf8tree = NULL;
+
+    memset(bitmap, 0, 32);
+
+    c = parseGetNextPatternChar(pattern);
+    if(parsePatternIsValid(&c)) {
+        parsePatternCharAdvance(pattern);
+    }
+    if(c.state == eRegexPatternEnd) {
+        *status = eCompileCharClassIncomplete;
+        return 0;
+    }
+
+    if(c.state == eRegexPatternMetaChar && c.c == '^') {
+        invert = 1;
+        c = parseGetNextPatternChar(pattern);
+        if(parsePatternIsValid(&c)) {
+            parsePatternCharAdvance(pattern);
+        }
+    }
+
+    for(;;) {
+        switch(c.state) {
+            case eRegexPatternInvalid:
+                *status = eCompileEscapeCharIncomplete;
+                return 0;
+
+            case eRegexPatternInvalidEscape:
+                *status = eCompileInvalidEscapeChar;
+                return 0;
+
+            case eRegexPatternUnicode:
+                if(utf8tree == NULL) {
+                    if((utf8tree = _regexAlloc(sizeof(utf8_charclass_tree_t), _regexMemContext)) == NULL) {
+                        *status = eCompileOutOfMem;
+                        return 0;
+                    }
+                    memset(utf8tree, 0, sizeof(utf8_charclass_tree_t));
+                    unicode = 1;
+                }
+                // intentional fall through
+
+            case eRegexPatternChar:
+                if(c.c == ']') {
+                    if(range == 2) {
+                        *status = eCompileCharClassRangeIncomplete;
+                        return 0;
+                    }
+                    goto parseClassCompleted;
+                }
+                // intentional fall through
+
+            case eRegexPatternMetaChar:
+            case eRegexPatternEscapedChar:
+                if(range == 0) {
+                    last = c.c;
+                    charClassBitmapSet(bitmap, last);
+                    range = 1;
+                } else if(range == 1) {
+                    if(c.state != eRegexPatternEscapedChar && c.c == '-') {
+                        range = 2;
+                    } else {
+                        last = c.c;
+                        charClassBitmapSet(bitmap, last);
+                    }
+                } else {
+                    next = c.c;
+                    for(; last <= next; last++) {
+                        charClassBitmapSet(bitmap, last);
+                    }
+                    range = 0;
+                }
+                break;
+
+            case eRegexPatternMetaClass:
+            case eRegexPatternUnicodeMetaClass:
+                *status = eCompileInvalidEscapeChar;
+                return 0;
+
+            case eRegexPatternEnd:
+                if(range == 2) {
+                    *status = eCompileCharClassRangeIncomplete;
+                    return 0;
+                }
+                if(!embedded) {
+                    goto parseClassCompleted;
+                }
+                *status = eCompileCharClassIncomplete;
+                return 0;
+        }
+        c = parseGetNextPatternChar(pattern);
+        if(parsePatternIsValid(&c)) {
+            parsePatternCharAdvance(pattern);
+        }
+    }
+
+parseClassCompleted:
+
+    if(unicode) {
+        // TODO: Check bitmap for unicode overlap. If none, include BOTH utf8
+        //       class AND regular char class. If overlap, transfer char class
+        //       content to utf8 class
+    } else {
+        // Strictly single byte, use a regular char class only
+        if(invert) {
+            charClassBitmapInvert(bitmap);
+        }
+
+        if((ptr = charClassBitmapCopy(bitmap)) == NULL) {
+            *status = eCompileOutOfMem;
+            return 0;
+        }
+
+        if(!regexTokenCreate(tokens, eTokenCharClass, 0, (char *)ptr, 0)) {
+            *status = eCompileOutOfMem;
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 int parseUnicodeClassAndCreateToken(eRegexCompileStatus *status, int unicodeClass, regex_token_t **tokens) {
     char classId[3];
     const char *classStr;
@@ -1674,14 +1850,7 @@ int parseUnicodeClassAndCreateToken(eRegexCompileStatus *status, int unicodeClas
         return 0;
     }
 
-    /*
-
-    char literal
-    alternative
-    utf8 class
-
-    */
-    return 1;
+    return parseCharClassAndCreateToken2(status, &classStr, 0, tokens);
 }
 
 void regexPrintCharClassToFP(FILE *fp, unsigned int *bitmap) {
@@ -1699,10 +1868,6 @@ void regexPrintCharClassToFP(FILE *fp, unsigned int *bitmap) {
             }
         }
     }
-}
-
-void regexPrintCharClass(unsigned int *bitmap) {
-    regexPrintCharClassToFP(stdout, bitmap);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1807,7 +1972,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         continue;
 
                     case '[':
-                        if(!parseCharClassAndCreateToken(&status, &pattern, tokens)) {
+                        if(!parseCharClassAndCreateToken2(&status, &pattern, 1, tokens)) {
                             SET_RESULT(status);
                         }
                         continue;
@@ -1889,58 +2054,43 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                 continue;
 
             case eRegexPatternMetaClass:
+                if(c.c == 'X') {
+                    // full unicode glyph (base + markers)
+                    // Represented by a micro NFA
+                    // TODO
+                    break;
+                }
                 switch(c.c) {
                     case 'd': // digit
                         class = META_CLASS(META_DIGITS_PATTERN);
-                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
-                            SET_RESULT(status);
-                        }
-                        continue;
+                        break;
 
                     case 'D': // non digit
                         class = META_CLASS_INV(META_DIGITS_PATTERN);
-                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
-                            SET_RESULT(status);
-                        }
-                        continue;
+                        break;
 
                     case 's': // whitespace
                         class = META_CLASS(META_WHITESPACE_PATTERN);
-                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
-                            SET_RESULT(status);
-                        }
-                        continue;
+                        break;
 
                     case 'S': // non whitespace
                         class = META_CLASS_INV(META_WHITESPACE_PATTERN);
-                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
-                            SET_RESULT(status);
-                        }
-                        continue;
+                        break;
 
                     case 'w': // word character
                         // TODO: derive from the unicode DB
                         class = META_CLASS(META_WORD_PATTERN);
-                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
-                            SET_RESULT(status);
-                        }
-                        continue;
+                        break;
 
                     case 'W': // non word character
                         // TODO: derive from the unicode DB
-                        // Derived from the unicode DB
                         class = META_CLASS_INV(META_WORD_PATTERN);
-                        if(!parseCharClassAndCreateToken(&status, &class, tokens)) {
-                            SET_RESULT(status);
-                        }
-                        continue;
-
-                    case 'X': // full unicode glyph (base + markers)
-                        // Represented by a micro NFA
-                        // TODO
                         break;
                 }
-                break;
+                if(!parseCharClassAndCreateToken2(&status, &class, 0, tokens)) {
+                    SET_RESULT(status);
+                }
+                continue;
 
             case eRegexPatternUnicodeMetaClass:
                 printf("utf8 class: %c%c\n", (c.c & 0xFF00) >> 8, c.c & 0xFF);
@@ -3148,9 +3298,22 @@ void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
             case eTokenJmp:
                 fprintf(fp, "jmp %d\n", instr[1]);
                 break;
+            case eTokenUtf8Class:
+                fprintf(fp, "utf8 [%d]\n", instr[1]);
+                break;
+            case eTokenCharAnyDotAll:
+                fprintf(fp, "anybyte\n");
+                break;
+            case eTokenCall:
+                fprintf(fp, "call %d\n", instr[1]);
+                break;
+            case eTokenReturn:
+                fprintf(fp, "return\n");
+                break;
             default:
                 fprintf(fp, "UNKNOWN [%d]!\n", instr[0]);
-                return;        }
+                return;
+        }
     }
 }
 
