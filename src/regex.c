@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "unicode_props.c"
 
 /*
     Flags (TODO)
@@ -38,7 +39,7 @@
         \0 null char
         \x## hex byte
         \u#### unicode codepoint
-        \U##### unicode codepoint > 0xFFFF - TODO
+        \U##### unicode codepoint > 0xFFFF
         \d [0-9]
         \D [^0-9]
         \s [ \t\f\v\r\n]
@@ -53,7 +54,6 @@
         $  end of string (assertion, non consuming)
         \< match start of word (assertion, non consuming)
         \> match end of word (assertion, non consuming)
-        \0 handle properly in string literals, and regex evaluation text
         eTokenUnicodeLiteral
         eTokenAnyCharDotAll
         unicode db -> digits, whitespace, uppercase, lowercase, combining marks
@@ -64,8 +64,8 @@
             \p{L} - any unicode letter (L_)
             \p{Lu} - uppercase unicode letter (Lu)
             \p{Ll} - lowercase unicode letter (Ll)
-        implement null compensating match
-        implement null in capture strings
+        update unicode parser to declare strings as [], not *
+        update unicdoe parser to escape the escape sequences
 
     (?P<name>...)  named subexpressions
     (?:...) non capturing subexpressions - TODO
@@ -73,8 +73,7 @@
     (?i) case insensitive match - TODO
 
 Todo:
-    properly handle unicode chars (we decode the escape value, but the lexer
-        does not properly deal with the multiple bytes)
+    unicode character classes
     multipass char class parsing, to separate ascii and unicode handling
     unicode compilation toggle - do NOT generate unicode char classes in non
         unicode mode
@@ -120,10 +119,6 @@ All VM programs are prefixed with: TODO
 
 Test: a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat abcdefgefgjfoo8167287catfoo
 
-clean up source output formatting
-generate string len table
-output string len table
-use string length table when evaluating pattern
 create utf8 class table
 output utf8 class table
 */
@@ -298,15 +293,6 @@ void crc32(const void *data, size_t n_bytes, uint32_t* crc) {
 #define META_CLASS(pattern)     pattern "]"
 #define META_CLASS_INV(pattern) "^" pattern "]"
 
-const char *unicode_combining_marks;
-const char *unicode_numeric;
-const char *unicode_punctuation;
-const char *unicode_whitespace;
-const char *unicode_letter;
-const char *unicode_uppercase;
-const char *unicode_lowercase;
-
-
 typedef enum {
     eTokenNone,
     eTokenCharLiteral,
@@ -360,13 +346,103 @@ struct regex_vm_build_s {
     unsigned int flags;
     int string_tbl_count;
     int class_tbl_count;
-    int ut8_tbl_count;
+    int utf8_tbl_count;
     int group_tbl_count;
     int groups;
     int pc;
 };
 
 int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int len, int index);
+
+/////////////////////////////////////////////////////////////////////////////
+// Unicode char class registration functions
+/////////////////////////////////////////////////////////////////////////////
+
+typedef struct regex_unicode_charclass_entry_s regex_unicode_charclass_entry_t;
+struct regex_unicode_charclass_entry_s {
+    char id[3];
+    const char *class_str;
+    regex_unicode_charclass_entry_t *next;
+};
+
+regex_unicode_charclass_entry_t _utf8_class_M_ = {
+        .id = "M",
+        .class_str = unicode_combining_marks,
+        .next = NULL
+};
+
+regex_unicode_charclass_entry_t _utf8_class_N_ = {
+        .id = "N",
+        .class_str = unicode_numeric,
+        .next = &_utf8_class_M_
+};
+
+regex_unicode_charclass_entry_t _utf8_class_P_ = {
+        .id = "P",
+        .class_str = unicode_punctuation,
+        .next = &_utf8_class_N_
+};
+
+regex_unicode_charclass_entry_t _utf8_class_Z_ = {
+        .id = "Z",
+        .class_str = unicode_whitespace,
+        .next = &_utf8_class_P_
+};
+
+regex_unicode_charclass_entry_t _utf8_class_Lu = {
+        .id = "Lu",
+        .class_str = unicode_uppercase,
+        .next = &_utf8_class_Z_
+};
+
+regex_unicode_charclass_entry_t _utf8_class_Ll = {
+        .id = "Ll",
+        .class_str = unicode_lowercase,
+        .next = &_utf8_class_Lu
+};
+
+regex_unicode_charclass_entry_t _utf8_class_L_ = {
+        .id = "L",
+        .class_str = unicode_letter,
+        .next = &_utf8_class_Ll
+};
+
+regex_unicode_charclass_entry_t *_regex_unicode_charclass_registry = &_utf8_class_L_;
+
+int regexRegUnicodeCharClass(const char *classId, const char *classStr) {
+    regex_unicode_charclass_entry_t *entry, *walk;
+
+    if((classId[0] == '\0') || ((classId[1] != '\0') && (classId[2] != '\0'))) {
+        return 0;
+    }
+
+    if((entry = _regexAlloc(sizeof(regex_unicode_charclass_entry_t), _regexMemContext)) == NULL) {
+        return 0;
+    }
+    memset(entry, 0, sizeof(regex_unicode_charclass_entry_t));
+    entry->id[0] = classId[0];
+    entry->id[1] = classId[1];
+    entry->id[2] = '\0';
+    entry->class_str = classStr;
+    if(_regex_unicode_charclass_registry == NULL) {
+        _regex_unicode_charclass_registry = entry;
+    } else {
+        for(walk = _regex_unicode_charclass_registry; walk->next != NULL; walk = walk->next);
+        walk->next = entry;
+    }
+    return 1;
+}
+
+const char *regexGetUnicodeCharClass(const char *classId) {
+    regex_unicode_charclass_entry_t *entry;
+
+    for(entry = _regex_unicode_charclass_registry; entry != NULL; entry = entry->next) {
+        if((classId[0] == entry->id[0]) && (classId[1] == entry->id[1])) {
+            return entry->class_str;
+        }
+    }
+    return NULL;
+}
 
 /////////////////////////////////////////////////////////////////////////////
 // Token management functions
@@ -495,6 +571,7 @@ typedef enum {
     eRegexPatternInvalidEscape,
     eRegexPatternMetaChar,
     eRegexPatternMetaClass,
+    eRegexPatternUnicodeMetaClass,
     eRegexPatternEscapedChar
 } eRegexPatternCharState;
 
@@ -522,12 +599,22 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
                 result.state = eRegexPatternInvalid;
                 return result;
 
+//            case 'p': // unicode class
+//                if(*(*pattern + 2) == '{') {
+//                    switch(*(*pattern + 3)) {
+//                        case '\0':
+//                            result.state = eRegexPatternInvalid;
+//                            return result;
+//                        case 'M':
+//                    }
+//                }
             case 'd': // digit
             case 'D': // non digit
             case 's': // whitespace
             case 'S': // non whitespace
             case 'w': // word character
             case 'W': // non word character
+            case 'B': // explicit byte match
             case 'X': // full unicode glyph (base + markers)
                 result.state = eRegexPatternMetaClass;
                 result.c = *(*pattern + 1);
@@ -796,6 +883,7 @@ int parseGetPatternStrLen(const char **pattern) {
         switch(c.state) {
             case eRegexPatternEnd:
             case eRegexPatternMetaChar:
+            case eRegexPatternUnicodeMetaClass:
             case eRegexPatternMetaClass:
                 return (int)(utf8 ? ((utf8 << 16u) | count) : count);
 
@@ -1505,6 +1593,7 @@ eRegexCompileStatus parseCharClass(const char **pattern, unsigned int *bitmap) {
                 break;
 
             case eRegexPatternMetaClass:
+            case eRegexPatternUnicodeMetaClass:
                 return eCompileInvalidEscapeChar;
 
             case eRegexPatternEnd:
@@ -1777,6 +1866,10 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         // TODO
                         break;
                 }
+                break;
+
+            case eRegexPatternUnicodeMetaClass:
+                // TODO - handle unicode property classes
                 break;
 
             case eRegexPatternChar:
@@ -2370,6 +2463,8 @@ eRegexCompileStatus regexShuntingYard(regex_token_t **tokens) {
 // Regex VM builder and evaluator
 /////////////////////////////////////////////////////////////////////////////
 
+// String table /////////////////////////////////////////////////////////////
+
 void regexVMStringTableFree(regex_vm_t *vm) {
     int k;
     if(vm->string_table != NULL) {
@@ -2429,6 +2524,8 @@ const char *regexVMStringTableEntryGet(regex_vm_t *vm, int string_table_id, int 
     return vm->string_table[string_table_id];
 }
 
+// Class table //////////////////////////////////////////////////////////////
+
 void regexVMClassTableFree(regex_vm_t *vm) {
     int k;
     if(vm->class_table != NULL) {
@@ -2475,6 +2572,57 @@ const unsigned int *regexVMClassTableEntryGet(regex_vm_t *vm, int class_table_id
     }
     return vm->class_table[class_table_id];
 }
+
+// Class table //////////////////////////////////////////////////////////////
+
+void regexVMUtf8TableFree(regex_vm_t *vm) {
+    int k;
+    if(vm->utf8_class_table != NULL) {
+        for(k = 0; k < vm->utf8_tbl_size; k++) {
+            if(vm->utf8_class_table[k] != NULL) {
+                _regexDealloc(vm->utf8_class_table[k], _regexMemContext);
+            }
+        }
+        _regexDealloc(vm->utf8_class_table, _regexMemContext);
+    }
+    vm->utf8_class_table = NULL;
+    vm->utf8_tbl_size = 0;
+}
+
+int regexVMUtf8TableEntryAdd(regex_vm_build_t *build, const unsigned int *bitmap) {
+    int index;
+
+    for(index = 0; index < build->utf8_tbl_count; index++) {
+        if(!memcmp(build->vm->utf8_class_table[index], bitmap, 8)) {
+            return index;
+        }
+    }
+
+    if(build->vm->utf8_tbl_size <= build->utf8_tbl_count ) {
+        if((build->vm->utf8_class_table = _regexRealloc(build->vm->utf8_class_table, (build->vm->utf8_tbl_size + DEF_VM_STRTBL_INC) * sizeof(unsigned int *), _regexMemContext)) == NULL) {
+            return -1;
+        }
+        memset(build->vm->utf8_class_table + build->vm->utf8_tbl_size, 0, DEF_VM_STRTBL_INC * sizeof(unsigned int *));
+        build->vm->utf8_tbl_size += DEF_VM_STRTBL_INC;
+    }
+
+    if((build->vm->utf8_class_table[build->utf8_tbl_count] = _regexAlloc(8, _regexMemContext)) == NULL) {
+        return -1;
+    }
+    memcpy(build->vm->utf8_class_table[build->utf8_tbl_count], bitmap, 8);
+    index = build->utf8_tbl_count;
+    build->utf8_tbl_count++;
+    return index;
+}
+
+const unsigned int *regexVMUtf8TableEntryGet(regex_vm_t *vm, int utf8_table_id) {
+    if(utf8_table_id >= vm->utf8_tbl_size) {
+        return NULL;
+    }
+    return vm->utf8_class_table[utf8_table_id];
+}
+
+// Group table //////////////////////////////////////////////////////////////
 
 void regexVMGroupTableFree(regex_vm_t *vm) {
     int k;
@@ -3475,7 +3623,7 @@ int main(int argc, char **argv) {
             }
 
             //regexVMGenerateDeclaration(result.vm, "myparser", stdout);
-            //regexVMGenerateDefinition(result.vm, "myparser", stdout);
+            regexVMGenerateDefinition(result.vm, "myparser", stdout);
         }
     }
 

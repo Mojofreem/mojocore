@@ -121,28 +121,28 @@ class PropertySet(object):
         def padding(codepoint):
             return 4 if codepoint <= 0xFFFF else 6
 
-        print("const char *{} = \"\"\\\n    \"".format(self._symbol), end='', file=fp)
+        print("const char {}[] =\n    \"".format(self._symbol), end='', file=fp)
         line = 8  # 4 leading spaces, open quote, close quote, at least 2 trailing spaces
 
         for codepoint in self._codepoints:
-            # Codepoints are 6/7 chars: \u#####
-            size = 6 if codepoint <= 0xFFFF else 7
+            # Codepoints are 7/9 chars: \\u#### | \\U######
+            size = 7 if codepoint <= 0xFFFF else 9
             if line + size > MAX_LINE_LEN:
                 print("\"\\\n    \"", end='', file=fp)
                 line = 8
-            print("\\{2}{0:0{1}X}".format(codepoint, padding(codepoint),
+            print("\\\\{2}{0:0{1}X}".format(codepoint, padding(codepoint),
                                           escape_char(codepoint)), end='', file=fp)
             line += size
 
         for coderange in self._ranges:
-            # Ranges are 13 chars: \u####-\u####
-            size = 6 if coderange.start() <= 0xFFFF else 7
-            size += 6 if coderange.end() <= 0xFFFF else 7
+            # Ranges are 15-19 chars: \\u####-\\u#### | \\U######-\\U######
+            size = 7 if coderange.start() <= 0xFFFF else 9
+            size += 7 if coderange.end() <= 0xFFFF else 9
             size += 1
             if line + size > MAX_LINE_LEN:
                 print("\"\\\n    \"", end='', file=fp)
                 line = 8
-            print("\\{4}{0:0{1}X}-\\{5}{2:0{3}X}".format(coderange.start(), padding(coderange.start()),
+            print("\\\\{4}{0:0{1}X}-\\\\{5}{2:0{3}X}".format(coderange.start(), padding(coderange.start()),
                                                          coderange.end(), padding(coderange.end()),
                                                          escape_char(coderange.start()),
                                                          escape_char(coderange.end())), end='', file=fp)
