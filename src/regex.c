@@ -3080,7 +3080,11 @@ regex_eval_t *regexEvalCreate(regex_vm_t *vm, const char *pattern, int len) {
 
     eval->vm = vm;
     eval->sp = pattern;
-    eval->len = len;
+    if(len == REGEX_STR_NULL_TERMINATED) {
+        eval->len = strlen(pattern);
+    } else {
+        eval->len = len;
+    }
 
     return eval;
 }
@@ -3320,7 +3324,7 @@ FoundMatch:
     memset(match, 0, sizeof(regex_match_t));
     match->vm = vm;
     match->text = text;
-    match->len = len;
+    match->len = eval->len;
     match->pos = eval->sp;
     for(k = 0; k < (vm->group_tbl_size * 2); k++) {
         match->subexprs[k] = thread->subexprs[k];
@@ -3462,11 +3466,9 @@ int main(int argc, char **argv) {
             regexVMPrintProgram(stdout, result.vm);
             printf("-------------------------\n");
 
-            //if((match = regexMatch(result.vm, argv[2], 24 /*strlen(argv[2])*/, 0)) == NULL) {
-
-            if((match = regexMatch(result.vm, test, 24 /*strlen(argv[2])*/, 0)) == NULL) {
+            if((match = regexMatch(result.vm, argv[2], REGEX_STR_NULL_TERMINATED, 0)) == NULL) {
                 printf("No match\n");
-                //return 1;
+                return 1;
             } else {
                 regexDumpMatch(match);
                 regexMatchFree(match);
