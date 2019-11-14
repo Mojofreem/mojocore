@@ -53,6 +53,7 @@
         $  end of string (assertion, non consuming)
         \< match start of word (assertion, non consuming)
         \> match end of word (assertion, non consuming)
+        \0 handle properly in string literals, and regex evaluation text
         eTokenUnicodeLiteral
         eTokenAnyCharDotAll
         unicode db -> digits, whitespace, uppercase, lowercase, combining marks
@@ -63,7 +64,8 @@
             \p{L} - any unicode letter (L_)
             \p{Lu} - uppercase unicode letter (Lu)
             \p{Ll} - lowercase unicode letter (Ll)
-        add version to VM struct
+        implement null compensating match
+        implement null in capture strings
 
     (?P<name>...)  named subexpressions
     (?:...) non capturing subexpressions - TODO
@@ -77,7 +79,7 @@ Todo:
     unicode compilation toggle - do NOT generate unicode char classes in non
         unicode mode
 
-Regex VM Bytecode (v3)
+Regex VM Bytecode (v4)
 
     Each operation is encoded into a single 32 bit int value:
 
@@ -117,11 +119,20 @@ All VM programs are prefixed with: TODO
     full match is requested, execution begins at 3.
 
 Test: a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat abcdefgefgjfoo8167287catfoo
+
+clean up source output formatting
+generate string len table
+output string len table
+use string length table when evaluating pattern
+create utf8 class table
+output utf8 class table
 */
+
+
 
 /////////////////////////////////////////////////////////////////////////////
 
-#define REGEX_VM_MACHINE_VERSION    3
+#define REGEX_VM_MACHINE_VERSION    4
 
 typedef struct regex_vm_s regex_vm_t;
 struct regex_vm_s {
@@ -130,16 +141,23 @@ struct regex_vm_s {
     int size;                       // number of instructions in the program
     char **string_table;            // table of string literals used in the pattern
     int string_tbl_size;            // number of strings in the string table
+    int *string_tbl_len;            // table of string lengths for string in the string table
     unsigned int **class_table;     // table of character class bitmaps (32 bytes each)
     int class_tbl_size;             // number of bitmaps in the class table
+    unsigned int **utf8_class_table;// table of utf8 encoding class bitmaps (8 bytes each)
+    int utf8_tbl_size;              // number of bitmaps in the utf8 table
     char **group_table;             // table of subexpression group names
     int group_tbl_size;             // number of groups in the group table
 };
 
 typedef void *(*regexMemAllocator_t)(size_t size, void *ctx);
 typedef void (*regexMemDeallocator_t)(void *ptr, void *ctx);
+typedef void *(*regexMemReallocator_t)(void *ptr, size_t size, void *ctx);
 
-void regexSetMemoryAllocator(regexMemAllocator_t alloc, regexMemDeallocator_t dealloc, void *context);
+void regexSetMemoryAllocator(regexMemAllocator_t alloc,
+                             regexMemDeallocator_t dealloc,
+                             regexMemReallocator_t re_alloc,
+                             void *context);
 
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
@@ -162,6 +180,8 @@ typedef enum {
 #define REGEX_NO_CAPTURE        0x04
 #define REGEX_DOTALL            0x08
 
+#define REGEX_STR_NULL_TERMINATED   -1
+
 typedef struct regex_compile_ctx_s regex_compile_ctx_t;
 struct regex_compile_ctx_s {
     eRegexCompileStatus status;
@@ -181,12 +201,13 @@ eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
 typedef struct regex_match_s regex_match_t;
 struct regex_match_s {
     const char *text;
+    int len;
     const char *pos;
     regex_vm_t *vm;
     const char *subexprs[0];
 };
 
-regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete);
+regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int complete);
 void regexMatchFree(regex_match_t *match);
 const char *regexGroupValueGet(regex_match_t *match, int group, int *len);
 const char *regexGroupValueGetByName(regex_match_t *match, const char *name, int *len);
@@ -216,13 +237,22 @@ static void regexDefMemDeallocator(void *ptr, void *ctx) {
     free(ptr);
 }
 
+static void *regexDefMemReallocator(void *ptr, size_t size, void *ctx) {
+    return realloc(ptr, size);
+}
+
 regexMemAllocator_t _regexAlloc = regexDefMemAllocator;
 regexMemDeallocator_t _regexDealloc = regexDefMemDeallocator;
+regexMemReallocator_t _regexRealloc = regexDefMemReallocator;
 void *_regexMemContext = NULL;
 
-void regexSetMemoryAllocator(regexMemAllocator_t alloc, regexMemDeallocator_t dealloc, void *context) {
+void regexSetMemoryAllocator(regexMemAllocator_t alloc,
+                             regexMemDeallocator_t dealloc,
+                             regexMemReallocator_t re_alloc,
+                             void *context) {
     _regexAlloc = alloc;
     _regexDealloc = dealloc;
+    _regexRealloc = re_alloc;
     _regexMemContext = context;
 }
 
@@ -280,16 +310,17 @@ const char *unicode_lowercase;
 typedef enum {
     eTokenNone,
     eTokenCharLiteral,
-    eTokenUnicodeLiteral,
     eTokenCharClass,
-    eTokenUnicodeClass,
     eTokenStringLiteral,
     eTokenCharAny,
-    eTokenCharAnyDotAll,
     eTokenMatch,
     eTokenSplit,
     eTokenJmp,
     eTokenSave,
+    eTokenUtf8Class,
+    eTokenCharAnyDotAll,
+    eTokenUtf8Literal,
+    eTokenUtf8AnyChar,
     eTokenConcatenation,
     eTokenAlternative,
     eTokenZeroOrOne,
@@ -316,6 +347,7 @@ struct regex_token_s {
         int group;
     };
     int pc;
+    int len;
     regex_token_t *out_a;
     regex_token_t *out_b;
     regex_token_t *next;
@@ -328,6 +360,7 @@ struct regex_vm_build_s {
     unsigned int flags;
     int string_tbl_count;
     int class_tbl_count;
+    int ut8_tbl_count;
     int group_tbl_count;
     int groups;
     int pc;
@@ -359,7 +392,7 @@ int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
     }
 }
 
-regex_token_t *regexAllocToken(eRegexToken tokenType, int c, char *str) {
+regex_token_t *regexAllocToken(eRegexToken tokenType, int c, char *str, int size) {
     regex_token_t *token;
 
     if((token = _regexAlloc(sizeof(regex_token_t), _regexMemContext)) == NULL) {
@@ -369,16 +402,17 @@ regex_token_t *regexAllocToken(eRegexToken tokenType, int c, char *str) {
     token->tokenType = tokenType;
     if(str != NULL) {
         token->str = str;
+        token->len = size;
     } else {
         token->c = c;
     }
     return token;
 }
 
-int regexTokenCreate(regex_token_t **list, eRegexToken tokenType, int c, char *str) {
+int regexTokenCreate(regex_token_t **list, eRegexToken tokenType, int c, char *str, int size) {
     regex_token_t *token, *walk;
 
-    if((token = regexAllocToken(tokenType, c, str)) == NULL) {
+    if((token = regexAllocToken(tokenType, c, str, size)) == NULL) {
         return 0;
     }
 
@@ -388,7 +422,7 @@ int regexTokenCreate(regex_token_t **list, eRegexToken tokenType, int c, char *s
         for(walk = *list; walk->next != NULL; walk = walk->next);
         if(regexTokenIsTerminal(token, 0) && regexTokenIsTerminal(walk, 1)) {
             // Two adjacent terminals have an implicit concatenation
-            if((walk->next = regexAllocToken(eTokenConcatenation, 0, NULL)) == NULL) {
+            if((walk->next = regexAllocToken(eTokenConcatenation, 0, NULL, 0)) == NULL) {
                 _regexDealloc(token, _regexMemContext);
                 return 0;
             }
@@ -500,14 +534,32 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
                 return result;
 
             case '0': result.c = '\0'; // null
+                result.state = eRegexPatternEscapedChar;
+                return result;
             case 'a': result.c = '\a'; // alarm (bell)
+                result.state = eRegexPatternEscapedChar;
+                return result;
             case 'b': result.c = '\b'; // backspace
+                result.state = eRegexPatternEscapedChar;
+                return result;
             case 'e': result.c = '\x1B'; // escape
+                result.state = eRegexPatternEscapedChar;
+                return result;
             case 'f': result.c = '\f'; // formfeed
+                result.state = eRegexPatternEscapedChar;
+                return result;
             case 'n': result.c = '\n'; // newline
+                result.state = eRegexPatternEscapedChar;
+                return result;
             case 'r': result.c = '\r'; // carraige return
+                result.state = eRegexPatternEscapedChar;
+                return result;
             case 't': result.c = '\t'; // tab
+                result.state = eRegexPatternEscapedChar;
+                return result;
             case '-': result.c = '-';  // escaped dash for character class ranges
+                result.state = eRegexPatternEscapedChar;
+                return result;
             case 'v': result.c = '\v'; // vertical tab
                 result.state = eRegexPatternEscapedChar;
                 return result;
@@ -684,6 +736,47 @@ void parseUtf8EncodeSequence(unsigned char *bytes, int c) {
     }
 }
 
+#define UTF8_FOUR_BYTE_PREFIX   0xF0
+#define UTF8_FOUR_BYTE_MASK     0xF8
+#define UTF8_FOUR_BYTE_BITMASK  0x07
+#define UTF8_THREE_BYTE_PREFIX  0xE0
+#define UTF8_THREE_BYTE_MASK    0xF0
+#define UTF8_THREE_BYTE_BITMASK 0x0F
+#define UTF8_TWO_BYTE_PREFIX    0xC0
+#define UTF8_TWO_BYTE_MASK      0xE0
+#define UTF8_TWO_BYTE_BITMASK   0x1F
+#define UTF8_LOW_BYTE_PREFIX    0x80
+#define UTF8_LOW_BYTE_MASK      0xC0
+#define UTF8_LOW_BYTE_BITMASK   0x3F
+
+int parseUtf8DecodeSequence(const char *str) {
+    if((str[0] & UTF8_TWO_BYTE_MASK) == UTF8_TWO_BYTE_PREFIX) {
+        if((str[1] & UTF8_LOW_BYTE_MASK) == UTF8_TWO_BYTE_PREFIX) {
+            // two byte utf8
+            return ((str[0] & UTF8_TWO_BYTE_BITMASK) << 6) | (str[1] & UTF8_LOW_BYTE_BITMASK);
+        }
+    } else if((str[0] & UTF8_THREE_BYTE_MASK) == UTF8_THREE_BYTE_PREFIX) {
+        if((str[1] & UTF8_LOW_BYTE_MASK) == UTF8_TWO_BYTE_PREFIX) {
+            if((str[2] & UTF8_LOW_BYTE_MASK) == UTF8_TWO_BYTE_PREFIX) {
+                // three byte utf8
+                return ((str[0] & UTF8_THREE_BYTE_BITMASK) << 12) | ((str[1] & UTF8_LOW_BYTE_BITMASK) << 6) |
+                        (str[2] & UTF8_LOW_BYTE_BITMASK);
+            }
+        }
+    } else if((str[0] & UTF8_FOUR_BYTE_MASK) == UTF8_FOUR_BYTE_PREFIX) {
+        if((str[1] & UTF8_LOW_BYTE_MASK) == UTF8_TWO_BYTE_PREFIX) {
+            if((str[2] & UTF8_LOW_BYTE_MASK) == UTF8_TWO_BYTE_PREFIX) {
+                if((str[3] & UTF8_LOW_BYTE_MASK) == UTF8_TWO_BYTE_PREFIX) {
+                    // four byte utf8
+                    return ((str[0] & UTF8_THREE_BYTE_BITMASK) << 18) | ((str[1] & UTF8_LOW_BYTE_BITMASK) << 12) |
+                            ((str[2] & UTF8_LOW_BYTE_BITMASK) << 6) | (str[3] & UTF8_LOW_BYTE_BITMASK);
+                }
+            }
+        }
+    }
+    return -1;
+}
+
 // parseGetPatternStrLen determines the length in characters AND bytes to
 // represent a string in the pattern. The low word is the character count, and
 // the high word is the number of additional bytes needed to accommodate any
@@ -754,6 +847,93 @@ char *parseGetPatternStr(const char **pattern, int len, int size) {
     }
     *ptr = '\0';
     return str;
+}
+
+int regexGetEscapedStrLen(const char *str, int len) {
+    int k, out = 0, codepoint;
+
+    for(k = 0; k < len; k++) {
+        // Check for utf8 encoding
+        if((codepoint = parseUtf8DecodeSequence(str + k)) != -1) {
+            if(codepoint > 0xFFFF) {
+                out += 8; // \U######
+                k += 3;
+            } else if(codepoint > 2047) {
+                out += 6; // \u####
+                k += 2;
+            } else if(codepoint > 127) {
+                out += 6; // \u####
+                k += 1;
+            }
+            if(codepoint > 127) {
+                continue;
+            }
+        }
+        switch(str[k]) {
+            case '\0':
+            case '\a':
+            case '\b':
+            case '\x1b':
+            case '\f':
+            case '\n':
+            case '\r':
+            case '\t':
+            case '\v':
+                out += 2;
+                break;
+
+            default:
+                if((str[k] >= ' ') && (str[k] <= 127)) {
+                    out++;
+                } else {
+                    out += 4; // \x##
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+void regexEmitEscapedStr(FILE *fp, const char *str, int len) {
+    int k;
+    int codepoint;
+
+    for(k = 0; k < len; k++) {
+        // Check for utf8 encoding
+        if((codepoint = parseUtf8DecodeSequence(str + k)) != -1) {
+            if(codepoint > 0xFFFF) {
+                k += 3;
+                fprintf(fp, "\\U%6.6X", codepoint);
+            } else if(codepoint > 2047) {
+                k += 2;
+                fprintf(fp, "\\u%4.4X", codepoint);
+            } else if(codepoint > 127) {
+                k += 1;
+                fprintf(fp, "\\u%4.4X", codepoint);
+            }
+            if(codepoint > 127) {
+                continue;
+            }
+        }
+        switch(str[k]) {
+            case '\0': fputs("\\0", fp); break;
+            case '\a': fputs("\\a", fp); break;
+            case '\b': fputs("\\b", fp); break;
+            case '\x1b': fputs("\\e", fp); break;
+            case '\f': fputs("\\f", fp); break;
+            case '\n': fputs("\\n", fp); break;
+            case '\r': fputs("\\r", fp); break;
+            case '\t': fputs("\\t", fp); break;
+            case '\v': fputs("\\v", fp); break;
+            default:
+                if((str[k] >= ' ') && (str[k] <= 127)) {
+                    fputc(str[k], fp);
+                } else {
+                    fprintf(fp, "\\x%2.2X", str[k]);
+                }
+                break;
+        }
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1349,7 +1529,7 @@ int parseCharClassAndCreateToken(eRegexCompileStatus *status, const char **patte
         *status = eCompileOutOfMem;
         return 0;
     }
-    if(!regexTokenCreate(tokens, eTokenCharClass, 0, (char *)ptr)) {
+    if(!regexTokenCreate(tokens, eTokenCharClass, 0, (char *)ptr, 0)) {
         *status = eCompileOutOfMem;
         return 0;
     }
@@ -1464,7 +1644,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                 switch(c.c) {
                     case '.':
                         // Operand, the meta "ANY" char
-                        if(!regexTokenCreate(tokens, eTokenCharAny, 0, 0)) {
+                        if(!regexTokenCreate(tokens, eTokenCharAny, 0, 0, 0)) {
                             SET_RESULT(eCompileOutOfMem);
                         }
                         continue;
@@ -1476,25 +1656,25 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         continue;
 
                     case '?':
-                        if(!regexTokenCreate(tokens, eTokenZeroOrOne, 0, 0)) {
+                        if(!regexTokenCreate(tokens, eTokenZeroOrOne, 0, 0, 0)) {
                             SET_RESULT(eCompileOutOfMem);
                         }
                         continue;
 
                     case '*':
-                        if(!regexTokenCreate(tokens, eTokenZeroOrMany, 0, 0)) {
+                        if(!regexTokenCreate(tokens, eTokenZeroOrMany, 0, 0, 0)) {
                             SET_RESULT(eCompileOutOfMem);
                         }
                         continue;
 
                     case '+':
-                        if(!regexTokenCreate(tokens, eTokenOneOrMany, 0, 0)) {
+                        if(!regexTokenCreate(tokens, eTokenOneOrMany, 0, 0, 0)) {
                             SET_RESULT(eCompileOutOfMem);
                         }
                         continue;
 
                     case '|':
-                        if(!regexTokenCreate(tokens, eTokenAlternative, 0, 0)) {
+                        if(!regexTokenCreate(tokens, eTokenAlternative, 0, 0, 0)) {
                             SET_RESULT(eCompileOutOfMem);
                         }
                         continue;
@@ -1527,14 +1707,14 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                                 SET_RESULT(eCompileUnsupportedMeta);
                             }
                         }
-                        if(!regexTokenCreate(tokens, eTokenSubExprStart, subexpr, NULL)) {
+                        if(!regexTokenCreate(tokens, eTokenSubExprStart, subexpr, NULL, 0)) {
                             SET_RESULT(eCompileOutOfMem);
                         }
                         continue;
 
                     case ')':
                         // End of grouped subexpression
-                        if(!regexTokenCreate(tokens, eTokenSubExprEnd, 0, 0)) {
+                        if(!regexTokenCreate(tokens, eTokenSubExprEnd, 0, 0, 0)) {
                             SET_RESULT(eCompileOutOfMem);
                         }
                         continue;
@@ -1609,7 +1789,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         SET_RESULT(eCompileEscapeCharIncomplete);
 
                     case 0:
-                        if(!regexTokenCreate(tokens,eTokenCharLiteral, (char)(c.c), 0)) {
+                        if(!regexTokenCreate(tokens,eTokenCharLiteral, (char)(c.c), 0, 0)) {
                             SET_RESULT(eCompileOutOfMem);
                         }
                         break;
@@ -1627,7 +1807,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         if((str = parseGetPatternStr(&pattern, PARSE_DEC_CHAR_COUNT(len), PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len))) == NULL) {
                             SET_RESULT(eCompileOutOfMem);
                         }
-                        if(!regexTokenCreate(tokens, eTokenStringLiteral, 0, str)) {
+                        if(!regexTokenCreate(tokens, eTokenStringLiteral, 0, str, PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len))) {
                             SET_RESULT(eCompileOutOfMem);
                         }
                 }
@@ -1897,7 +2077,7 @@ int regexOperatorAlternationCreate(regex_fragment_t **stack, regex_token_t *toke
         return 0;
     }
 
-    if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL)) {
+    if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL, 0)) {
         return 0;
     }
     regexPtrlistPatch(e1->ptrlist, jmp);
@@ -1961,7 +2141,7 @@ int regexOperatorZeroOrMoreCreate(regex_fragment_t **stack, regex_token_t *token
     if((list = regexPtrlistCreate(&(token->out_b))) == NULL) {
         return 0;
     }
-    if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL)) {
+    if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL, 0)) {
         return 0;
     }
     jmp->out_a = token;
@@ -2006,7 +2186,7 @@ int regexOperatorMatchCreate(regex_fragment_t **stack) {
     if((e = regexFragmentStackPop(stack)) == NULL) {
         return 0;
     }
-    if(!regexTokenCreate(&token, eTokenMatch, 0, NULL)) {
+    if(!regexTokenCreate(&token, eTokenMatch, 0, NULL, 0)) {
         return 0;
     }
     regexPtrlistPatch(e->ptrlist, token);
@@ -2077,7 +2257,7 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
 
     if(sub_expression >= 0) {
         operands = *root_stack;
-        if(!regexTokenCreate(&token, eTokenConcatenation, 0, NULL)) {
+        if(!regexTokenCreate(&token, eTokenConcatenation, 0, NULL, 0)) {
             return eCompileOutOfMem;
         }
         regexTokenStackPush(&operators, token);
@@ -2130,7 +2310,7 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
                     SET_YARD_RESULT(eCompileOutOfMem);
                 }
                 token = NULL;
-                if(!regexTokenCreate(&token, eTokenConcatenation, 0, NULL)) {
+                if(!regexTokenCreate(&token, eTokenConcatenation, 0, NULL, 0)) {
                     return eCompileOutOfMem;
                 }
                 regexTokenStackPush(&operators, token);
@@ -2200,38 +2380,52 @@ void regexVMStringTableFree(regex_vm_t *vm) {
         }
         _regexDealloc(vm->string_table, _regexMemContext);
     }
+    if(vm->string_tbl_len != NULL) {
+        _regexDealloc(vm->string_tbl_len, _regexMemContext);
+    }
     vm->string_table = NULL;
     vm->string_tbl_size = 0;
 }
 
-int regexVMStringTableEntryAdd(regex_vm_build_t *build, const char *str) {
+int regexVMStringTableEntryAdd(regex_vm_build_t *build, const char *str, int len) {
     int index;
+    char *dup;
 
     for(index = 0; index < build->string_tbl_count; index++) {
-        if(!strcmp(build->vm->string_table[index], str)) {
+        if((build->vm->string_tbl_len[index] == len) &&
+           (!memcmp(build->vm->string_table[index], str, len))) {
             return index;
         }
     }
 
     if(build->vm->string_tbl_size <= build->string_tbl_count) {
-        if((build->vm->string_table = realloc(build->vm->string_table, (build->vm->string_tbl_size + DEF_VM_STRTBL_INC) * sizeof(char *))) == NULL) {
+        if((build->vm->string_table = _regexRealloc(build->vm->string_table, (build->vm->string_tbl_size + DEF_VM_STRTBL_INC) * sizeof(char *), _regexMemContext)) == NULL) {
             return -1;
         }
         memset(build->vm->string_table + build->vm->string_tbl_size, 0, DEF_VM_STRTBL_INC * sizeof(char *));
+        if((build->vm->string_tbl_len = _regexRealloc(build->vm->string_tbl_len, (build->vm->string_tbl_size + DEF_VM_STRTBL_INC) * sizeof(int), _regexMemContext)) == NULL) {
+            return -1;
+        }
+        memset(build->vm->string_tbl_len + build->vm->string_tbl_size, 0, DEF_VM_STRTBL_INC * sizeof(int));
         build->vm->string_tbl_size += DEF_VM_STRTBL_INC;
     }
-    if((build->vm->string_table[build->string_tbl_count] = strdup(str)) == NULL) {
+    if((dup = _regexAlloc(len + 1, _regexMemContext)) == NULL) {
         return -1;
     }
+    memcpy(dup, str, len);
+    dup[len] = '\0';
+    build->vm->string_table[build->string_tbl_count] = dup;
+    build->vm->string_tbl_len[build->string_tbl_count] = len;
     index = build->string_tbl_count;
     build->string_tbl_count++;
     return index;
 }
 
-const char *regexVMStringTableEntryGet(regex_vm_t *vm, int string_table_id) {
+const char *regexVMStringTableEntryGet(regex_vm_t *vm, int string_table_id, int *len) {
     if(string_table_id >= vm->string_tbl_size) {
         return NULL;
     }
+    *len = vm->string_tbl_len[string_table_id];
     return vm->string_table[string_table_id];
 }
 
@@ -2259,7 +2453,7 @@ int regexVMClassTableEntryAdd(regex_vm_build_t *build, const unsigned int *bitma
     }
 
     if(build->vm->class_tbl_size <= build->class_tbl_count ) {
-        if((build->vm->class_table = realloc(build->vm->class_table, (build->vm->class_tbl_size + DEF_VM_STRTBL_INC) * sizeof(unsigned int *))) == NULL) {
+        if((build->vm->class_table = _regexRealloc(build->vm->class_table, (build->vm->class_tbl_size + DEF_VM_STRTBL_INC) * sizeof(unsigned int *), _regexMemContext)) == NULL) {
             return -1;
         }
         memset(build->vm->class_table + build->vm->class_tbl_size, 0, DEF_VM_STRTBL_INC * sizeof(unsigned int *));
@@ -2303,7 +2497,7 @@ int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int le
         while((build->vm->group_tbl_size + add) <= index) {
             add += DEF_VM_STRTBL_INC;
         }
-        if((build->vm->group_table = realloc(build->vm->group_table, (build->vm->group_tbl_size + add) * sizeof(char *))) == NULL) {
+        if((build->vm->group_table = _regexRealloc(build->vm->group_table, (build->vm->group_tbl_size + add) * sizeof(char *), _regexMemContext)) == NULL) {
             return 0;
         }
         memset(build->vm->group_table + build->vm->group_tbl_size, 0, add * sizeof(char *));
@@ -2406,7 +2600,7 @@ void regexVMPatchJumps(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list
 
 int regexVMProgramAdd(regex_vm_build_t *build, eRegexToken opcode, unsigned int arg1, unsigned int arg2) {
     if((build->vm->size - build->pc) <= 0) {
-        if((build->vm->program = realloc(build->vm->program, (build->vm->size + DEF_VM_SIZE_INC) * sizeof(int))) == NULL) {
+        if((build->vm->program = _regexRealloc(build->vm->program, (build->vm->size + DEF_VM_SIZE_INC) * sizeof(int), _regexMemContext)) == NULL) {
             return 0;
         }
         memset(build->vm->program + build->vm->size, 0, DEF_VM_SIZE_INC * sizeof(int));
@@ -2452,7 +2646,7 @@ int regexVMProgramGenerate(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_
             idx_a = token->c;
             break;
         case eTokenStringLiteral:
-            if((idx_a = regexVMStringTableEntryAdd(build, token->str)) == -1) {
+            if((idx_a = regexVMStringTableEntryAdd(build, token->str, token->len)) == -1) {
                 return 0;
             }
             break;
@@ -2529,67 +2723,131 @@ void regexVMGenerateDeclaration(regex_vm_t *vm, const char *symbol, FILE *fp) {
     fprintf(fp, "extern regex_vm_t *%s;\n", symbol);
 }
 
-#define MAX_VM_INSTR_PER_ROW    8
+#define MAX_LINE_LEN    80
+#define LINE_PADDING    6   // 4 leading spaces, 2 trailing
 
-// TODO - recode exploded utf8 values
-void regexEmitEscapedString(FILE *fp, const char *str) {
-    for(; *str != '\0'; str++) {
-        if((*str < 32) || (*str > 127)) {
-            switch(*str) {
-                case '\n': fprintf(fp, "\\n"); break;
-                case '\r': fprintf(fp, "\\r"); break;
-                case '\t': fprintf(fp, "\\t"); break;
-                case '\f': fprintf(fp, "\\f"); break;
-                case '\v': fprintf(fp, "\\v"); break;
-                case '\a': fprintf(fp, "\\a"); break;
-                default:
-                    fprintf(fp, "\\x%2.2X\"\"", *str);
-                    break;
-            }
-        } else {
-            fputc(*str, fp);
+int hexStrLen(unsigned int val) {
+    unsigned int k;
+
+    for(k = 7; k > 2; k-= 1) {
+        if(val & (0xFu << (k * 4))) {
+            return (int)k + 3; // 3 = '0x' + nibble
         }
+    }
+    return 4; // 0x##
+}
+
+void generateHexValueTable(FILE *fp, unsigned int *table, int size) {
+    int k, len, line, first = 1;
+
+    line = MAX_LINE_LEN - LINE_PADDING;
+    for(k = 0; k < size; k++) {
+        len = hexStrLen(table[k]) + 1;   // value, comma
+        if(!first) {
+            len++; // padding space between values
+        }
+        line -= len;
+        if(line < 0) {
+            fputs("\n    ", fp);
+            line = MAX_LINE_LEN - LINE_PADDING;
+            first = 1;
+        }
+        fprintf(fp, "%s0x%0.2X%s", (!first ? " " : ""), table[k],
+                (k + 1 != size ? "," : ""));
+        first = 0;
+    }
+}
+
+int intStrLen(int val) {
+    int check = (val < 0 ? -val : val);
+    int k, len;
+
+    for(len = 0, k = 9; k <= check; len++, k = (k * 10) + 9);
+    if(val < 0) {
+        len++;
+    }
+    return len;
+}
+
+void generateIntValueTable(FILE *fp, int *table, int size) {
+    int k, len, line, first = 1;
+
+    line = MAX_LINE_LEN - LINE_PADDING;
+    for(k = 0; k < size; k++) {
+        len = intStrLen(table[k]) + 1;   // value, comma
+        if(!first) {
+            len++; // padding space between values
+        }
+        line -= len;
+        if(line < 0) {
+            fputs("\n    ", fp);
+            line = MAX_LINE_LEN - LINE_PADDING;
+            first = 1;
+        }
+        fprintf(fp, "%s%d%s", (!first ? " " : ""), table[k],
+                (k + 1 != size ? "," : ""));
+        first = 0;
+    }
+}
+
+void generateStringValueTable(FILE *fp, char **table, const int *lengths, int size) {
+    int k, len, pad, line, baselen, first = 1;
+
+    line = MAX_LINE_LEN - LINE_PADDING;
+    for(k = 0; k < size; k++) {
+        if(table[k] == NULL) {
+            len = 4; // NULL
+            pad = 1; // comma
+        } else {
+            baselen = (int)(lengths != NULL ? lengths[k] : strlen(table[k]));
+            len = regexGetEscapedStrLen(table[k], baselen);
+            pad = 3; // quotes, comma
+        }
+        if(!first) {
+            pad++; // padding space between values
+        }
+        line -= len + pad;
+        if((line < 0) && (!first)) {
+            fputs("\n    ", fp);
+            line = MAX_LINE_LEN - LINE_PADDING;
+            first = 1;
+        }
+        if(table[k] == NULL) {
+            fprintf(fp, "%sNULL%s", (!first ? " " : ""), (k + 1 != size ? "," : ""));
+        } else {
+            fprintf(fp, "%s\"", (!first ? " " : ""));
+            regexEmitEscapedStr(fp, table[k], baselen);
+            fprintf(fp, "\"%s", (k + 1 != size ? "," : ""));
+        }
+        first = 0;
     }
 }
 
 void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
-    int k, j;
+    int k, j, len, line, first = 1;
 
-    fprintf(fp, "unsigned int _%s_program[] = {", symbol);
-    for(k = 0; k < vm->size; k++) {
-        if(k != 0) {
-            fputc(',', fp);
-        }
-        if(!(k % MAX_VM_INSTR_PER_ROW)) {
-            fputs("\n    ", fp);
-        } else {
-            fputc(' ', fp);
-        }
-        fprintf(fp, "0x%.2X", vm->program[k]);
-    }
+    // Program bytecode
+    line = MAX_LINE_LEN - LINE_PADDING;
+    fprintf(fp, "unsigned int _%s_program[] = {\n    ", symbol);
+    generateHexValueTable(fp, vm->program, vm->size);
     fprintf(fp, "\n};\n\n");
 
-    fprintf(fp, "char *_%s_string_table[] = {\n", symbol);
-    for(k = 0; k < vm->string_tbl_size; k++) {
-        if(vm->string_table[k] == NULL) {
-            fprintf(fp, "    NULL%s\n", (((k + 1) != vm->string_tbl_size) ? "," : ""));
-        } else {
-            fprintf(fp, "    \"");
-            regexEmitEscapedString(fp, vm->string_table[k]);
-            fprintf(fp, "\"%s\n", (((k + 1) != vm->string_tbl_size) ? "," : ""));
-        }
-    }
-    fprintf(fp, "};\n\n");
+    // String literal table
+    fprintf(fp, "char *_%s_string_table[] = {\n    ", symbol);
+    generateStringValueTable(fp, vm->string_table, vm->string_tbl_len, vm->string_tbl_size);
+    fprintf(fp, "\n};\n\n");
 
+    fprintf(fp, "int _%s_string_tbl_len[] = {\n    ", symbol);
+    generateIntValueTable(fp, vm->string_tbl_len, vm->string_tbl_size);
+    fprintf(fp, "\n};\n\n");
+
+    // Character class table
     for(k = 0; k < vm->class_tbl_size; k++) {
         if(vm->class_table[k] == NULL) {
             continue;
         }
-        fprintf(fp, "unsigned int _%s_class_entry_%d[] = {", symbol, k);
-        for(j = 0; j < 8; j++) {
-            fprintf(fp, "%s0x%8.8X%s", (j % 4 ? " " : "\n    "),
-                    vm->class_table[k][j], (j != 7 ? "," : ""));
-        }
+        fprintf(fp, "unsigned int _%s_class_entry_%d[] = {\n    ", symbol, k);
+        generateHexValueTable(fp, vm->class_table[k], 8);
         fprintf(fp, "\n};\n\n");
     }
 
@@ -2603,17 +2861,13 @@ void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
     }
     fprintf(fp, "};\n\n");
 
-    fprintf(fp, "char *_%s_group_table[] = {\n", symbol);
-    for(k = 0; k < vm->group_tbl_size; k++) {
-        if(vm->group_table[k] == NULL) {
-            fprintf(fp, "    NULL,\n");
-        } else {
-            fprintf(fp, "    \"");
-            regexEmitEscapedString(fp, vm->group_table[k]);
-            fprintf(fp, "\",\n");
-        }
-    }
-    fprintf(fp, "};\n\n");
+    // Utf8 character class table
+    // TODO
+
+    // Group table
+    fprintf(fp, "char *_%s_group_table[] = {\n    ", symbol);
+    generateStringValueTable(fp, vm->group_table, NULL, vm->group_tbl_size);
+    fprintf(fp, "\n};\n\n");
 
     fprintf(fp, "regex_vm_t _%s = {\n", symbol);
     fprintf(fp, "    .vm_version = %d,\n", vm->vm_version);
@@ -2621,8 +2875,11 @@ void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
     fprintf(fp, "    .size = %d,\n", vm->size);
     fprintf(fp, "    .string_table = _%s_string_table,\n", symbol);
     fprintf(fp, "    .string_tbl_size = %d,\n", vm->string_tbl_size);
+    fprintf(fp, "    .string_tbl_len = _%s_string_tbl_len,\n", symbol);
     fprintf(fp, "    .class_table = _%s_class_table,\n", symbol);
     fprintf(fp, "    .class_tbl_size = %d,\n", vm->class_tbl_size);
+    fprintf(fp, "    .utf8_class_table = _%s_utf8_class_table,\n", symbol); // TODO
+    fprintf(fp, "    .utf8_tbl_size = %d,\n", vm->utf8_tbl_size); // TODO
     fprintf(fp, "    .group_table = _%s_group_table,\n", symbol);
     fprintf(fp, "    .group_tbl_size = %d\n", vm->group_tbl_size);
     fprintf(fp, "};\n\n");
@@ -2642,7 +2899,9 @@ void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
                 fprintf(fp, "char (%c:%d)\n", (instr[1] < 32 || instr[1] > 127) ? '-' : instr[1], instr[1]);
                 break;
             case eTokenStringLiteral:
-                fprintf(fp, "string(\"%s\")\n", vm->string_table[instr[1]]);
+                fputs("string(\"", fp);
+                regexEmitEscapedStr(fp, vm->string_table[instr[1]], vm->string_tbl_len[instr[1]]);
+                fputs("\")\n", fp);
                 break;
             case eTokenCharClass:
                 fprintf(fp, "class([");
@@ -2788,6 +3047,8 @@ struct regex_thread_s {
 typedef struct regex_eval_s regex_eval_t;
 struct regex_eval_s {
     const char *sp;
+    int len;
+    int pos;
     regex_thread_t *thread;
     regex_thread_t *queue;
     regex_vm_t *vm;
@@ -2803,7 +3064,7 @@ void regexThreadCopySubexprs(int count, regex_thread_t *dest, regex_thread_t *sr
     }
 }
 
-regex_eval_t *regexEvalCreate(regex_vm_t *vm, const char *pattern) {
+regex_eval_t *regexEvalCreate(regex_vm_t *vm, const char *pattern, int len) {
     regex_eval_t *eval;
 
     if((eval = _regexAlloc(sizeof(regex_eval_t), _regexMemContext)) == NULL) {
@@ -2819,6 +3080,7 @@ regex_eval_t *regexEvalCreate(regex_vm_t *vm, const char *pattern) {
 
     eval->vm = vm;
     eval->sp = pattern;
+    eval->len = len;
 
     return eval;
 }
@@ -2904,6 +3166,7 @@ typedef enum {
 eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, int complete) {
     const unsigned int *bitmap;
     const char *str;
+    int len;
     unsigned int instr[3];
 
     while(regexVMNoTextAdvance(eval->vm->program[thread->pc])) {
@@ -2928,7 +3191,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                 thread->pc = instr[2];
                 continue;
             case eTokenMatch:
-                if(!complete || *eval->sp == '\0') {
+                if(!complete || eval->pos == eval->len) {
                     return eEvalMatch;
                 }
                 return eEvalNoMatch;
@@ -2949,7 +3212,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
             }
             return eEvalMatch;
         case eTokenStringLiteral:
-            if((str = regexVMStringTableEntryGet(eval->vm, instr[1])) == NULL) {
+            if((str = regexVMStringTableEntryGet(eval->vm, instr[1], &len)) == NULL) {
                 return eEvalInternalError;
             }
             if(thread->pos == -1) {
@@ -2957,7 +3220,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
             }
             if(str[thread->pos] == *(eval->sp)) {
                 thread->pos++;
-                if(str[thread->pos] == '\0') {
+                if(thread->pos == len) {
                     thread->pc++;
                     thread->pos = -1;
                     return eEvalMatch;
@@ -2983,7 +3246,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
     }
 }
 
-regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete) {
+regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int complete) {
     regex_match_t *match;
     regex_eval_t *eval;
     regex_thread_t *thread;
@@ -2993,7 +3256,7 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete) {
         return NULL;
     }
 
-    if((eval = regexEvalCreate(vm, text)) == NULL) {
+    if((eval = regexEvalCreate(vm, text, len)) == NULL) {
         return NULL;
     }
 
@@ -3002,7 +3265,10 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete) {
         return NULL;
     }
 
-    for(; *eval->sp != '\0'; eval->sp++) {
+    for(; eval->pos != eval->len; eval->sp++, eval->pos++) {
+        if(eval->queue == NULL) {
+            break;
+        }
         eval->thread = eval->queue;
         eval->queue = NULL;
         for(thread = eval->thread; thread != NULL; thread = eval->thread) {
@@ -3016,7 +3282,7 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete) {
                 case eEvalMatch:
                 case eEvalContinue:
                     if(eval->vm->program[thread->pc] == eTokenMatch) {
-                        if((complete && (*eval->sp == '\0')) || (!complete)) {
+                        if((complete && (eval->pos == eval->len)) || (!complete)) {
                             goto FoundMatch;
                         }
                     }
@@ -3025,7 +3291,7 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete) {
                     break;
                 case eEvalNoMatch:
                     regexThreadFree(eval, thread);
-                    continue;
+                    break;
             }
         }
     }
@@ -3054,6 +3320,7 @@ FoundMatch:
     memset(match, 0, sizeof(regex_match_t));
     match->vm = vm;
     match->text = text;
+    match->len = len;
     match->pos = eval->sp;
     for(k = 0; k < (vm->group_tbl_size * 2); k++) {
         match->subexprs[k] = thread->subexprs[k];
@@ -3112,32 +3379,79 @@ const char *regexGroupValueGetByName(regex_match_t *match, const char *name, int
 #define REGEX_TEST_MAIN
 #ifdef REGEX_TEST_MAIN
 
+void printEscapedStr(FILE *fp, const char *text, int len) {
+    int k;
+    int codepoint;
+    char fmt[10];
+
+    for(k = 0; k < len; k++) {
+        // Check for utf8 encoding
+        if((codepoint = parseUtf8DecodeSequence(text + k)) != -1) {
+            if(codepoint > 0xFFFF) {
+                k += 3;
+                fprintf(fp, "\\U%6.6X", codepoint);
+            } else {
+                if(codepoint > 2047) {
+                    k += 2;
+                } else if(codepoint > 127) {
+                    k += 1;
+                }
+                snprintf(fmt, sizeof(fmt) - 1, "\\u%4.4X", codepoint);
+                fmt[6] = '\0';
+                fputs(fmt, fp);
+            }
+        } else {
+            switch(text[k]) {
+                case '\0': fputs("\\0", fp); break;
+                case '\a': fputs("\\a", fp); break;
+                case '\b': fputs("\\b", fp); break;
+                case '\x1b': fputs("\\e", fp); break;
+                case '\f': fputs("\\f", fp); break;
+                case '\n': fputs("\\n", fp); break;
+                case '\r': fputs("\\r", fp); break;
+                case '\t': fputs("\\t", fp); break;
+                case '\v': fputs("\\v", fp); break;
+                default:
+                    if((text[k] >= ' ') && (text[k] <= 127)) {
+                        fputc(text[k], fp);
+                    } else {
+                        fprintf(fp, "\\x%2.2X", text[k]);
+                    }
+                    break;
+            }
+        }
+    }
+}
+
 void regexDumpMatch(regex_match_t *match) {
     int k, len;
     const char *ptr;
 
-    printf("Evaluation of [%s]\n", match->text);
     if(match == NULL) {
         printf("No match\n");
         return;
     }
+    printf("Evaluation of [");
+    printEscapedStr(stdout, match->text, match->len);
+    printf("]\n");
     printf("Match found\n");
     printf("    %d groups\n", regexGroupCountGet(match->vm));
     for(k = 0; k <= regexGroupCountGet(match->vm); k++) {
         if((ptr = regexGroupValueGet(match, k, &len)) == NULL) {
             printf("        %d [%s]: no match\n", k, regexGroupNameLookup(match->vm, k));
         } else {
-            printf("        %d [%s]: [%*.*s]\n", k, regexGroupNameLookup(match->vm, k), len, len, ptr);
+            //printf("        %d [%s]: [%*.*s]\n", k, regexGroupNameLookup(match->vm, k), len, len, ptr);
+            printf("        %d [%s]: [", k, regexGroupNameLookup(match->vm, k));
+            printEscapedStr(stdout, ptr, len);
+            printf("]\n");
         }
-    }
-    if((ptr = regexGroupValueGetByName(match, "foolio", &len)) != NULL) {
-        printf("Foolio group is [%*.*s]\n", len, len, ptr);
     }
 }
 
 int main(int argc, char **argv) {
     regex_compile_ctx_t result;
     regex_match_t *match;
+    char test[] = "abcdefgj\0foo033195catghj";
 
     if(argc > 1) {
         if(regexCompile(&result, argv[1], 0) != eCompileOk) {
@@ -3146,14 +3460,17 @@ int main(int argc, char **argv) {
         }
         if(argc > 2) {
             regexVMPrintProgram(stdout, result.vm);
+            printf("-------------------------\n");
 
-            if((match = regexMatch(result.vm, argv[2], 0)) == NULL) {
+            //if((match = regexMatch(result.vm, argv[2], 24 /*strlen(argv[2])*/, 0)) == NULL) {
+
+            if((match = regexMatch(result.vm, test, 24 /*strlen(argv[2])*/, 0)) == NULL) {
                 printf("No match\n");
-                return 1;
+                //return 1;
+            } else {
+                regexDumpMatch(match);
+                regexMatchFree(match);
             }
-
-            regexDumpMatch(match);
-            regexMatchFree(match);
 
             //regexVMGenerateDeclaration(result.vm, "myparser", stdout);
             //regexVMGenerateDefinition(result.vm, "myparser", stdout);

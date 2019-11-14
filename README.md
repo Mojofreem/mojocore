@@ -162,7 +162,7 @@ to convert the human readable form back into VM bytecode._
 With a valid `regex_vm_t` structure, you can now evaluate text using the match
 function:
 
-`regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int complete);`
+`regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int complete);`
 
 where `vm` is the VM program to use, `text` is the content to evaluate, and
 `complete` indicates whether or not this is an unanchored match (_`complete` is
