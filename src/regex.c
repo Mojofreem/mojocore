@@ -40,12 +40,12 @@
         \x## hex byte
         \u#### unicode codepoint
         \U##### unicode codepoint > 0xFFFF
-        \d [0-9]
-        \D [^0-9]
-        \s [ \t\f\v\r\n]
-        \S [^ \t\f\v\r\n]
-        \w [a-zA-Z0-9_] - TODO adapt for unicode utf8 sequences
-        \W [^a-zA-Z0-9_] - TODO adapt for unicode utf8 sequences
+        \d [0-9] - ASCII
+        \D [^0-9] - ASCII
+        \s [ \t\f\v\r\n] - ASCII
+        \S [^ \t\f\v\r\n] - ASCII
+        \w [a-zA-Z0-9_] - ASCII
+        \W [^a-zA-Z0-9_] - ASCII
         \p{M} - combining mark (M_)
         \p{N} - numeric digit (N_)
         \p{P} - punctuation (P_)
@@ -56,15 +56,22 @@
         \p{__} - any unicode property set, when registered with regexRegUnicodeCharClass()
         \B - match a byte (differs from . in that it always matches a single byte, even '\n')
 
+    Note on utf8 support:
+        clang follows sane expectations and converts \u#### into utf8 encoding
+        within a char string. gcc illogically converts \u#### into utf16
+        encoding, even within a char string, and does work properly with the
+        evaluator. For gcc, you will need to manually encode utf8 characters.
+
     TODO
         \X full unicode glyph (may be multiple chars)
             "(:(:(:[\xC0-\xDF]|(:[\xE0-\xEF]|[\xF0-\xF7][\x80-\xBF])[\x80-\xBF])[\x80-\xBF])|[\x00-\x7F])"
         ^  start of string (assertion, non consuming)
         $  end of string (assertion, non consuming) [see eTokenMatch]
-        \< match start of word (assertion, non consuming)
-        \> match end of word (assertion, non consuming)
+        \< match start of word (assertion, non consuming, ASCII only)
+        \> match end of word (assertion, non consuming, ASCII only)
         unicode utf8 classes
             build NFA from class tree
+        convert call NFA to VM
 
     (?P<name>...)  named subexpressions
     (?:...) non capturing subexpressions
@@ -398,6 +405,7 @@ typedef enum {
 #define REGEX_TOKEN_FLAG_CASEINS    0x1u
 #define REGEX_TOKEN_FLAG_NOCAPTURE  0x2u
 #define REGEX_TOKEN_FLAG_COMPOUND   0x4u
+#define REGEX_TOKEN_FLAG_SUBROUTINE 0x8u
 
 #define REGEX_TOKEN_FLAG_INVERT     0x1u
 
@@ -2273,6 +2281,55 @@ int regexGetOperatorArity(regex_token_t *token) {
 }
 
 /////////////////////////////////////////////////////////////////////////////
+// Subroutine support functions
+//
+// Since subroutines may be called from multiple places, multiple positions
+// in the pattern may reference the same subroutine token stream. We use an
+// index to keep track of a subroutine when it is converted to an NFA so that
+// we only need to generate the NFA once, and subsequent references can then
+// refer to the same NFA.
+/////////////////////////////////////////////////////////////////////////////
+
+typedef struct regex_sub_index_s regex_sub_index_t;
+struct regex_sub_index_s {
+    regex_token_t *sequence;
+    regex_fragment_t *fragment;
+    regex_sub_index_t *next;
+};
+
+regex_fragment_t *regexSubroutineGet(regex_sub_index_t *index, regex_token_t *token) {
+    for(; index != NULL; index = index->next) {
+        if(index->sequence == token) {
+            return index->fragment;
+        }
+    }
+    return NULL;
+}
+
+int regexSubroutineStore(regex_sub_index_t **index, regex_token_t *token, regex_fragment_t *fragment) {
+    regex_sub_index_t *entry;
+
+    if((entry = _regexAlloc(sizeof(regex_sub_index_t), _regexMemContext)) == NULL) {
+        return 0;
+    }
+    memset(entry, 0, sizeof(regex_sub_index_t));
+    entry->sequence = token;
+    entry->fragment = fragment;
+    entry->next = *index;
+    *index = entry;
+    return 1;
+}
+
+void regexSubroutineFree(regex_sub_index_t **index) {
+    regex_sub_index_t *walk, *next;
+
+    for(walk = *index; walk != NULL; walk = next) {
+        next = walk->next;
+        _regexDealloc(walk, _regexMemContext);
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
 // NFA form regex support
 /////////////////////////////////////////////////////////////////////////////
 
@@ -2546,6 +2603,22 @@ int regexOperatorMatchCreate(regex_fragment_t **stack) {
     return 1;
 }
 
+int regexOperatorReturnCreate(regex_fragment_t **stack) {
+    regex_fragment_t *e;
+    regex_token_t *token = NULL;
+
+    if((e = regexFragmentStackPop(stack)) == NULL) {
+        return 0;
+    }
+    if(!regexTokenCreate(&token, eTokenReturn, 0, NULL, 0)) {
+        return 0;
+    }
+    regexPtrlistPatch(e->ptrlist, token);
+    regexFragmentStackPush(stack, e);
+
+    return 1;
+}
+
 int regexHasSufficientOperands(regex_fragment_t *fragments, int arity) {
     for(; ((fragments != NULL) && (arity)); arity--, fragments = fragments->next);
     return arity == 0;
@@ -2603,8 +2676,10 @@ eRegexCompileStatus regexOperatorApply(regex_token_t **operators, eRegexOpApply 
 
 #define SET_YARD_RESULT(res)    status = res; goto ShuntingYardFailure;
 
-eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_fragment_t **root_stack, int sub_expression, unsigned int group_flags) {
-    regex_token_t *token = NULL, *operators = NULL;
+eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_fragment_t **root_stack,
+                                              regex_sub_index_t **sub_index, int sub_expression,
+                                              unsigned int group_flags) {
+    regex_token_t *token = NULL, *concat, *operators = NULL;
     regex_fragment_t *operands = NULL, *subexpr;
     eRegexCompileStatus status;
     int group_num;
@@ -2650,19 +2725,48 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
             case eTokenSubExprStart:
                 // TODO - handle case insensitive propogation
                 subexpr = NULL;
-                if(token->flags & REGEX_TOKEN_FLAG_NOCAPTURE) {
-                    group_num = REGEX_SHUNTING_YARD_NO_CAPTURE;
-                } else {
-                    group_num = token->group;
-                    token->group = regexSubexprStartFromGroup(token->group);
-                    if(!regexOperatorSubexprCreate(&subexpr, token)) {
+                if(token->flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
+                    // Generate the sub sequence pattern, and tie it into the current pattern
+                    // with an eTokenCall
+                    if(regexSubroutineGet(*sub_index, token->sub_sequence) == NULL) {
+                        if((status = regexShuntingYardFragment(&(token->sub_sequence), &subexpr, sub_index,
+                                                                 REGEX_SHUNTING_YARD_NO_CAPTURE, 0)) != eCompileOk) {
+                            SET_YARD_RESULT(status);
+                        }
+                        if(!regexOperatorReturnCreate(&subexpr)) {
+                            SET_YARD_RESULT(eCompileOutOfMem);
+                        }
+                        concat = NULL;
+                        if(!regexTokenCreate(&concat, eTokenConcatenation, 0, NULL, 0)) {
+                            return eCompileOutOfMem;
+                        }
+                        if((status = regexOperatorApply(&concat, OP_ALL, 0, &subexpr)) != eCompileOk) {
+                            goto ShuntingYardFailure;
+                        }
+                        if(!regexSubroutineStore(sub_index, token->sub_sequence, subexpr)) {
+                            SET_YARD_RESULT(eCompileOutOfMem);
+                        }
+                    }
+                    token->tokenType = eTokenCall;
+                    token->out_b = token->sub_sequence;
+                    if(!regexOperatorLiteralCreate(&operands, token)) {
                         SET_YARD_RESULT(eCompileOutOfMem);
                     }
+                } else {
+                    if(token->flags & REGEX_TOKEN_FLAG_NOCAPTURE) {
+                        group_num = REGEX_SHUNTING_YARD_NO_CAPTURE;
+                    } else {
+                        group_num = token->group;
+                        token->group = regexSubexprStartFromGroup(token->group);
+                        if(!regexOperatorSubexprCreate(&subexpr, token)) {
+                            SET_YARD_RESULT(eCompileOutOfMem);
+                        }
+                    }
+                    if((status = regexShuntingYardFragment(tokens, &subexpr, sub_index, group_num, token->flags)) != eCompileOk) {
+                        SET_YARD_RESULT(status);
+                    }
+                    regexFragmentStackPush(&operands, subexpr);
                 }
-                if((status = regexShuntingYardFragment(tokens, &subexpr, group_num, token->flags)) != eCompileOk) {
-                    SET_YARD_RESULT(status);
-                }
-                regexFragmentStackPush(&operands, subexpr);
                 break;
 
             case eTokenSubExprEnd:
@@ -2720,8 +2824,9 @@ ShuntingYardFailure:
 eRegexCompileStatus regexShuntingYard(regex_token_t **tokens) {
     regex_fragment_t *stack = NULL;
     eRegexCompileStatus status;
+    regex_sub_index_t *sub_index = NULL;
 
-    status = regexShuntingYardFragment(tokens, &stack, REGEX_SHUNTING_YARD_NO_PARENT, 0);
+    status = regexShuntingYardFragment(tokens, &stack, &sub_index, REGEX_SHUNTING_YARD_NO_PARENT, 0);
     if(status != eCompileOk) {
         return status;
     }
@@ -4175,7 +4280,7 @@ void regexDumpMatch(regex_match_t *match) {
 int main(int argc, char **argv) {
     regex_compile_ctx_t result;
     regex_match_t *match;
-    const char test[] = "abcdefgefgjfoofoofyo8167287catfoo";
+    const char test[] = "abcdefgjfoofwof\u01a8o8167287catfoo";
 
     if(argc > 1) {
         if(regexCompile(&result, argv[1], 0) != eCompileOk) {
