@@ -3559,38 +3559,49 @@ int regexThreadCompoundCount(regex_compound_t *compound) {
 
     for(; compound != NULL; k++, compound = compound->next);
 
+    printf("compound captures: %d\n", k);
     return k;
 }
 
 void regexThreadCompoundReverse(regex_compound_t **compound) {
-    // TODO
+    regex_compound_t *base = NULL, *walk, *next;
+
+    for(walk = *compound; walk != NULL; walk = next) {
+        next = walk->next;
+        walk->next = base;
+        base = walk;
+    }
+    *compound = base;
 }
 
 size_t regexThreadCompoundCalcMatchBufferSize(regex_vm_t *vm, regex_thread_t *thread) {
     size_t size;
 
-    // array of group ptrs -> array of compounds -> const char *
-    //
+    // an entry for each group
+    size = sizeof(const char ***) * vm->group_tbl_size;
 
-    size = sizeof(const char *) * vm->group_tbl_size; // an entry for each group
-    size += sizeof(const char *) * vm->group_tbl_size; // a null entry to terminate each group
-    size += regexThreadCompoundCount(thread->compound) * 2 * sizeof(char *);
-        // 2 pointers for each compound match (start, end)
+    // a null entry to terminate each group
+    size += sizeof(const char **) * vm->group_tbl_size;
+
+    // 2 pointers for each compound match (start, end)
+    size += sizeof(const char **) * (2 * regexThreadCompoundCount(thread->compound));
+
     return size;
 }
 
 // Note: Assumes that match has preallocated sufficient space and provides a
 // pointer via baseMem
-int regexThreadCompoundStoreInMatch(regex_match_t *match, const char *baseMem, regex_compound_t *compound) {
+void regexThreadCompoundStoreInMatch(regex_match_t *match, const char *baseMem, regex_thread_t *thread) {
     int grp, cnt;
     regex_compound_t *walk;
 
-    regexThreadCompoundReverse(compound);
+    regexThreadCompoundReverse(&(thread->compound));
 
     match->compound = (const char ***)baseMem;
     baseMem += match->vm->group_tbl_size * sizeof(const char ***);
     for(grp = 0; grp < match->vm->group_tbl_size; grp++) {
-        for(cnt = 0, walk = compound; walk != NULL; walk = walk->next) {
+        for(cnt = 0, walk = thread->compound; walk != NULL; walk = walk->next) {
+            printf("grp: %d, cnt: %d, subexpr: %d, calc: %d\n", grp, cnt, walk->subexpr, walk->subexpr / 2);
             if((walk->subexpr / 2) == grp) {
                 cnt++;
             }
@@ -3598,11 +3609,18 @@ int regexThreadCompoundStoreInMatch(regex_match_t *match, const char *baseMem, r
         match->compound[grp] = (const char **)baseMem;
         if(cnt == 0) {
             match->compound[grp][0] = NULL;
-            baseMem += sizeof(char *);
+            baseMem += sizeof(char **);
         } else {
-            baseMem += sizeof(char *) * (cnt + 1);
-
-            match->compound[grp]
+            baseMem += sizeof(char **) * (((cnt  + 1) * 2) + 1);
+            cnt = 0;
+            for(walk = thread->compound; walk != NULL; walk = walk->next) {
+                if((walk->subexpr / 2) == grp) {
+                    match->compound[grp][cnt * 2] = walk->start;
+                    match->compound[grp][(cnt * 2) + 1] = walk->end;
+                    cnt++;
+                }
+            }
+            match->compound[grp][cnt * 2] = NULL;
         }
     }
 }
@@ -3754,6 +3772,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                     // Group end
                     thread->subexprs[instr[1]] = eval->sp;
                     if(instr[2]) {
+                        printf("compound end [%d]\n", instr[2] - 1);
                         if(!regexThreadCompoundEnd(thread, eval->sp)) {
                             return eEvalOutOfMem;
                         }
@@ -3764,6 +3783,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                         thread->subexprs[instr[1]] = eval->sp;
                     }
                     if(instr[2]) {
+                        printf("compound start [%d]\n", instr[2]);
                         if(!regexThreadCompoundStart(eval, thread, instr[1], eval->sp)) {
                             return eEvalOutOfMem;
                         }
@@ -3840,6 +3860,8 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int complet
     regex_match_t *match;
     regex_eval_t *eval;
     regex_thread_t *thread;
+    size_t capture_size;
+    size_t compound_size;
     int k;
 
     if(vm->vm_version != REGEX_VM_MACHINE_VERSION) {
@@ -3904,10 +3926,13 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int complet
 FoundMatch:
 
     // Expects "thread" to be the success thread
-    if((match = _regexAlloc(sizeof(regex_match_t) + (sizeof(char *) * 2 * vm->group_tbl_size), _regexMemContext)) == NULL) {
+    capture_size = sizeof(char *) * 2 * vm->group_tbl_size;
+    compound_size = regexThreadCompoundCalcMatchBufferSize(vm, thread);
+    if((match = _regexAlloc(sizeof(regex_match_t) + capture_size + compound_size, _regexMemContext)) == NULL) {
         return NULL;
     }
     memset(match, 0, sizeof(regex_match_t));
+    match->subexprs = (const char **) match->_buffer;
     match->vm = vm;
     match->text = text;
     match->len = eval->len;
@@ -3915,7 +3940,7 @@ FoundMatch:
     for(k = 0; k < (vm->group_tbl_size * 2); k++) {
         match->subexprs[k] = thread->subexprs[k];
     }
-    match->compound = thread->compound;
+    regexThreadCompoundStoreInMatch(match, match->_buffer + capture_size, thread);
     thread->compound = NULL;
     regexEvalFree(eval);
 
@@ -4015,8 +4040,38 @@ void printEscapedStr(FILE *fp, const char *text, int len) {
     }
 }
 
-int regexGroupCompoundCountGet(regex_match_t *match, int group);
-const char *regexGroupCompoundValueGet(regex_match_t *match, int group, int num, int *len);
+int regexGroupCompoundCountGet(regex_match_t *match, int group) {
+    int cnt;
+    if((group < 1) || (group > match->vm->group_tbl_size)) {
+        return 0;
+    }
+    group--;
+
+    for(cnt = 0; match->compound[group][cnt] != NULL; cnt++);
+
+    return cnt / 2;
+}
+
+const char *regexGroupCompoundValueGet(regex_match_t *match, int group, int num, int *len) {
+    int cnt;
+
+    if(len != NULL) {
+        *len = 0;
+    }
+    if((group < 1) || (group > match->vm->group_tbl_size)) {
+        return NULL;
+    }
+    group--;
+    num *= 2;
+    for(cnt = 0; ((cnt < num) && (match->compound[group][cnt] != NULL)); cnt++);
+    if(match->compound[group][cnt] == NULL) {
+        return NULL;
+    }
+    if(len != NULL) {
+        *len = match->compound[group][cnt + 1] - match->compound[group][cnt];
+    }
+    return match->compound[group][cnt];
+}
 
 void regexDumpMatch(regex_match_t *match) {
     int k, m, n, len;
