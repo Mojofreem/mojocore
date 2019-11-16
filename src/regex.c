@@ -3103,29 +3103,24 @@ int regexVMGroupNameLookup(regex_vm_t *vm, const char *name) {
 
 // VM Patch list management functions ///////////////////////////////////////
 
-#define REGEX_VM_INSTR_DECODE2(var,vm,pc)   (var)[0] = (vm)->program[(pc)] & 0xFU; \
+#define REGEX_VM_INSTR_DECODE(var,vm,pc)   (var)[0] = (vm)->program[(pc)] & 0xFU; \
                                             (var)[1] = ((vm)->program[(pc)] & 0x3FFF0U) >> 4U; \
                                             (var)[2] = ((vm)->program[(pc)] & 0xFFFC0000U) >> 18U;
-#define REGEX_VM_INSTR_DECODE1(var,vm,pc)   (var)[0] = (vm)->program[(pc)] & 0xFU; \
-                                            (var)[1] = ((vm)->program[(pc)] & 0x3FFF0U) >> 4U;
-#define REGEX_VM_INSTR_DECODE0(var,vm,pc)   (var)[0] = (vm)->program[(pc)] & 0xFU;
 
-#define REGEX_VM_INSTR_ENCODE2(vm,pc,instr,opa,opb) (vm)->program[(pc)] = (instr & 0xFU) | ((opa & 0x3FFFU) << 4U) | ((opb & 0x3FFFU) << 18U)
-#define REGEX_VM_INSTR_ENCODE1(vm,pc,instr,opa)     (vm)->program[(pc)] = (instr & 0xFU) | ((opa & 0x3FFFU) << 4U)
-#define REGEX_VM_INSTR_ENCODE0(vm,pc,instr)         (vm)->program[(pc)] = (instr & 0xFU)
+#define REGEX_VM_INSTR_ENCODE(vm,pc,instr,opa,opb) (vm)->program[(pc)] = (instr & 0xFU) | ((opa & 0x3FFFU) << 4U) | ((opb & 0x3FFFU) << 18U)
 
-int regexAddPCPatchEntry(regex_vm_pc_patch_t **patch_list, regex_token_t *token, int index, int operand) {
+int regexAddPCPatchEntry(regex_vm_build_t *build, regex_token_t *token, int operand) {
     regex_vm_pc_patch_t *entry;
 
     if((entry = _regexAlloc(sizeof(regex_vm_pc_patch_t), _regexMemContext)) == NULL) {
         return 0;
     }
     memset(entry, 0, sizeof(regex_vm_pc_patch_t));
-    entry->pc = index;
+    entry->pc = build->pc;
     entry->operand = operand;
     entry->token = token;
-    entry->next = *patch_list;
-    *patch_list = entry;
+    entry->next = build->patch_list;
+    build->patch_list = entry;
     return 1;
 }
 
@@ -3144,13 +3139,13 @@ void regexVMPatchJumps(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list
 
     for(patch = *patch_list; patch != NULL; patch = next) {
         next = patch->next;
-        REGEX_VM_INSTR_DECODE2(instr, build->vm, patch->pc);
+        REGEX_VM_INSTR_DECODE(instr, build->vm, patch->pc);
         if(patch->operand == 1) {
             instr[1] = patch->token->pc;
         } else {
             instr[2] = patch->token->pc;
         }
-        REGEX_VM_INSTR_ENCODE2(build->vm, patch->pc, instr[0], instr[1], instr[2]);
+        REGEX_VM_INSTR_ENCODE(build->vm, patch->pc, instr[0], instr[1], instr[2]);
         _regexDealloc(patch, _regexMemContext);
     }
     *patch_list = NULL;
@@ -3238,31 +3233,15 @@ int regexVMProgramAdd(regex_vm_build_t *build, eRegexToken opcode, unsigned int 
         build->vm->size += DEF_VM_SIZE_INC;
     }
 
-    REGEX_VM_INSTR_ENCODE2(build->vm, build->pc, opcode, arg1, arg2);
+    REGEX_VM_INSTR_ENCODE(build->vm, build->pc, opcode, arg1, arg2);
     build->pc++;
 
     return 1;
 }
 
-void regexWalkAllTokens(regex_token_t *token, int value) {
-    if(token != NULL) {
-        if(token->pc == value) {
-            return;
-        }
-        token->pc = value;
-        if(token->out_a != NULL) {
-            regexWalkAllTokens(token->out_a, value);
-        }
-        if(token->out_b != NULL) {
-            regexWalkAllTokens(token->out_b, value);
-        }
-    }
-}
-
 // VM bytecode generator ////////////////////////////////////////////////////
 
-int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list,
-                                regex_token_t *token, regex_token_t **next) {
+int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_token_t *token, regex_token_t **next) {
     int idx_a = 0, idx_b = 0;
 
     if(token == NULL) {
@@ -3278,7 +3257,7 @@ int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_vm_pc_patch_t **p
     switch(token->tokenType) {
         case eTokenCharLiteral:
             idx_a = token->c;
-            idx_b = token->flags & REGEX_TOKEN_FLAG_INVERT;
+            idx_b = (int)(token->flags & REGEX_TOKEN_FLAG_INVERT);
             break;
         case eTokenStringLiteral:
             if((idx_a = regexVMStringTableEntryAdd(build, token->str, token->len)) == -1) {
@@ -3292,7 +3271,7 @@ int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_vm_pc_patch_t **p
             break;
         case eTokenCall:
             if((idx_a = token->out_b->pc) == VM_PC_UNVISITED) {
-                if(!regexAddPCPatchEntry(patch_list, token->out_b, build->pc, 1)) {
+                if(!regexAddPCPatchEntry(build, token->out_b, 1)) {
                     return 0;
                 }
                 if(!regexVMGenPathSubroutineExists(build, token->out_b)) {
@@ -3304,29 +3283,28 @@ int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_vm_pc_patch_t **p
             break;
         case eTokenSave:
             idx_a = token->group;
-            idx_b = token->flags & REGEX_TOKEN_FLAG_COMPOUND;
+            idx_b = (int)(token->flags & REGEX_TOKEN_FLAG_COMPOUND);
             break;
         case eTokenSplit:
             if((idx_a = token->out_a->pc) == VM_PC_UNVISITED) {
-                if(!regexAddPCPatchEntry(patch_list, token->out_a, build->pc, 1)) {
+                if(!regexAddPCPatchEntry(build, token->out_a, 1)) {
                     return 0;
                 }
             }
             if((idx_b = token->out_b->pc) == VM_PC_UNVISITED) {
-                if(!regexAddPCPatchEntry(patch_list, token->out_b, build->pc, 2)) {
+                if(!regexAddPCPatchEntry(build, token->out_b, 2)) {
                     return 0;
                 }
             }
             break;
         case eTokenJmp:
             if((idx_a = token->out_a->pc) == VM_PC_UNVISITED) {
-                if(!regexAddPCPatchEntry(patch_list, token->out_a, build->pc, 1)) {
+                if(!regexAddPCPatchEntry(build, token->out_a, 1)) {
                     return 0;
                 }
             }
             break;
         default:
-            // Fall through
             break;
     }
 
@@ -3346,7 +3324,7 @@ int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_vm_pc_patch_t **p
 int regexVMProgramGenerate(regex_vm_build_t *build, regex_token_t *token) {
     do {
         for(;token != NULL;) {
-            if(!regexVMProgramGenerateInstr(build, &(build->patch_list), token, &token)) {
+            if(!regexVMProgramGenerateInstr(build, token, &token)) {
                 return 0;
             }
         }
@@ -3355,7 +3333,7 @@ int regexVMProgramGenerate(regex_vm_build_t *build, regex_token_t *token) {
     token = regexVMGenPathGetNext(build, 1);
     do {
         for(;token != NULL;) {
-            if(!regexVMProgramGenerateInstr(build, &(build->patch_list), token, &token)) {
+            if(!regexVMProgramGenerateInstr(build, token, &token)) {
                 return 0;
             }
         }
@@ -3563,7 +3541,7 @@ void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
     const char *name;
 
     for(pc = 0; pc < vm->size; pc++) {
-        REGEX_VM_INSTR_DECODE2(instr, vm, pc);
+        REGEX_VM_INSTR_DECODE(instr, vm, pc);
         fprintf(fp, "%3.3d  ", pc);
         switch(instr[0]) {
             case eTokenCharLiteral:
@@ -3678,19 +3656,13 @@ eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
     // runtime evaluation.
 
     if((ctx->status = regexShuntingYard(&(build.tokens))) != eCompileOk) {
-        regexWalkAllTokens(build.tokens, VM_PC_UNVISITED);
         regexTokenDestroy(build.tokens, 0);
         regexVMBuildDestroy(&build);
         ctx->vm = NULL;
         return ctx->status;
     }
 
-    regexWalkAllTokens(build.tokens, VM_PC_PENDING_ASSIGNMENT);
-    regexWalkAllTokens(build.tokens, VM_PC_UNVISITED);
-
     if(!regexVMProgramGenerate(&build, build.tokens)) {
-        regexWalkAllTokens(build.tokens, VM_PC_PENDING_ASSIGNMENT);
-        regexWalkAllTokens(build.tokens, VM_PC_UNVISITED);
         regexTokenDestroy(build.tokens, 0);
         regexVMBuildDestroy(&build);
         ctx->vm = NULL;
@@ -4030,7 +4002,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
     unsigned char c = *eval->sp;
 
     while(regexVMNoTextAdvance(eval->vm->program[thread->pc])) {
-        REGEX_VM_INSTR_DECODE2(instr, eval->vm, thread->pc);
+        REGEX_VM_INSTR_DECODE(instr, eval->vm, thread->pc);
         switch(instr[0]) {
             case eTokenSave:
                 if(instr[1] % 2) {
@@ -4093,7 +4065,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                 return eEvalInternalError;
         }
     }
-    REGEX_VM_INSTR_DECODE2(instr, eval->vm, thread->pc);
+    REGEX_VM_INSTR_DECODE(instr, eval->vm, thread->pc);
     switch(instr[0]) {
         case eTokenCharLiteral:
             if((instr[2] && instr[1] == c) || (instr[1] != c)) {
@@ -4415,7 +4387,7 @@ void regexDumpMatch(regex_match_t *match) {
 int main(int argc, char **argv) {
     regex_compile_ctx_t result;
     regex_match_t *match;
-    const char test[] = "abcdefgjfoofwof\u01a8o8167287catfoo";
+    const char test[] = "abcdefgjfoofwofwo8167287catfoo";
 
     if(argc > 1) {
         if(regexCompile(&result, argv[1], 0) != eCompileOk) {
