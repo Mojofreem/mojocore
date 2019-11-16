@@ -71,7 +71,6 @@
         \> match end of word (assertion, non consuming, ASCII only)
         unicode utf8 classes
             build NFA from class tree
-        convert call NFA to VM
 
     (?P<name>...)  named subexpressions
     (?:...) non capturing subexpressions
@@ -592,7 +591,7 @@ regex_token_t *regexAllocToken(eRegexToken tokenType, int c, char *str, int size
     }
     memset(token, 0, sizeof(regex_token_t));
     token->tokenType = tokenType;
-
+    token->pc = VM_PC_UNVISITED;
     if(str != NULL) {
         token->str = str;
         token->len = sizeOrFlags;
@@ -651,12 +650,17 @@ void regexTokenDestroy(regex_token_t *token, int stack) {
             _regexDealloc(token, _regexMemContext);
         }
     } else {
-        if(token->pc != VM_PC_UNVISITED) {
-            return;
+        switch(token->tokenType) {
+            case eTokenCharClass:
+            case eTokenStringLiteral:
+                if(token->str != NULL) {
+                    _regexDealloc(token->str, _regexMemContext);
+                }
+                break;
+            default:
+                break;
         }
-        token->pc = VM_PC_UNVISITED;
-        regexTokenDestroy(token->out_a, 0);
-        regexTokenDestroy(token->out_b, 0);
+        _regexDealloc(token, _regexMemContext);
     }
 }
 
@@ -2143,12 +2147,10 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         break;
 
                     case 'w': // word character
-                        // TODO: derive from the unicode DB
                         class = META_CLASS(META_WORD_PATTERN);
                         break;
 
                     case 'W': // non word character
-                        // TODO: derive from the unicode DB
                         class = META_CLASS_INV(META_WORD_PATTERN);
                         break;
                 }
@@ -2158,7 +2160,6 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                 continue;
 
             case eRegexPatternUnicodeMetaClass:
-                printf("utf8 class: %c%c\n", c.c & 0xFF, (((c.c & 0xFF00) >> 8) ? ((c.c & 0xFF00) >> 8) : '_'));
                 if(!parseUnicodeClassAndCreateToken(&status, c.c, tokens)) {
                     SET_RESULT(status);
                 }
