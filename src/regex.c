@@ -217,7 +217,7 @@ struct regex_vm_s {
 
 typedef void *(*regexMemAllocator_t)(size_t size, void *ctx);
 typedef void (*regexMemDeallocator_t)(void *ptr, void *ctx);
-typedef void *(*regexMemReallocator_t)(void *ptr, size_t size, void *ctx);
+typedef void *(*regexMemReallocator_t)(void *ptr, size_t old_size, size_t new_size, void *ctx);
 
 void regexSetMemoryAllocator(regexMemAllocator_t alloc,
                              regexMemDeallocator_t dealloc,
@@ -307,15 +307,21 @@ int regexGroupIndexLookup(regex_vm_t *vm, const char *name);
 // Delegated memory allocation handlers /////////////////////////////////////
 
 static void *regexDefMemAllocator(size_t size, void *ctx) {
-    return malloc(size);
+    void *ptr = malloc(size);
+    memset(ptr, 0, size);
+    return ptr;
 }
 
 static void regexDefMemDeallocator(void *ptr, void *ctx) {
     free(ptr);
 }
 
-static void *regexDefMemReallocator(void *ptr, size_t size, void *ctx) {
-    return realloc(ptr, size);
+static void *regexDefMemReallocator(void *ptr, size_t old_size, size_t new_size, void *ctx) {
+    ptr = realloc(ptr, new_size);
+    if(new_size > old_size) {
+        memset(((unsigned char *)ptr) + old_size, 0, new_size - old_size);
+    }
+    return ptr;
 }
 
 regexMemAllocator_t _regexAlloc = regexDefMemAllocator;
@@ -429,10 +435,27 @@ struct regex_token_s {
     regex_token_t *next;
 };
 
+typedef struct regex_vm_pc_patch_s regex_vm_pc_patch_t;
+struct regex_vm_pc_patch_s {
+    regex_token_t *token;
+    int pc;
+    int operand;
+    regex_vm_pc_patch_t *next;
+};
+
+typedef struct regex_vm_gen_path_s regex_vm_gen_path_t;
+struct regex_vm_gen_path_s {
+    regex_token_t *token;
+    regex_vm_gen_path_t *next;
+};
+
 typedef struct regex_vm_build_s regex_vm_build_t;
 struct regex_vm_build_s {
     regex_vm_t *vm;
     regex_token_t *tokens;
+    regex_vm_pc_patch_t *patch_list;
+    regex_vm_gen_path_t *gen_list;
+    regex_vm_gen_path_t *gen_pool;
     unsigned int flags;
     int string_tbl_count;
     int class_tbl_count;
@@ -2873,11 +2896,17 @@ int regexVMStringTableEntryAdd(regex_vm_build_t *build, const char *str, int len
     }
 
     if(build->vm->string_tbl_size <= build->string_tbl_count) {
-        if((build->vm->string_table = _regexRealloc(build->vm->string_table, (build->vm->string_tbl_size + DEF_VM_STRTBL_INC) * sizeof(char *), _regexMemContext)) == NULL) {
+        if((build->vm->string_table = _regexRealloc(build->vm->string_table,
+                                                    (build->vm->string_tbl_size * sizeof(char *)),
+                                                    (build->vm->string_tbl_size + DEF_VM_STRTBL_INC) * sizeof(char *),
+                                                    _regexMemContext)) == NULL) {
             return -1;
         }
         memset(build->vm->string_table + build->vm->string_tbl_size, 0, DEF_VM_STRTBL_INC * sizeof(char *));
-        if((build->vm->string_tbl_len = _regexRealloc(build->vm->string_tbl_len, (build->vm->string_tbl_size + DEF_VM_STRTBL_INC) * sizeof(int), _regexMemContext)) == NULL) {
+        if((build->vm->string_tbl_len = _regexRealloc(build->vm->string_tbl_len,
+                                                      (build->vm->string_tbl_size * sizeof(int)),
+                                                      (build->vm->string_tbl_size + DEF_VM_STRTBL_INC) * sizeof(int),
+                                                      _regexMemContext)) == NULL) {
             return -1;
         }
         memset(build->vm->string_tbl_len + build->vm->string_tbl_size, 0, DEF_VM_STRTBL_INC * sizeof(int));
@@ -2929,7 +2958,10 @@ int regexVMClassTableEntryAdd(regex_vm_build_t *build, const unsigned int *bitma
     }
 
     if(build->vm->class_tbl_size <= build->class_tbl_count ) {
-        if((build->vm->class_table = _regexRealloc(build->vm->class_table, (build->vm->class_tbl_size + DEF_VM_STRTBL_INC) * sizeof(unsigned int *), _regexMemContext)) == NULL) {
+        if((build->vm->class_table = _regexRealloc(build->vm->class_table,
+                                                   (build->vm->class_tbl_size * sizeof(unsigned int *)),
+                                                   (build->vm->class_tbl_size + DEF_VM_STRTBL_INC) * sizeof(unsigned int *),
+                                                   _regexMemContext)) == NULL) {
             return -1;
         }
         memset(build->vm->class_table + build->vm->class_tbl_size, 0, DEF_VM_STRTBL_INC * sizeof(unsigned int *));
@@ -2978,7 +3010,10 @@ int regexVMUtf8TableEntryAdd(regex_vm_build_t *build, const unsigned int *bitmap
     }
 
     if(build->vm->utf8_tbl_size <= build->utf8_tbl_count ) {
-        if((build->vm->utf8_class_table = _regexRealloc(build->vm->utf8_class_table, (build->vm->utf8_tbl_size + DEF_VM_STRTBL_INC) * sizeof(unsigned int *), _regexMemContext)) == NULL) {
+        if((build->vm->utf8_class_table = _regexRealloc(build->vm->utf8_class_table,
+                                                        (build->vm->utf8_tbl_size * sizeof(unsigned int *)),
+                                                        (build->vm->utf8_tbl_size + DEF_VM_STRTBL_INC) * sizeof(unsigned int *),
+                                                        _regexMemContext)) == NULL) {
             return -1;
         }
         memset(build->vm->utf8_class_table + build->vm->utf8_tbl_size, 0, DEF_VM_STRTBL_INC * sizeof(unsigned int *));
@@ -3023,7 +3058,10 @@ int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int le
     int add;
 
     add = index - build->vm->group_tbl_size;
-    if((build->vm->group_table = _regexRealloc(build->vm->group_table, (build->vm->group_tbl_size + add) * sizeof(char *), _regexMemContext)) == NULL) {
+    if((build->vm->group_table = _regexRealloc(build->vm->group_table,
+                                               (build->vm->group_tbl_size * sizeof(char *)),
+                                               (build->vm->group_tbl_size + add) * sizeof(char *),
+                                               _regexMemContext)) == NULL) {
         return 0;
     }
     memset(build->vm->group_table + build->vm->group_tbl_size, 0, add * sizeof(char *));
@@ -3073,14 +3111,6 @@ int regexVMGroupNameLookup(regex_vm_t *vm, const char *name) {
 #define REGEX_VM_INSTR_ENCODE1(vm,pc,instr,opa)     (vm)->program[(pc)] = (instr & 0xFU) | ((opa & 0x3FFFU) << 4U)
 #define REGEX_VM_INSTR_ENCODE0(vm,pc,instr)         (vm)->program[(pc)] = (instr & 0xFU)
 
-typedef struct regex_vm_pc_patch_s regex_vm_pc_patch_t;
-struct regex_vm_pc_patch_s {
-    regex_token_t *token;
-    int pc;
-    int operand;
-    regex_vm_pc_patch_t *next;
-};
-
 int regexAddPCPatchEntry(regex_vm_pc_patch_t **patch_list, regex_token_t *token, int index, int operand) {
     regex_vm_pc_patch_t *entry;
 
@@ -3123,11 +3153,59 @@ void regexVMPatchJumps(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list
     *patch_list = NULL;
 }
 
+int regexVMGenPathCreate(regex_vm_build_t *build, regex_token_t *token) {
+    regex_vm_gen_path_t *entry;
+
+    if(build->gen_pool != NULL) {
+        entry = build->gen_pool;
+        build->gen_pool = entry->next;
+    } else {
+        if((entry = _regexAlloc(sizeof(regex_vm_gen_path_t), _regexMemContext)) == NULL) {
+            return 0;
+        }
+    }
+    entry->token = token;
+    entry->next = build->gen_list;
+    build->gen_list = entry;
+    return 1;
+}
+
+regex_token_t *regexVMGenPathGetNext(regex_vm_build_t *build) {
+    regex_vm_gen_path_t *entry;
+
+    if((entry = build->gen_list) == NULL) {
+        return NULL;
+    }
+    build->gen_list = entry->next;
+    entry->next = build->gen_pool;
+    build->gen_pool = entry;
+    return entry->token;
+}
+
+void regexVMGenPathFree(regex_vm_build_t *build) {
+    regex_vm_gen_path_t *walk, *next;
+
+    for(walk = build->gen_list; walk != NULL; walk = next) {
+        next = walk->next;
+        free(walk);
+    }
+    build->gen_list = NULL;
+
+    for(walk = build->gen_pool; walk != NULL; walk = next) {
+        next = walk->next;
+        free(walk);
+    }
+    build->gen_pool = NULL;
+}
+
 /////////////////////////////////////////////////////////////////////////////
 
 int regexVMProgramAdd(regex_vm_build_t *build, eRegexToken opcode, unsigned int arg1, unsigned int arg2) {
     if((build->vm->size - build->pc) <= 0) {
-        if((build->vm->program = _regexRealloc(build->vm->program, (build->vm->size + DEF_VM_SIZE_INC) * sizeof(int), _regexMemContext)) == NULL) {
+        if((build->vm->program = _regexRealloc(build->vm->program,
+                                               (build->vm->size * sizeof(int)),
+                                               (build->vm->size + DEF_VM_SIZE_INC) * sizeof(int),
+                                               _regexMemContext)) == NULL) {
             return 0;
         }
         memset(build->vm->program + build->vm->size, 0, DEF_VM_SIZE_INC * sizeof(int));
@@ -3157,13 +3235,16 @@ void regexWalkAllTokens(regex_token_t *token, int value) {
 
 // VM bytecode generator ////////////////////////////////////////////////////
 
-int regexVMProgramGenerate(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list, regex_token_t *token) {
+int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list,
+                                regex_token_t *token, regex_token_t **next) {
     int idx_a = 0, idx_b = 0;
 
     if(token == NULL) {
+        *next = NULL;
         return 1;
     }
     if(token->pc != VM_PC_UNVISITED) {
+        *next = NULL;
         return 1;
     }
     token->pc = build->pc;
@@ -3219,14 +3300,24 @@ int regexVMProgramGenerate(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_
     }
 
     if(token->tokenType == eTokenSplit) {
-        if(!regexVMProgramGenerate(build, patch_list, token->out_a)) {
+        if(!regexVMGenPathCreate(build, token->out_b)) {
             return 0;
         }
-        return regexVMProgramGenerate(build, patch_list, token->out_b);
     }
+    *next = token->out_a;
+    return 1;
+}
 
-    return regexVMProgramGenerate(build, patch_list, token->out_a);
+int regexVMProgramGenerate(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list, regex_token_t *token) {
+    do {
+        for(;token != NULL;) {
+            if(!regexVMProgramGenerateInstr(build, patch_list, token, &token)) {
+                return 0;
+            }
+        }
+    } while((token = regexVMGenPathGetNext(build)) != NULL);
 
+    return 1;
 }
 
 int regexVMBuildInit(regex_vm_build_t *build) {
