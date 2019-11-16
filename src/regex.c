@@ -455,6 +455,7 @@ struct regex_vm_build_s {
     regex_token_t *tokens;
     regex_vm_pc_patch_t *patch_list;
     regex_vm_gen_path_t *gen_list;
+    regex_vm_gen_path_t *subroutine_list;
     regex_vm_gen_path_t *gen_pool;
     unsigned int flags;
     int string_tbl_count;
@@ -591,6 +592,7 @@ regex_token_t *regexAllocToken(eRegexToken tokenType, int c, char *str, int size
     }
     memset(token, 0, sizeof(regex_token_t));
     token->tokenType = tokenType;
+
     if(str != NULL) {
         token->str = str;
         token->len = sizeOrFlags;
@@ -3153,7 +3155,18 @@ void regexVMPatchJumps(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list
     *patch_list = NULL;
 }
 
-int regexVMGenPathCreate(regex_vm_build_t *build, regex_token_t *token) {
+int regexVMGenPathSubroutineExists(regex_vm_build_t *build, regex_token_t *token) {
+    regex_vm_gen_path_t *entry;
+
+    for(entry = build->subroutine_list; entry != NULL; entry = entry->next) {
+        if(entry->token == token) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int regexVMGenPathCreate(regex_vm_build_t *build, regex_token_t *token, int subroutine) {
     regex_vm_gen_path_t *entry;
 
     if(build->gen_pool != NULL) {
@@ -3165,19 +3178,25 @@ int regexVMGenPathCreate(regex_vm_build_t *build, regex_token_t *token) {
         }
     }
     entry->token = token;
-    entry->next = build->gen_list;
-    build->gen_list = entry;
+    if(subroutine) {
+        entry->next = build->subroutine_list;
+        build->subroutine_list = entry;
+    } else {
+        entry->next = build->gen_list;
+        build->gen_list = entry;
+    }
     return 1;
 }
 
-regex_token_t *regexVMGenPathGetNext(regex_vm_build_t *build) {
+regex_token_t *regexVMGenPathGetNext(regex_vm_build_t *build, int subroutine) {
     regex_vm_gen_path_t *entry;
+    regex_vm_gen_path_t **base = (subroutine ? &(build->subroutine_list) : &(build->gen_list));
 
-    if((entry = build->gen_list) == NULL) {
+    if((entry = *base) == NULL) {
         return NULL;
     }
-    build->gen_list = entry->next;
-    entry->next = build->gen_pool;
+    *base = entry->next;
+    entry->next = *base;
     build->gen_pool = entry;
     return entry->token;
 }
@@ -3190,6 +3209,12 @@ void regexVMGenPathFree(regex_vm_build_t *build) {
         free(walk);
     }
     build->gen_list = NULL;
+
+    for(walk = build->subroutine_list; walk != NULL; walk = next) {
+        next = walk->next;
+        free(walk);
+    }
+    build->subroutine_list = NULL;
 
     for(walk = build->gen_pool; walk != NULL; walk = next) {
         next = walk->next;
@@ -3265,7 +3290,16 @@ int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_vm_pc_patch_t **p
             }
             break;
         case eTokenCall:
-            idx_a = token->group;
+            if((idx_a = token->out_b->pc) == VM_PC_UNVISITED) {
+                if(!regexAddPCPatchEntry(patch_list, token->out_b, build->pc, 1)) {
+                    return 0;
+                }
+                if(!regexVMGenPathSubroutineExists(build, token->out_b)) {
+                    if(!regexVMGenPathCreate(build, token->out_b, 1)) {
+                        return 0;
+                    }
+                }
+            }
             break;
         case eTokenSave:
             idx_a = token->group;
@@ -3300,7 +3334,7 @@ int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_vm_pc_patch_t **p
     }
 
     if(token->tokenType == eTokenSplit) {
-        if(!regexVMGenPathCreate(build, token->out_b)) {
+        if(!regexVMGenPathCreate(build, token->out_b, 0)) {
             return 0;
         }
     }
@@ -3308,14 +3342,26 @@ int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_vm_pc_patch_t **p
     return 1;
 }
 
-int regexVMProgramGenerate(regex_vm_build_t *build, regex_vm_pc_patch_t **patch_list, regex_token_t *token) {
+int regexVMProgramGenerate(regex_vm_build_t *build, regex_token_t *token) {
     do {
         for(;token != NULL;) {
-            if(!regexVMProgramGenerateInstr(build, patch_list, token, &token)) {
+            if(!regexVMProgramGenerateInstr(build, &(build->patch_list), token, &token)) {
                 return 0;
             }
         }
-    } while((token = regexVMGenPathGetNext(build)) != NULL);
+    } while((token = regexVMGenPathGetNext(build, 0)) != NULL);
+
+    token = regexVMGenPathGetNext(build, 1);
+    do {
+        for(;token != NULL;) {
+            if(!regexVMProgramGenerateInstr(build, &(build->patch_list), token, &token)) {
+                return 0;
+            }
+        }
+    } while((token = regexVMGenPathGetNext(build, 1)) != NULL);
+
+    regexVMPatchJumps(build, &(build->patch_list));
+    regexVMPatchListFree(build->patch_list);
 
     return 1;
 }
@@ -3339,6 +3385,8 @@ void regexVMFree(regex_vm_t *vm) {
 
 void regexVMBuildDestroy(regex_vm_build_t *build) {
     regexVMFree(build->vm);
+    regexVMGenPathFree(build);
+    regexVMPatchListFree(build->patch_list);
 }
 
 void regexVMGenerateDeclaration(regex_vm_t *vm, const char *symbol, FILE *fp) {
@@ -3600,7 +3648,6 @@ const char *regexGetCompileStatusStr(eRegexCompileStatus status) {
 eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
                                  unsigned int flags) {
     regex_vm_build_t build;
-    regex_vm_pc_patch_t *patch_list = NULL;
 
     memset(ctx, 0, sizeof(regex_compile_ctx_t));
     ctx->pattern = pattern;
@@ -3640,19 +3687,15 @@ eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
     regexWalkAllTokens(build.tokens, VM_PC_PENDING_ASSIGNMENT);
     regexWalkAllTokens(build.tokens, VM_PC_UNVISITED);
 
-    if(!regexVMProgramGenerate(&build, &patch_list, build.tokens)) {
+    if(!regexVMProgramGenerate(&build, build.tokens)) {
         regexWalkAllTokens(build.tokens, VM_PC_PENDING_ASSIGNMENT);
         regexWalkAllTokens(build.tokens, VM_PC_UNVISITED);
         regexTokenDestroy(build.tokens, 0);
         regexVMBuildDestroy(&build);
-        regexVMPatchListFree(patch_list);
         ctx->vm = NULL;
         ctx->status = eCompileOutOfMem;
         return ctx->status;
     }
-
-    regexVMPatchJumps(&build, &patch_list);
-    regexVMPatchListFree(patch_list);
 
     // Fixup the lookup tables
     build.vm->string_tbl_size = build.string_tbl_count;
