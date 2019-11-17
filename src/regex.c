@@ -1,14 +1,15 @@
 #ifndef _MOJO_REGEX_HEADER_
 #define _MOJO_REGEX_HEADER_
 
+#define MOJO_REGEX_TEST_MAIN
 #define MOJO_REGEX_COMPILE_IMPLEMENTATION
 #define MOJO_REGEX_EVALUATE_IMPLEMENTATION
+#define MOJO_UNICODE_SUPPORT
 #define MOJO_REGEX_IMPLEMENTATION
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "unicode_props.c"
 
 /*
     Flags (TODO)
@@ -191,8 +192,6 @@ All VM programs are prefixed with: TODO
 Test: a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat abcdefgefgjfoo8167287catfoo
 */
 
-
-
 /////////////////////////////////////////////////////////////////////////////
 
 #define REGEX_VM_MACHINE_VERSION    5
@@ -302,7 +301,9 @@ int regexGroupIndexLookup(regex_vm_t *vm, const char *name);
 #if defined(MOJO_REGEX_IMPLEMENTATION)
 /////////////////////////////////////////////////////////////////////////////
 
-// Delegated memory allocation handlers /////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////
+// Delegated memory allocation handlers
+/////////////////////////////////////////////////////////////////////////////
 
 static void *regexDefMemAllocator(size_t size, void *ctx) {
     void *ptr = malloc(size);
@@ -337,7 +338,9 @@ void regexSetMemoryAllocator(regexMemAllocator_t alloc,
     _regexMemContext = context;
 }
 
-// Table management and data reproduction ///////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////
+// String table management and data reproduction
+/////////////////////////////////////////////////////////////////////////////
 
 #define REGEX_TABLE_DEDUPE      0x01u
 #define REGEX_TABLE_KEEP_PTR    0x02u
@@ -406,26 +409,9 @@ void tableEntryFree(void ***base, int *table_size, int free_data) {
     *table_size = 0;
 }
 
-// CRC calculation functions ////////////////////////////////////////////////
-
-// Public domain from http://home.thep.lu.se/~bjorn/crc/
-
-uint32_t crc32_for_byte(uint32_t r) {
-    for(int j = 0; j < 8; ++j)
-        r = (r & 1? 0: (uint32_t)0xEDB88320L) ^ r >> 1;
-    return r ^ (uint32_t)0xFF000000L;
-}
-
-void crc32(const void *data, size_t n_bytes, uint32_t* crc) {
-    static uint32_t table[0x100];
-    if(!*table)
-        for(size_t i = 0; i < 0x100; ++i)
-            table[i] = crc32_for_byte(i);
-    for(size_t i = 0; i < n_bytes; ++i)
-        *crc = table[(uint8_t)*crc ^ ((uint8_t*)data)[i]] ^ *crc >> 8;
-}
-
-// Data structures and function declarations ////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////
+// Parsing, token, and VM data structures and function declarations
+/////////////////////////////////////////////////////////////////////////////
 
 #define DEF_VM_SIZE_INC 1024
 
@@ -531,8 +517,92 @@ struct regex_vm_build_s {
 int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int len, int index);
 
 /////////////////////////////////////////////////////////////////////////////
+// Token meta attribute helper functions
+/////////////////////////////////////////////////////////////////////////////
+
+// Determines whether a given token is a terminal operand. Used when comparing
+// two adjacent tokens, the preceeding flag indicates whether the token be
+// checked is leftmost.
+int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
+    switch(token->tokenType) {
+        case eTokenCharLiteral:
+        case eTokenStringLiteral:
+        case eTokenCharClass:
+        case eTokenByte:
+        case eTokenCall:
+        case eTokenReturn:
+        case eTokenCharAny:
+            return 1;
+        case eTokenZeroOrOne:
+        case eTokenZeroOrMany:
+        case eTokenOneOrMany:
+            return preceeding;
+        case eTokenSubExprEnd:
+            return preceeding;
+        case eTokenSubExprStart:
+            return !preceeding;
+        default:
+            return 0;
+    }
+}
+
+// Token priority when applying operators to operands in the shunting yard
+eRegexTokenPriority_t regexGetTokenTypePriority(eRegexToken_t tokenType) {
+    switch(tokenType) {
+        case eTokenCharLiteral:
+        case eTokenCharClass:
+        case eTokenStringLiteral:
+        case eTokenCharAny:
+        case eTokenByte:
+        case eTokenCall:
+        case eTokenReturn:
+        case eTokenMatch:
+        default:
+            return ePriorityNone;
+
+        case eTokenZeroOrOne:
+        case eTokenZeroOrMany:
+        case eTokenOneOrMany:
+            return ePriorityHigh;
+
+        case eTokenConcatenation:
+        case eTokenAlternative:
+            return ePriorityMedium;
+
+        case eTokenSubExprStart:
+        case eTokenSubExprEnd:
+            return ePriorityLow;
+    }
+}
+
+// Operator arity (number of tokens that the operator functions on) in the
+// shunting yard
+int regexGetOperatorArity(regex_token_t *token) {
+    switch(token->tokenType) {
+        case eTokenZeroOrOne:
+        case eTokenZeroOrMany:
+        case eTokenOneOrMany:
+            return 1;
+        case eTokenConcatenation:
+        case eTokenAlternative:
+            return 2;
+        default:
+            return 0;
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
 // Unicode char class registration functions
 /////////////////////////////////////////////////////////////////////////////
+
+// Forward declarations of the unicode property classes
+const char unicode_combining_marks[];
+const char unicode_numeric[];
+const char unicode_punctuation[];
+const char unicode_whitespace[];
+const char unicode_uppercase[];
+const char unicode_lowercase[];
+const char unicode_letter[];
 
 typedef struct regex_unicode_charclass_entry_s regex_unicode_charclass_entry_t;
 struct regex_unicode_charclass_entry_s {
@@ -595,7 +665,6 @@ int regexRegUnicodeCharClass(const char *classId, const char *classStr) {
     if((entry = _regexAlloc(sizeof(regex_unicode_charclass_entry_t), _regexMemContext)) == NULL) {
         return 0;
     }
-    memset(entry, 0, sizeof(regex_unicode_charclass_entry_t));
     entry->id[0] = classId[0];
     entry->id[1] = classId[1];
     entry->id[2] = '\0';
@@ -623,29 +692,6 @@ const char *regexGetUnicodeCharClass(const char *classId) {
 /////////////////////////////////////////////////////////////////////////////
 // Token management functions
 /////////////////////////////////////////////////////////////////////////////
-
-int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
-    switch(token->tokenType) {
-        case eTokenCharLiteral:
-        case eTokenStringLiteral:
-        case eTokenCharClass:
-        case eTokenByte:
-        case eTokenCall:
-        case eTokenReturn:
-        case eTokenCharAny:
-            return 1;
-        case eTokenZeroOrOne:
-        case eTokenZeroOrMany:
-        case eTokenOneOrMany:
-            return preceeding;
-        case eTokenSubExprEnd:
-            return preceeding;
-        case eTokenSubExprStart:
-            return !preceeding;
-        default:
-            return 0;
-    }
-}
 
 regex_token_t *regexAllocToken(eRegexToken_t tokenType, int c, char *str, int sizeOrFlags) {
     regex_token_t *token;
@@ -698,25 +744,12 @@ void regexTokenDestroy(regex_token_t *token, int stack) {
         return;
     }
 
-    if(stack) {
-        for(; token != NULL; token = next) {
-            next = token->next;
-            switch(token->tokenType) {
-                case eTokenCharClass:
-                case eTokenStringLiteral:
-                    if(token->str != NULL) {
-                        _regexDealloc(token->str, _regexMemContext);
-                    }
-                    break;
-                default:
-                    break;
-            }
-            _regexDealloc(token, _regexMemContext);
-        }
-    } else {
+    for(; token != NULL; token = next) {
+        next = token->next;
         switch(token->tokenType) {
             case eTokenCharClass:
             case eTokenStringLiteral:
+            case eTokenUtf8Class:
                 if(token->str != NULL) {
                     _regexDealloc(token->str, _regexMemContext);
                 }
@@ -725,6 +758,9 @@ void regexTokenDestroy(regex_token_t *token, int stack) {
                 break;
         }
         _regexDealloc(token, _regexMemContext);
+        if(!stack) {
+            break;
+        }
     }
 }
 
@@ -999,18 +1035,6 @@ int parseUtf8EncodingByteLen(int c) {
         return 2;
     }
     return 1;
-}
-
-unsigned int parseUtf8EncodeCodepoint(int c) {
-    if(c <= 127) { // 1 byte
-        return (unsigned int)c;
-    } else if(c <= 2047) { // 2 byte (5 prefix bits)
-        return 0xC080u | ((unsigned int)c & 0x3Fu) | (((unsigned int)c & 0x7C0u) << 2u);
-    } else if(c <= 65535) { // 3 byte (4 prefix bits)
-        return 0xE08080u | ((unsigned int)c & 0x3Fu) | (((unsigned int)c & 0xFC0u) << 2u) | (((unsigned int)c & 0xF000u) << 4u);
-    } else { // 4 byte (3 prefix bits)
-        return 0xF0808080u | ((unsigned int)c & 0x3Fu) | (((unsigned int)c & 0xFC0u) << 2u) | (((unsigned int)c & 0x3F000u) << 4u) | ((unsigned int)c & 0x7000000u);
-    }
 }
 
 // bytes should be a 5 byte sequence, and c a unicode codepoint
@@ -1408,6 +1432,7 @@ unsigned char *parseUtf8TreeGetLowByte(utf8_charclass_tree_t *tree, unsigned cha
 }
 
 int regexTokenUtf8ClassCreate(eRegexCompileStatus *status, regex_token_t **tokens, utf8_charclass_tree_t *tree) {
+    // TODO
     return 1;
 }
 
@@ -1488,7 +1513,6 @@ int parseUtf8TreeGenerateRange(utf8_charclass_tree_t *tree,
     // H references the max value for the high byte
     // L references the max value for the low bytes
 
-    unsigned char *bitmap;
     int mh, ml, h;
 
     switch(start[0]) {
@@ -1683,16 +1707,6 @@ int parseUtf8CharClassRangeSet(utf8_charclass_tree_t *tree, int code_a, int code
     }
 
     return 1;
-}
-
-utf8_charclass_tree_t *regexCharClassUtf8TreeCreate(void) {
-    utf8_charclass_tree_t *tree;
-
-    if((tree = _regexAlloc(sizeof(utf8_charclass_tree_t), _regexMemContext)) == NULL) {
-        return NULL;
-    }
-    memset(tree, 0, sizeof(utf8_charclass_tree_t));
-    return tree;
 }
 
 void regexCharClassUtf8TreeFree(utf8_charclass_tree_t *tree) {
@@ -2321,53 +2335,11 @@ eRegexToken_t regexTokenStackPeekType(regex_token_t *stack) {
     return stack->tokenType;
 }
 
-eRegexTokenPriority_t regexGetTokenTypePriority(eRegexToken_t tokenType) {
-    switch(tokenType) {
-        case eTokenCharLiteral:
-        case eTokenCharClass:
-        case eTokenStringLiteral:
-        case eTokenCharAny:
-        case eTokenByte:
-        case eTokenCall:
-        case eTokenReturn:
-        case eTokenMatch:
-        default:
-            return ePriorityNone;
-
-        case eTokenZeroOrOne:
-        case eTokenZeroOrMany:
-        case eTokenOneOrMany:
-            return ePriorityHigh;
-
-        case eTokenConcatenation:
-        case eTokenAlternative:
-            return ePriorityMedium;
-
-        case eTokenSubExprStart:
-        case eTokenSubExprEnd:
-            return ePriorityLow;
-    }
-}
-
 int regexStackTypeGreaterOrEqualToToken(regex_token_t *stack, eRegexToken_t tokenType) {
     eRegexTokenPriority_t stackPriority;
 
     stackPriority = regexGetTokenTypePriority(regexTokenStackPeekType(stack));
     return (stackPriority >= regexGetTokenTypePriority(tokenType));
-}
-
-int regexGetOperatorArity(regex_token_t *token) {
-    switch(token->tokenType) {
-        case eTokenZeroOrOne:
-        case eTokenZeroOrMany:
-        case eTokenOneOrMany:
-            return 1;
-        case eTokenConcatenation:
-        case eTokenAlternative:
-            return 2;
-        default:
-            return 0;
-    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -2820,7 +2792,7 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
                     // with an eTokenCall
                     if(regexSubroutineGet(*sub_index, token->sub_sequence) == NULL) {
                         if((status = regexShuntingYardFragment(&(token->sub_sequence), &subexpr, sub_index,
-                                                                 REGEX_SHUNTING_YARD_NO_CAPTURE, 0)) != eCompileOk) {
+                                                               REGEX_SHUNTING_YARD_NO_CAPTURE, 0)) != eCompileOk) {
                             SET_YARD_RESULT(status);
                         }
                         if(!regexOperatorReturnCreate(&subexpr)) {
@@ -2917,7 +2889,9 @@ eRegexCompileStatus regexShuntingYard(regex_token_t **tokens) {
     regex_sub_index_t *sub_index = NULL;
 
     status = regexShuntingYardFragment(tokens, &stack, &sub_index, REGEX_SHUNTING_YARD_NO_PARENT, 0);
+    regexSubroutineFree(&sub_index);
     if(status != eCompileOk) {
+        regexFragmentFree(stack);
         return status;
     }
 
@@ -3005,7 +2979,7 @@ void regexVMUtf8TableFree(regex_vm_t *vm) {
 // Group table //////////////////////////////////////////////////////////////
 
 int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int len, int index) {
-    int k, actual;
+    int k;
 
     for(k = build->vm->group_tbl_size; k < index; k++) {
         if(tableEntryAdd((void ***)&(build->vm->group_table), &(build->vm->group_tbl_size),
@@ -3014,15 +2988,15 @@ int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int le
         }
     }
     if(group == NULL) {
-        if((actual = tableEntryAdd((void ***)&(build->vm->group_table),
-                                   &(build->vm->group_tbl_size),
-                                   0, NULL, REGEX_TABLE_KEEP_PTR, NULL)) != index) {
+        if((tableEntryAdd((void ***)&(build->vm->group_table),
+                          &(build->vm->group_tbl_size),
+                          0, NULL, REGEX_TABLE_KEEP_PTR, NULL)) != index) {
             return 0;
         }
     } else {
-        if((actual = tableEntryAdd((void ***)&(build->vm->group_table),
-                                   &(build->vm->group_tbl_size),
-                                   len + 1, (void *)group, 0, NULL)) != index) {
+        if((tableEntryAdd((void ***)&(build->vm->group_table),
+                          &(build->vm->group_tbl_size),
+                          len + 1, (void *)group, 0, NULL)) != index) {
             return 0;
         }
         build->vm->group_table[index][len] = '\0';
@@ -3168,7 +3142,7 @@ void regexVMGenPathFree(regex_vm_build_t *build) {
     build->gen_pool = NULL;
 }
 
-/////////////////////////////////////////////////////////////////////////////
+// VM bytecode generator ////////////////////////////////////////////////////
 
 int regexVMProgramAdd(regex_vm_build_t *build, eRegexToken_t opcode, unsigned int arg1, unsigned int arg2) {
     if((build->vm->size - build->pc) <= 0) {
@@ -3187,8 +3161,6 @@ int regexVMProgramAdd(regex_vm_build_t *build, eRegexToken_t opcode, unsigned in
 
     return 1;
 }
-
-// VM bytecode generator ////////////////////////////////////////////////////
 
 int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_token_t *token, regex_token_t **next) {
     int idx_a = 0, idx_b = 0;
@@ -3299,7 +3271,6 @@ int regexVMBuildInit(regex_vm_build_t *build) {
     if((build->vm = _regexAlloc(sizeof(regex_vm_t), _regexMemContext)) == NULL) {
         return 0;
     }
-    memset(build->vm, 0, sizeof(regex_vm_t));
     build->vm->vm_version = REGEX_VM_MACHINE_VERSION;
     return 1;
 }
@@ -3307,6 +3278,7 @@ int regexVMBuildInit(regex_vm_build_t *build) {
 void regexVMFree(regex_vm_t *vm) {
     regexVMStringTableFree(vm);
     regexVMClassTableFree(vm);
+    regexVMUtf8TableFree(vm);
     regexVMGroupTableFree(vm);
     _regexDealloc(vm, _regexMemContext);
 }
@@ -3315,7 +3287,12 @@ void regexVMBuildDestroy(regex_vm_build_t *build) {
     regexVMFree(build->vm);
     regexVMGenPathFree(build);
     regexVMPatchListFree(build->patch_list);
+    regexTokenDestroy(build->tokens, 1);
 }
+
+/////////////////////////////////////////////////////////////////////////////
+// VM program source code generation functions
+/////////////////////////////////////////////////////////////////////////////
 
 void regexVMGenerateDeclaration(regex_vm_t *vm, const char *symbol, FILE *fp) {
     fprintf(fp, "extern regex_vm_t *%s;\n", symbol);
@@ -3460,7 +3437,20 @@ void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
     fprintf(fp, "};\n\n");
 
     // Utf8 character class table
-    // TODO
+    for(k = 0; k < vm->utf8_tbl_size; k++) {
+        if(vm->utf8_class_table[k] == NULL) {
+            continue;
+        }
+        fprintf(fp, "unsigned int _%s_utf8_class_entry_%d[] = {\n    ", symbol, k);
+        generateHexValueTable(fp, vm->utf8_class_table[k], 2);
+        fprintf(fp, "\n};\n\n");
+    }
+
+    fprintf(fp, "unsigned int *_%s_utf_class_table[] = {\n    ", symbol, k);
+    for(k = 0; k < vm->utf8_tbl_size; k++) {
+        fprintf(fp, "    _%s_class_entry_%d,\n", symbol, k);
+    }
+    fprintf(fp, "};\n\n");
 
     // Group table
     fprintf(fp, "char *_%s_group_table[] = {\n    ", symbol);
@@ -3604,14 +3594,12 @@ eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
     // runtime evaluation.
 
     if((ctx->status = regexShuntingYard(&(build.tokens))) != eCompileOk) {
-        regexTokenDestroy(build.tokens, 1);
         regexVMBuildDestroy(&build);
         ctx->vm = NULL;
         return ctx->status;
     }
 
     if(!regexVMProgramGenerate(&build, build.tokens)) {
-        regexTokenDestroy(build.tokens, 1);
         regexVMBuildDestroy(&build);
         ctx->vm = NULL;
         ctx->status = eCompileOutOfMem;
@@ -3626,6 +3614,10 @@ eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
 
     return eCompileOk;
 }
+
+/////////////////////////////////////////////////////////////////////////////
+// Pattern evaluation structures and functions
+/////////////////////////////////////////////////////////////////////////////
 
 int regexGroupCountGet(regex_vm_t *vm) {
     return vm->group_tbl_size;
@@ -4217,8 +4209,44 @@ const char *regexGroupValueGetByName(regex_match_t *match, const char *name, int
     return regexGroupValueGet(match, regexGroupIndexLookup(match->vm, name), len);
 }
 
-#define REGEX_TEST_MAIN
-#ifdef REGEX_TEST_MAIN
+int regexGroupCompoundCountGet(regex_match_t *match, int group) {
+    int cnt;
+    if((group < 1) || (group > match->vm->group_tbl_size)) {
+        return 0;
+    }
+    group--;
+
+    for(cnt = 0; match->compound[group][cnt] != NULL; cnt++);
+
+    return cnt / 2;
+}
+
+const char *regexGroupCompoundValueGet(regex_match_t *match, int group, int num, int *len) {
+    int cnt;
+
+    if(len != NULL) {
+        *len = 0;
+    }
+    if((group < 1) || (group > match->vm->group_tbl_size)) {
+        return NULL;
+    }
+    group--;
+    num *= 2;
+    for(cnt = 0; ((cnt < num) && (match->compound[group][cnt] != NULL)); cnt++);
+    if(match->compound[group][cnt] == NULL) {
+        return NULL;
+    }
+    if(len != NULL) {
+        *len = match->compound[group][cnt + 1] - match->compound[group][cnt];
+    }
+    return match->compound[group][cnt];
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Regex dev test functions
+/////////////////////////////////////////////////////////////////////////////
+
+#ifdef MOJO_REGEX_TEST_MAIN
 
 void printEscapedStr(FILE *fp, const char *text, int len) {
     int k;
@@ -4264,39 +4292,6 @@ void printEscapedStr(FILE *fp, const char *text, int len) {
     }
 }
 
-int regexGroupCompoundCountGet(regex_match_t *match, int group) {
-    int cnt;
-    if((group < 1) || (group > match->vm->group_tbl_size)) {
-        return 0;
-    }
-    group--;
-
-    for(cnt = 0; match->compound[group][cnt] != NULL; cnt++);
-
-    return cnt / 2;
-}
-
-const char *regexGroupCompoundValueGet(regex_match_t *match, int group, int num, int *len) {
-    int cnt;
-
-    if(len != NULL) {
-        *len = 0;
-    }
-    if((group < 1) || (group > match->vm->group_tbl_size)) {
-        return NULL;
-    }
-    group--;
-    num *= 2;
-    for(cnt = 0; ((cnt < num) && (match->compound[group][cnt] != NULL)); cnt++);
-    if(match->compound[group][cnt] == NULL) {
-        return NULL;
-    }
-    if(len != NULL) {
-        *len = match->compound[group][cnt + 1] - match->compound[group][cnt];
-    }
-    return match->compound[group][cnt];
-}
-
 void regexDumpMatch(regex_match_t *match) {
     int k, m, n, len;
     const char *ptr;
@@ -4305,9 +4300,6 @@ void regexDumpMatch(regex_match_t *match) {
         printf("No match\n");
         return;
     }
-    printf("Evaluation of [");
-    printEscapedStr(stdout, match->text, match->len);
-    printf("]\n");
     printf("Match found\n");
     printf("    %d groups\n", regexGroupCountGet(match->vm));
     for(k = 0; k <= regexGroupCountGet(match->vm); k++) {
@@ -4333,7 +4325,6 @@ void regexDumpMatch(regex_match_t *match) {
 int main(int argc, char **argv) {
     regex_compile_ctx_t result;
     regex_match_t *match;
-    const char test[] = "abcdefgjfoofwofwo8167287catfoo";
 
     if(argc > 1) {
         if(regexCompile(&result, argv[1], 0) != eCompileOk) {
@@ -4344,10 +4335,13 @@ int main(int argc, char **argv) {
             regexVMPrintProgram(stdout, result.vm);
             printf("-------------------------\n");
 
-            printf("Evaluating [%s]\n", test);
-            if((match = regexMatch(result.vm, test /*argv[2]*/, REGEX_STR_NULL_TERMINATED, 0)) == NULL) {
+            printf("Evaluating [%s]\n", argv[2]);
+            printf(" (escaped) [");
+            printEscapedStr(stdout, argv[2], strlen(argv[2]));
+            printf("]\n");
+            if((match = regexMatch(result.vm, argv[2], REGEX_STR_NULL_TERMINATED, 0)) == NULL) {
                 printf("No match\n");
-                //return 1;
+                return 1;
             } else {
                 regexDumpMatch(match);
                 regexMatchFree(match);
@@ -4360,8 +4354,14 @@ int main(int argc, char **argv) {
     return 0;
 }
 
-#endif // REGEX_TEST_MAIN
+#endif // MOJO_REGEX_TEST_MAIN
+
+/////////////////////////////////////////////////////////////////////////////
+// Unicode property class definitions
+/////////////////////////////////////////////////////////////////////////////
+
+// TODO - integrate directly
+#include "unicode_props.c"
 
 #endif // MOJO_REGEX_IMPLEMENTATION
 #endif // _MOJO_REGEX_HEADER_
-
