@@ -709,6 +709,10 @@ regex_token_t *regexAllocToken(eRegexToken_t tokenType, int c, char *str, int si
     memset(token, 0, sizeof(regex_token_t));
     token->tokenType = tokenType;
     token->pc = VM_PC_UNVISITED;
+    if(tokenType == eTokenCall) {
+        token->sub_sequence = (regex_token_t *)str;
+        token->out_b = (regex_token_t *)str;
+    }
     if(str != NULL) {
         token->str = str;
         token->len = sizeOrFlags;
@@ -2071,7 +2075,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                                          regex_vm_build_t *build);
 
 eRegexCompileStatus regexTokenCreateSubroutine(regex_token_t **tokens, regex_vm_build_t *build, const char *pattern) {
-    regex_token_t *subroutine;
+    regex_token_t *subroutine = NULL;
     int pos;
     eRegexCompileStatus status;
 
@@ -2903,21 +2907,10 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
                                                            REGEX_TOKEN_FLAG_SUBROUTINE)) != eCompileOk) {
                         SET_YARD_RESULT(status);
                     }
-                    if(!regexOperatorReturnCreate(&subexpr)) {
-                        SET_YARD_RESULT(eCompileOutOfMem);
-                    }
-                    concat = NULL;
-                    if(!regexTokenCreate(&concat, eTokenConcatenation, 0, NULL, 0)) {
-                        return eCompileOutOfMem;
-                    }
-                    if((status = regexOperatorApply(&concat, OP_ALL, 0, &subexpr)) != eCompileOk) {
-                        goto ShuntingYardFailure;
-                    }
-                    if(!regexSubroutineStore(sub_index, token->sub_sequence, subexpr)) {
+                   if(!regexSubroutineStore(sub_index, token->sub_sequence, subexpr)) {
                         SET_YARD_RESULT(eCompileOutOfMem);
                     }
                 }
-                token->out_b = token->sub_sequence;
                 if(!regexOperatorLiteralCreate(&operands, token)) {
                     SET_YARD_RESULT(eCompileOutOfMem);
                 }
@@ -2972,7 +2965,11 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
         goto ShuntingYardFailure;
     }
 
-    if(!(group_flags & REGEX_TOKEN_FLAG_SUBROUTINE)) {
+    if(group_flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
+        if(!regexOperatorReturnCreate(&operands)) {
+            SET_YARD_RESULT(eCompileOutOfMem);
+        }
+    } else {
         if(sub_expression != REGEX_SHUNTING_YARD_NO_PARENT) {
             SET_YARD_RESULT(eCompileInternalError);
         }
@@ -2982,6 +2979,7 @@ eRegexCompileStatus regexShuntingYardFragment(regex_token_t **tokens, regex_frag
             SET_YARD_RESULT(eCompileOutOfMem);
         }
     }
+
     *root_stack = operands;
 
     return status;
@@ -3162,7 +3160,7 @@ void regexVMPatchListFree(regex_vm_pc_patch_t *patch_list) {
     regex_vm_pc_patch_t *next;
 
     for(; patch_list != NULL; patch_list = next) {
-        next = patch_list;
+        next = patch_list->next;
         _regexDealloc(patch_list, _regexMemContext);
     }
 }
@@ -3226,7 +3224,7 @@ regex_token_t *regexVMGenPathGetNext(regex_vm_build_t *build, int subroutine) {
         return NULL;
     }
     *base = entry->next;
-    entry->next = *base;
+    entry->next = build->gen_pool;
     build->gen_pool = entry;
     return entry->token;
 }
@@ -3364,11 +3362,13 @@ int regexVMProgramGenerate(regex_vm_build_t *build, regex_token_t *token) {
 
     token = regexVMGenPathGetNext(build, 1);
     do {
-        for(;token != NULL;) {
-            if(!regexVMProgramGenerateInstr(build, token, &token)) {
-                return 0;
+        do {
+            for(;token != NULL;) {
+                if(!regexVMProgramGenerateInstr(build, token, &token)) {
+                    return 0;
+                }
             }
-        }
+        } while((token = regexVMGenPathGetNext(build, 0)) != NULL);
     } while((token = regexVMGenPathGetNext(build, 1)) != NULL);
 
     regexVMPatchJumps(build, &(build->patch_list));
@@ -3969,12 +3969,14 @@ int regexThreadCreate(regex_eval_t *eval, regex_thread_t *parent, unsigned int p
         }
     }
     memset(thread, 0, sizeof(regex_thread_t) + (eval->vm->group_tbl_size * 2 * sizeof(char *)));
-    for(k = 0; k < REGEX_THREAD_CALLSTACK_MAX_DEPTH; k++) {
-        thread->callstack[k] = -1;
-    }
     if(parent != NULL) {
         regexThreadCopySubexprs(eval->vm->group_tbl_size * 2, thread, parent);
         regexThreadCompoundCopy(eval, thread, parent);
+        memcpy(thread->callstack, parent->callstack, sizeof(int) * REGEX_THREAD_CALLSTACK_MAX_DEPTH);
+    } else {
+        for(k = 0; k < REGEX_THREAD_CALLSTACK_MAX_DEPTH; k++) {
+            thread->callstack[k] = -1;
+        }
     }
     thread->pc = pc;
     thread->pos = -1;
@@ -4101,7 +4103,10 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                         break;
                     }
                 }
-                return eEvalStackOverrun;
+                if(k == REGEX_THREAD_CALLSTACK_MAX_DEPTH) {
+                    return eEvalStackOverrun;
+                }
+                break;
             case eTokenReturn:
                 for(k = REGEX_THREAD_CALLSTACK_MAX_DEPTH - 1; k >= 0; k--) {
                     if(thread->callstack[k] != -1) {
@@ -4110,7 +4115,10 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                         break;
                     }
                 }
-                return eEvalInternalError;
+                if(k < 0) {
+                    return eEvalInternalError;
+                }
+                break;
             default:
                 return eEvalInternalError;
         }
