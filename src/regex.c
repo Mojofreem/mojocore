@@ -64,12 +64,15 @@
         evaluator. For gcc, you will need to manually encode utf8 characters.
 
     TODO
-        \X full unicode glyph (may be multiple chars)
-            "(:(:(:[\xC0-\xDF]|(:[\xE0-\xEF]|[\xF0-\xF7][\x80-\xBF])[\x80-\xBF])[\x80-\xBF])|[\x00-\x7F])"
+        \X full unicode letter glyph (may be multiple chars, includes marker glyphs)
+            "\P{M}\p{M}*"
         ^  start of string (assertion, non consuming)
         $  end of string (assertion, non consuming) [see eTokenMatch]
         \< match start of word (assertion, non consuming, ASCII only)
         \> match end of word (assertion, non consuming, ASCII only)
+        \P inverts unicode category class
+        extend subexpression notation for explicit subroutines
+        surface subroutine errors during compilation
         unicode utf8 classes
             build NFA from class tree
         create utf8 class table
@@ -776,6 +779,105 @@ void regexTokenDestroy(regex_token_t *token, int stack) {
 }
 
 /////////////////////////////////////////////////////////////////////////////
+// Subroutine index table
+/////////////////////////////////////////////////////////////////////////////
+
+// CRC32 routines public domain from http://home.thep.lu.se/~bjorn/crc/
+
+uint32_t calcCrc32ForByte(uint32_t r) {
+    for(int j = 0; j < 8; ++j) {
+        r = (r & 1 ? 0 : (uint32_t) 0xEDB88320L) ^ r >> 1;
+    }
+    return r ^ (uint32_t)0xFF000000L;
+}
+
+void calcCrc32(const void *data, size_t n_bytes, uint32_t* crc) {
+    static uint32_t table[0x100];
+    if(!*table) {
+        for(size_t i = 0; i < 0x100; ++i) {
+            table[i] = calcCrc32ForByte(i);
+        }
+    }
+    for(size_t i = 0; i < n_bytes; ++i) {
+        *crc = table[(uint8_t) *crc ^ ((uint8_t *) data)[i]] ^ *crc >> 8;
+    }
+}
+
+regex_token_t *regexSubroutineIdxCheckCrc(regex_vm_build_t *build, uint32_t check) {
+    regex_subroutine_t *walk;
+
+    for(walk = build->subroutine_index; walk != NULL; walk = walk->next) {
+        if(walk->crc == check) {
+            return walk->tokens;
+        }
+    }
+    return NULL;
+}
+
+regex_token_t *regexSubroutineIdxCheck(regex_vm_build_t *build, const char *pattern) {
+    uint32_t check = 0;
+
+    calcCrc32(pattern, strlen(pattern), &check);
+    return regexSubroutineIdxCheckCrc(build, check);
+}
+
+int regexSubroutineIdxAddCrc(regex_vm_build_t *build, uint32_t crc, regex_token_t *token) {
+    regex_subroutine_t *entry;
+
+    if((entry = _regexAlloc(sizeof(regex_subroutine_t), _regexMemContext)) == NULL) {
+        return 0;
+    }
+    entry->tokens = token;
+    entry->crc = crc;
+    entry->next = build->subroutine_index;
+    build->subroutine_index = entry;
+    return 1;
+}
+
+int regexSubroutineIdxAdd(regex_vm_build_t *build, const char *pattern, regex_token_t *token) {
+    uint32_t crc = 0;
+
+    calcCrc32(pattern, strlen(pattern), &crc);
+    return regexSubroutineIdxAddCrc(build, crc, token);
+}
+
+void regexSubroutineIdxFree(regex_vm_build_t *build) {
+    regex_subroutine_t *walk, *next;
+
+    for(walk = build->subroutine_index; walk != NULL; walk = next) {
+        next = walk->next;
+        _regexDealloc(walk, _regexMemContext);
+    }
+}
+
+eRegexCompileStatus regexTokenizePattern(const char *pattern,
+                                         int *pos,
+                                         regex_token_t **tokens,
+                                         regex_vm_build_t *build);
+
+eRegexCompileStatus regexTokenCreateSubroutine(regex_token_t **tokens, regex_vm_build_t *build, const char *pattern) {
+    regex_token_t *subroutine = NULL;
+    int pos;
+    eRegexCompileStatus status;
+
+    if((subroutine = regexSubroutineIdxCheck(build, pattern)) == NULL) {
+        if((status = regexTokenizePattern(pattern, &pos, &subroutine, build)) != eCompileOk) {
+            // TODO - retain sub-compilation status
+            return status;
+        }
+
+        if(!regexSubroutineIdxAdd(build, pattern, subroutine)) {
+            return eCompileOutOfMem;
+        }
+    }
+
+    if(!regexTokenCreate(tokens, eTokenCall, 0, (void *)subroutine, 0)) {
+        return eCompileOutOfMem;
+    }
+    return eCompileOk;
+}
+
+/////////////////////////////////////////////////////////////////////////////
 // Character parsing, assists with escaped chars
 /////////////////////////////////////////////////////////////////////////////
 
@@ -1291,10 +1393,6 @@ void regexEmitEscapedStr(FILE *fp, const char *str, int len) {
 // Character class parsing handlers
 /////////////////////////////////////////////////////////////////////////////
 
-eRegexCompileStatus regexTokenCreateSubroutine(regex_token_t **tokens,
-                                               regex_vm_build_t *build,
-                                               const char *pattern);
-
 // Unicode char class support
 
 // For utf8 encoded characters, trailing bytes have 6 bits of character data,
@@ -1311,7 +1409,7 @@ eRegexCompileStatus regexTokenCreateSubroutine(regex_token_t **tokens,
 typedef struct utf8_charclass_midlow_byte_s utf8_charclass_midlow_byte_t;
 struct utf8_charclass_midlow_byte_s {
     unsigned char prefix;
-    unsigned char bitmap[8];
+    unsigned int bitmap[2];
     utf8_charclass_midlow_byte_t *next;
 };
 
@@ -1334,7 +1432,7 @@ struct utf8_charclass_tree_s {
     utf8_charclass_high_byte_t *four_byte;
     utf8_charclass_midhigh_byte_t *three_byte;
     utf8_charclass_midlow_byte_t *two_byte;
-    unsigned char one_byte[32];
+    unsigned int one_byte[8];
 };
 
 utf8_charclass_midlow_byte_t *parseUtf8GetMidLowByte(utf8_charclass_midlow_byte_t **base,
@@ -1407,7 +1505,7 @@ utf8_charclass_high_byte_t *parseUtf8GetHighByte(utf8_charclass_high_byte_t **ba
     return high;
 }
 
-unsigned char *parseUtf8TreeGetLowByte(utf8_charclass_tree_t *tree, unsigned char *bytes) {
+unsigned int *parseUtf8TreeGetLowByte(utf8_charclass_tree_t *tree, unsigned char *bytes) {
     utf8_charclass_midlow_byte_t *midlow;
     utf8_charclass_midhigh_byte_t *midhigh;
     utf8_charclass_high_byte_t *high;
@@ -1446,8 +1544,272 @@ unsigned char *parseUtf8TreeGetLowByte(utf8_charclass_tree_t *tree, unsigned cha
     }
 }
 
-int regexTokenUtf8ClassCreate(eRegexCompileStatus *status, regex_token_t **tokens, utf8_charclass_tree_t *tree) {
-    // TODO
+unsigned int *charClassBitmapCopy(unsigned int *bitmap) {
+    unsigned int *copy;
+
+    if((copy = _regexAlloc(32, _regexMemContext)) == NULL) {
+        return NULL;
+    }
+    memcpy(copy, bitmap, 32);
+    return copy;
+}
+
+unsigned int *utf8ClassBitmapCopy(unsigned int *bitmap, int invert) {
+    unsigned int *copy;
+    int k;
+
+    if((copy = _regexAlloc(2, _regexMemContext)) == NULL) {
+        return NULL;
+    }
+    memcpy(copy, bitmap, 8);
+    if(invert) {
+        for(k = 0; k < 2; k++) {
+            copy[k] ^= 0xFFFFFFFF;
+        }
+    }
+    return copy;
+}
+
+int regexTokenUtf8ClassMidlowCreate(regex_token_t **tokens, utf8_charclass_midlow_byte_t *midlow,
+                                    int first, int nested, int invert) {
+    unsigned int *bitmap;
+
+    if(!first) {
+        if(!regexTokenCreate(tokens, eTokenAlternative, 0, NULL, 0)) {
+            return 0;
+        }
+    }
+    if(!regexTokenCreate(tokens, eTokenSubExprStart, 0, NULL, REGEX_TOKEN_FLAG_NOCAPTURE)) {
+        return 0;
+    }
+    if(!regexTokenCreate(tokens, eTokenCharLiteral,
+                         midlow->prefix | (nested ? UTF8_LOW_BYTE_PREFIX : UTF8_TWO_BYTE_PREFIX),
+                         NULL, (invert ? REGEX_TOKEN_FLAG_INVERT : 0))) {
+        return 0;
+    }
+    if((bitmap = utf8ClassBitmapCopy(midlow->bitmap, invert)) == NULL) {
+        return 0;
+    }
+    if(!regexTokenCreate(tokens, eTokenUtf8Class, 0, (char *)bitmap, 0)) {
+        return 0;
+    }
+    if(!regexTokenCreate(tokens, eTokenSubExprEnd, 0, NULL, 0)) {
+        return 0;
+    }
+    return 1;
+}
+
+int regexTokenUtf8ClassMidhighCreate(regex_token_t **tokens, utf8_charclass_midhigh_byte_t *midhigh,
+                                     int first, int nested, int invert) {
+    utf8_charclass_midlow_byte_t *midlow;
+
+    if(!first) {
+        if(!regexTokenCreate(tokens, eTokenAlternative, 0, NULL, 0)) {
+            return 0;
+        }
+    }
+    if(!regexTokenCreate(tokens, eTokenSubExprStart, 0, NULL, REGEX_TOKEN_FLAG_NOCAPTURE)) {
+        return 0;
+    }
+    if(!regexTokenCreate(tokens, eTokenCharLiteral,
+                         midhigh->prefix | (nested ? UTF8_LOW_BYTE_PREFIX : UTF8_THREE_BYTE_PREFIX),
+                         NULL, (invert ? REGEX_TOKEN_FLAG_INVERT : 0))) {
+        return 0;
+    }
+    first = 1;
+    for(midlow = midhigh->midlow_byte; midlow != NULL; midlow = midlow->next) {
+        if(!regexTokenUtf8ClassMidlowCreate(tokens, midlow, first, 1, invert)) {
+            return 0;
+        }
+        first = 0;
+    }
+    if(!regexTokenCreate(tokens, eTokenSubExprEnd, 0, NULL, 0)) {
+        return 0;
+    }
+    return 1;
+}
+
+int regexTokenUtf8ClassHighCreate(regex_token_t **tokens, utf8_charclass_high_byte_t *high, int first, int invert) {
+    utf8_charclass_midhigh_byte_t *midhigh;
+
+    if(!first) {
+        if(!regexTokenCreate(tokens, eTokenAlternative, 0, NULL, 0)) {
+            return 0;
+        }
+    }
+    if(!regexTokenCreate(tokens, eTokenSubExprStart, 0, NULL, REGEX_TOKEN_FLAG_NOCAPTURE)) {
+        return 0;
+    }
+    if(!regexTokenCreate(tokens, eTokenCharLiteral,
+                         high->prefix | UTF8_FOUR_BYTE_PREFIX,
+                         NULL, (invert ? REGEX_TOKEN_FLAG_INVERT : 0))) {
+        return 0;
+    }
+    first = 1;
+    for(midhigh = high->midhigh_byte; midhigh != NULL; midhigh = midhigh->next) {
+        if(!regexTokenUtf8ClassMidhighCreate(tokens, midhigh, first, 1, invert)) {
+            return 0;
+        }
+        first = 0;
+    }
+    if(!regexTokenCreate(tokens, eTokenSubExprEnd, 0, NULL, 0)) {
+        return 0;
+    }
+    return 1;
+}
+
+uint32_t regexCalUtf8ClassCrc(utf8_charclass_tree_t *tree) {
+    utf8_charclass_midlow_byte_t *midlow;
+    utf8_charclass_midhigh_byte_t *midhigh;
+    utf8_charclass_high_byte_t *high;
+    uint32_t crc = 0;
+
+    calcCrc32(tree->one_byte, 32, &crc);
+    for(midlow = tree->two_byte; midlow != NULL; midlow = midlow->next) {
+        calcCrc32(&(midlow->prefix), 1, &crc);
+        calcCrc32(midlow->bitmap, 8, &crc);
+    }
+    for(midhigh = tree->three_byte; midhigh != NULL; midhigh = midhigh->next) {
+        calcCrc32(&(midhigh->prefix), 1, &crc);
+        for(midlow = midhigh->midlow_byte; midlow != NULL; midlow = midlow->next) {
+            calcCrc32(&(midlow->prefix), 1, &crc);
+            calcCrc32(midlow->bitmap, 8, &crc);
+        }
+    }
+    for(high = tree->four_byte; high != NULL; high = high->next) {
+        calcCrc32(&(high->prefix), 1, &crc);
+        for(midhigh = high->midhigh_byte; midhigh != NULL; midhigh = midhigh->next) {
+            calcCrc32(&(midhigh->prefix), 1, &crc);
+            for(midlow = midhigh->midlow_byte; midlow != NULL; midlow = midlow->next) {
+                calcCrc32(&(midlow->prefix), 1, &crc);
+                calcCrc32(midlow->bitmap, 8, &crc);
+            }
+        }
+    }
+    return crc;
+}
+
+int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus *status,
+                              regex_token_t **tokens, utf8_charclass_tree_t *tree, int invert) {
+    regex_token_t *utf8class = NULL;
+    utf8_charclass_midlow_byte_t *midlow;
+    utf8_charclass_midhigh_byte_t *midhigh;
+    utf8_charclass_high_byte_t *high;
+    unsigned int *bitmap;
+    uint32_t crc;
+    int k, first = 1;
+
+    // Preset to OoM, change to eCompileOk on success
+    *status = eCompileOutOfMem;
+
+    crc = regexCalUtf8ClassCrc(tree);
+    if((utf8class = regexSubroutineIdxCheckCrc(build, crc)) == NULL) {
+        if(!regexTokenCreate(&utf8class, eTokenSubExprStart, 0, NULL, REGEX_TOKEN_FLAG_NOCAPTURE)) {
+            return 0;
+        }
+
+        // Single byte character encoding
+        // Are low bytes set?
+        for(k = 0; k < 32; k++) {
+            if(tree->one_byte[k] != 0) {
+                break;
+            }
+        }
+        if(k < 32) {
+            // The single byte encoding has a glyph set
+            if(invert) {
+                for(k = 0; k < 32; k++) {
+                    tree->one_byte[k] ^= 0xFFu;
+                }
+            }
+            if((bitmap = charClassBitmapCopy(tree->one_byte)) == NULL) {
+                *status = eCompileOutOfMem;
+                return 0;
+            }
+            if(!regexTokenCreate(&utf8class, eTokenCharClass, 0, (char *) bitmap, 0)) {
+                *status = eCompileOutOfMem;
+                return 0;
+            }
+            first = 0;
+        }
+
+        if(tree->two_byte != NULL) {
+            if(!first) {
+                if(!regexTokenCreate(&utf8class, eTokenAlternative, 0, NULL, 0)) {
+                    return 0;
+                }
+            }
+            if(!regexTokenCreate(&utf8class, eTokenSubExprStart, 0, NULL, REGEX_TOKEN_FLAG_NOCAPTURE)) {
+                return 0;
+            }
+            first = 1;
+            for(midlow = tree->two_byte; midlow != NULL; midlow = midlow->next) {
+                if(!regexTokenUtf8ClassMidlowCreate(&utf8class, midlow, first, 0, invert)) {
+                    return 0;
+                }
+                first = 0;
+            }
+            if(!regexTokenCreate(&utf8class, eTokenSubExprEnd, 0, NULL, 0)) {
+                return 0;
+            }
+        }
+
+        if(tree->three_byte != NULL) {
+            if(!first) {
+                if(!regexTokenCreate(&utf8class, eTokenAlternative, 0, NULL, 0)) {
+                    return 0;
+                }
+            }
+            if(!regexTokenCreate(&utf8class, eTokenSubExprStart, 0, NULL, REGEX_TOKEN_FLAG_NOCAPTURE)) {
+                return 0;
+            }
+            first = 1;
+            for(midhigh = tree->three_byte; midhigh != NULL; midhigh = midhigh->next) {
+                if(!regexTokenUtf8ClassMidhighCreate(&utf8class, midhigh, first, 0, invert)) {
+                    return 0;
+                }
+                first = 0;
+            }
+            if(!regexTokenCreate(&utf8class, eTokenSubExprEnd, 0, NULL, 0)) {
+                return 0;
+            }
+        }
+
+        if(tree->four_byte != NULL) {
+            if(!first) {
+                if(!regexTokenCreate(&utf8class, eTokenAlternative, 0, NULL, 0)) {
+                    return 0;
+                }
+            }
+            if(!regexTokenCreate(&utf8class, eTokenSubExprStart, 0, NULL, REGEX_TOKEN_FLAG_NOCAPTURE)) {
+                return 0;
+            }
+            first = 1;
+            for(high = tree->four_byte; high != NULL; high = high->next) {
+                if(!regexTokenUtf8ClassHighCreate(&utf8class, high, first, invert)) {
+                    return 0;
+                }
+                first = 0;
+            }
+            if(!regexTokenCreate(&utf8class, eTokenSubExprEnd, 0, NULL, 0)) {
+                return 0;
+            }
+        }
+
+        if(!regexTokenCreate(&utf8class, eTokenSubExprEnd, 0, NULL, 0)) {
+            return 0;
+        }
+
+        if(!regexSubroutineIdxAddCrc(build, crc, utf8class)) {
+            return eCompileOutOfMem;
+        }
+    }
+
+    if(!regexTokenCreate(tokens, eTokenCall, 0, (void *)utf8class, 0)) {
+        return eCompileOutOfMem;
+    }
+
+    *status = eCompileOk;
     return 1;
 }
 
@@ -1458,7 +1820,7 @@ int regexTokenUtf8ClassCreate(eRegexCompileStatus *status, regex_token_t **token
 #define UTF8_ENC_HIGH_FOUR_BYTE_FULL_RANGE  0x07 // 11110xxx
 
 int parseUtf8CharClassCodepoint(utf8_charclass_tree_t *tree, int codepoint) {
-    unsigned char *bitmap;
+    unsigned int *bitmap;
     unsigned char bytes[5];
     int byte;
 
@@ -1468,7 +1830,9 @@ int parseUtf8CharClassCodepoint(utf8_charclass_tree_t *tree, int codepoint) {
     }
     switch(bytes[0]) {
         default:
-        case 1: byte = bytes[1]; break;
+        case 1:
+            bitmap[bytes[1] / 32] |= 0x1u << (bytes[1] % 8u);
+            return 1;
         case 2: byte = bytes[2]; break;
         case 3: byte = bytes[3]; break;
         case 4: byte = bytes[4]; break;
@@ -1477,7 +1841,7 @@ int parseUtf8CharClassCodepoint(utf8_charclass_tree_t *tree, int codepoint) {
     return 1;
 }
 
-void parseUtf8SetCharClassBitmapRange(unsigned char *bitmap, int start, int end) {
+void parseUtf8SetCharClassBitmapRange(unsigned int *bitmap, int start, int end) {
     int k;
 
     for(k = start; k <= end; k++) {
@@ -1488,7 +1852,7 @@ void parseUtf8SetCharClassBitmapRange(unsigned char *bitmap, int start, int end)
 int parseUtf8SetTreeClassBitmapRange(utf8_charclass_tree_t *tree, int count,
                                      int high, int midhigh, int midlow,
                                      int start, int end) {
-    unsigned char *bitmap;
+    unsigned int *bitmap;
     unsigned char bytes[5];
 
     bytes[0] = count;
@@ -1760,16 +2124,6 @@ int charClassBitmapCheck(const unsigned int *bitmap, int pos) {
     return (int)(bitmap[pos / 32u] & (1u << pos % 32u));
 }
 
-unsigned int *charClassBitmapCopy(unsigned int *bitmap) {
-    unsigned int *copy;
-
-    if((copy = _regexAlloc(32, _regexMemContext)) == NULL) {
-        return NULL;
-    }
-    memcpy(copy, bitmap, 32);
-    return copy;
-}
-
 int utf8ClassBitmapCheck(const unsigned int *bitmap, int pos) {
     if((pos & UTF8_LOW_BYTE_MASK) != UTF8_LOW_BYTE_PREFIX) {
         return 0;
@@ -1821,7 +2175,8 @@ int parseCharClassBitmapRangeSet(utf8_charclass_tree_t *tree, unsigned int *bitm
 // of an actual pattern expression, or is just the content of the pattern, from
 // a secodary source. An embedded pattern ends at the required ']' delimiter,
 // whereas a non embedded pattern does not contain a trailing delimiter.
-int parseCharClassAndCreateToken(eRegexCompileStatus *status, const char **pattern, int embedded, regex_token_t **tokens) {
+int parseCharClassAndCreateToken(eRegexCompileStatus *status, regex_vm_build_t *build,
+                                 const char **pattern, int embedded, regex_token_t **tokens) {
     unsigned int bitmap[8], *ptr;
     parseChar_t c;
     int invert = 0;
@@ -1941,14 +2296,7 @@ parseClassCompleted:
             }
         }
 
-        if(invert) {
-            for(k = 0; k < 32; k++) {
-                utf8tree->one_byte[k] ^= 0xFF;
-            }
-        }
-
-        // TODO: generate sub-pattern for the utf8 char class
-        if(!regexTokenUtf8ClassCreate(status, tokens, utf8tree)) {
+        if(!regexTokenUtf8ClassCreate(build, status, tokens, utf8tree, invert)) {
             regexCharClassUtf8TreeFree(utf8tree);
             return 0;
         }
@@ -1974,7 +2322,8 @@ parseClassCompleted:
     return 1;
 }
 
-int parseUnicodeClassAndCreateToken(eRegexCompileStatus *status, int unicodeClass, regex_token_t **tokens) {
+int parseUnicodeClassAndCreateToken(eRegexCompileStatus *status, regex_vm_build_t *build,
+                                    int unicodeClass, regex_token_t **tokens) {
     char classId[3];
     const char *classStr;
 
@@ -1987,7 +2336,7 @@ int parseUnicodeClassAndCreateToken(eRegexCompileStatus *status, int unicodeClas
         return 0;
     }
 
-    return parseCharClassAndCreateToken(status, &classStr, 0, tokens);
+    return parseCharClassAndCreateToken(status, build, &classStr, 0, tokens);
 }
 
 void regexPrintCharClassToFP(FILE *fp, unsigned int *bitmap) {
@@ -2005,95 +2354,6 @@ void regexPrintCharClassToFP(FILE *fp, unsigned int *bitmap) {
             }
         }
     }
-}
-
-/////////////////////////////////////////////////////////////////////////////
-// Subroutine index table
-/////////////////////////////////////////////////////////////////////////////
-
-// CRC32 routines public domain from http://home.thep.lu.se/~bjorn/crc/
-
-uint32_t calcCrc32ForByte(uint32_t r) {
-    for(int j = 0; j < 8; ++j) {
-        r = (r & 1 ? 0 : (uint32_t) 0xEDB88320L) ^ r >> 1;
-    }
-    return r ^ (uint32_t)0xFF000000L;
-}
-
-void calcCrc32(const void *data, size_t n_bytes, uint32_t* crc) {
-    static uint32_t table[0x100];
-    if(!*table) {
-        for(size_t i = 0; i < 0x100; ++i) {
-            table[i] = calcCrc32ForByte(i);
-        }
-    }
-    for(size_t i = 0; i < n_bytes; ++i) {
-        *crc = table[(uint8_t) *crc ^ ((uint8_t *) data)[i]] ^ *crc >> 8;
-    }
-}
-
-regex_token_t *regexSubroutineIdxCheck(regex_vm_build_t *build, const char *pattern) {
-    regex_subroutine_t *walk;
-    uint32_t check = 0;
-
-    calcCrc32(pattern, strlen(pattern), &check);
-    for(walk = build->subroutine_index; walk != NULL; walk = walk->next) {
-        if(walk->crc == check) {
-            return walk->tokens;
-        }
-    }
-    return NULL;
-}
-
-int regexSubroutineIdxAdd(regex_vm_build_t *build, const char *pattern, regex_token_t *token) {
-    regex_subroutine_t *entry;
-    uint32_t crc;
-
-    calcCrc32(pattern, strlen(pattern), &crc);
-    if((entry = _regexAlloc(sizeof(regex_subroutine_t), _regexMemContext)) == NULL) {
-        return 0;
-    }
-    entry->tokens = token;
-    entry->crc = crc;
-    entry->next = build->subroutine_index;
-    build->subroutine_index = entry;
-    return 1;
-}
-
-void regexSubroutineIdxFree(regex_vm_build_t *build) {
-    regex_subroutine_t *walk, *next;
-
-    for(walk = build->subroutine_index; walk != NULL; walk = next) {
-        next = walk->next;
-        _regexDealloc(walk, _regexMemContext);
-    }
-}
-
-eRegexCompileStatus regexTokenizePattern(const char *pattern,
-                                         int *pos,
-                                         regex_token_t **tokens,
-                                         regex_vm_build_t *build);
-
-eRegexCompileStatus regexTokenCreateSubroutine(regex_token_t **tokens, regex_vm_build_t *build, const char *pattern) {
-    regex_token_t *subroutine = NULL;
-    int pos;
-    eRegexCompileStatus status;
-
-    if((subroutine = regexSubroutineIdxCheck(build, pattern)) == NULL) {
-        if((status = regexTokenizePattern(pattern, &pos, &subroutine, build)) != eCompileOk) {
-            // TODO - retain sub-compilation status
-            return status;
-        }
-
-        if(!regexSubroutineIdxAdd(build, pattern, subroutine)) {
-            return eCompileOutOfMem;
-        }
-    }
-
-    if(!regexTokenCreate(tokens, eTokenCall, 0, (void *)subroutine, 0)) {
-        return eCompileOutOfMem;
-    }
-    return eCompileOk;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -2199,7 +2459,7 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         continue;
 
                     case '[':
-                        if(!parseCharClassAndCreateToken(&status, &pattern, 1, tokens)) {
+                        if(!parseCharClassAndCreateToken(&status, build, &pattern, 1, tokens)) {
                             SET_RESULT(status);
                         }
                         continue;
@@ -2346,13 +2606,13 @@ eRegexCompileStatus regexTokenizePattern(const char *pattern,
                         class = META_CLASS_INV(META_WORD_PATTERN);
                         break;
                 }
-                if(!parseCharClassAndCreateToken(&status, &class, 0, tokens)) {
+                if(!parseCharClassAndCreateToken(&status, build, &class, 0, tokens)) {
                     SET_RESULT(status);
                 }
                 continue;
 
             case eRegexPatternUnicodeMetaClass:
-                if(!parseUnicodeClassAndCreateToken(&status, c.c, tokens)) {
+                if(!parseUnicodeClassAndCreateToken(&status, build, c.c, tokens)) {
                     SET_RESULT(status);
                 }
                 continue;
