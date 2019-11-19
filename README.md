@@ -88,7 +88,7 @@ may be compiled to a VM program in advance, and the resulting VM compiled
 directly into your program to avoid further runtime pattern compilation. To
 compile a pattern, you will call:
 
-`eRegexCompileStatus regexCompile(regex_compile_ctx_t *ctx, const char *pattern);`
+`eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern);`
 
 where `pattern` is a pointer to the null terminated string containing your regex
 pattern, and `regex_compile_ctx_t` is a pointer to the regex context structure:
@@ -96,7 +96,7 @@ pattern, and `regex_compile_ctx_t` is a pointer to the regex context structure:
 ```
 typedef struct regex_compile_ctx_s regex_compile_ctx_t;
 struct regex_compile_ctx_s {
-    eRegexCompileStatus status;
+    eRegexCompileStatus_t status;
     const char *pattern;
     int position;
     regex_vm_t *vm;
@@ -106,7 +106,7 @@ struct regex_compile_ctx_s {
 `regexCompile` will initialize this structure, attempt to compile your pattern
 into a regex VM program, and return the resulting program, or specify an error
 condition encountered. The return value of `regexCompile` will provide details
-on the result of the compilation via the `eRegexCompileStatus` value:
+on the result of the compilation via the `eRegexCompileStatus_t` value:
 
 | enum value                         | Meaning |
 | ---------------------------------- | --------|
@@ -124,7 +124,7 @@ on the result of the compilation via the `eRegexCompileStatus` value:
 
 If an error was encountered, the `position` field of the context structure will
 indicate the pattern index at which the error occurred. For convenience, the
-`const char *regexGetCompileStatusStr(eRegexCompileStatus status);` function
+`const char *regexGetCompileStatusStr(eRegexCompileStatus_t status);` function
 will provide a human readable string version of the enum value. The regex VM
 program is stored in the `vm` field of the context.
 
