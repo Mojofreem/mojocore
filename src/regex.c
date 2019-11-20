@@ -205,7 +205,7 @@ Test: a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat abcdefgefgjfoo8167287catfoo
 
 /////////////////////////////////////////////////////////////////////////////
 
-#define REGEX_VM_MACHINE_VERSION    6
+#define REGEX_VM_MACHINE_VERSION    7
 
 typedef struct regex_vm_s regex_vm_t;
 struct regex_vm_s {
@@ -350,13 +350,18 @@ void regexSetMemoryAllocator(regexMemAllocator_t alloc,
 
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
-char *_regexStrdup(const char *str) {
+// If len == -1, copies the string up to the null terminator '\0'
+char *_regexStrdup(const char *str, size_t len) {
     char *ptr;
 
-    if((ptr = _regexAlloc(strlen(str) + 1, _regexMemContext)) == NULL) {
+    if(len == -1) {
+        len = strlen(str) + 1;
+    }
+
+    if((ptr = _regexAlloc(len, _regexMemContext)) == NULL) {
         return NULL;
     }
-    memcpy(ptr, str, strlen(str) + 1);
+    memcpy(ptr, str, len);
     return ptr;
 }
 
@@ -364,71 +369,110 @@ char *_regexStrdup(const char *str) {
 // String table management and data reproduction
 /////////////////////////////////////////////////////////////////////////////
 
+// Ensure that only a single entry for the data exists. When adding, if the
+// data already exists in the table, then do not add a new entry.
 #define REGEX_TABLE_DEDUPE      0x01u
+
+// Retain the data provided to the table. The table retains ownership of the
+// pointer, and will free it upon removal.
 #define REGEX_TABLE_KEEP_PTR    0x02u
 
-int tableEntryAdd(void ***base, int *table_size, size_t entry_size, void *entry_data,
-                  unsigned int flags, int *deduped) {
-    int k;
+// Add one character to the str length, and null terminate.
+#define REGEX_TABLE_NULL_TERMINATE  0x04u
 
+// If entry_size == -1, the entry is expected to be a null terminated ('\0')
+// string, and will be derived automatically.
+int regexStrTableEntryAdd(char ***table, int *table_size, size_t entry_size,
+                          const char *entry_data, int **len_table,
+                          unsigned int flags, int *deduped) {
+    int index, k;
+
+    if(entry_size == -1) {
+        entry_size = ((entry_data != NULL) ? (strlen(entry_data) + 1) : 0);
+    }
+    if(flags & REGEX_TABLE_NULL_TERMINATE) {
+        entry_size++;
+    }
     if(flags & REGEX_TABLE_DEDUPE) {
         for(k = 0; k < *table_size; k++) {
-            if(((entry_data == NULL) && ((*base)[k] == NULL)) ||
-               ((entry_data != NULL) && (!memcmp((*base)[k], entry_data, entry_size)))) {
-                if(deduped != NULL) {
-                    *deduped = 1;
+            if((entry_data == NULL) && ((*table)[k] != NULL)) {
+                break;
+            } else if((entry_data != NULL) && (table[k] != NULL)) {
+                if(len_table != NULL) {
+                    if(((*len_table)[k] == entry_size) &&
+                       (!memcmp((*table)[k], entry_data, entry_size))) {
+                        break;
+                    }
+                } else if(!memcmp((*table)[k], entry_data, entry_size)) {
+                    break;
                 }
-                return k;
             }
         }
-        if(deduped != NULL) {
-            *deduped = 0;
+        if(k < *table_size) {
+            if(deduped != NULL) {
+                *deduped = 1;
+            }
+            return k;
         }
     }
-
-    if((*base = _regexRealloc(*base, ((*table_size) * sizeof(void *)),
-                              (((*table_size) + 1) * sizeof(void *)),
-                              _regexMemContext)) == NULL) {
+    if(deduped != NULL) {
+        *deduped = 0;
+    }
+    if((*table = _regexRealloc(*table, *table_size * sizeof(char **),
+                               (*table_size + 1) * sizeof(char **),
+                               _regexMemContext)) == NULL) {
         return -1;
     }
-    if(flags & REGEX_TABLE_KEEP_PTR) {
-        (*base)[*table_size] = entry_data;
+    if(len_table != NULL) {
+        if((*len_table = _regexRealloc(*len_table, *table_size * sizeof(int),
+                                       (*table_size + 1) * sizeof(int),
+                                       _regexMemContext)) == NULL) {
+            return -1;
+        }
+        (*len_table)[*table_size] = entry_size;
+    }
+    index = *table_size;
+    (*table_size)++;
+    if((flags & REGEX_TABLE_KEEP_PTR) || (entry_data == NULL)) {
+        (*table)[index] = (char *)entry_data;
     } else {
-        if(entry_data == NULL) {
-            (*base)[*table_size] = entry_data;
-        } else {
-            if(((*base)[*table_size] = _regexAlloc(entry_size, _regexMemContext)) == NULL) {
-                return -1;
-            }
-            memcpy((*base)[*table_size], entry_data, entry_size);
+        if(((*table)[index] = _regexStrdup(entry_data,
+                                           entry_size - ((flags & REGEX_TABLE_NULL_TERMINATE) ? 1 : 0))) == NULL) {
+            return -1;
+        }
+        if(flags & REGEX_TABLE_NULL_TERMINATE) {
+            (*table)[index][entry_size - 1] = '\0';
         }
     }
-
-    (*table_size)++;
-    return (*table_size) - 1;
+    return index;
 }
 
-void *tableEntryGet(void **base, int table_size, int index) {
-    if(index >= table_size) {
+const char *regexStrTableEntryGet(char **table, int table_size,
+                                  const int *len_table, int index, int *len) {
+    if((index < 0) || (index >= table_size)) {
         return NULL;
     }
-    return base[index];
+    if(len != NULL) {
+        *len = (len_table != NULL ? len_table[index] : 0);
+    }
+    return table[index];
 }
 
-void tableEntryFree(void ***base, int *table_size, int free_data) {
+void regexStrTableFreeAll(char ***table, int *table_size, int **len_table) {
     int k;
-    if((*base) != NULL) {
-        if(free_data) {
-            for(k = 0; k < *table_size; k++) {
-                if((*base)[k] != NULL) {
-                    _regexDealloc((*base)[k], _regexMemContext);
-                }
-            }
+
+    for(k = 0; k < *table_size; k++) {
+        if((*table)[k] != NULL) {
+            _regexDealloc((*table)[k], _regexMemContext);
         }
-        _regexDealloc((*base), _regexMemContext);
     }
-    (*base) = NULL;
+    _regexDealloc(*table, _regexMemContext);
+    if((len_table != NULL) && (*len_table != NULL)) {
+        _regexDealloc(*len_table, _regexMemContext);
+        *len_table = NULL;
+    }
     *table_size = 0;
+    *table = NULL;
 }
 
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
@@ -466,8 +510,6 @@ typedef enum {
     eTokenReturn,
     eTokenByte,
     // Abstractions, reduced down to the above VM opcodes
-    eTokenUtf8Literal,
-    eTokenUtf8AnyChar,
     eTokenConcatenation,
     eTokenAlternative,
     eTokenZeroOrOne,
@@ -504,23 +546,23 @@ typedef enum {
 // Shunting yard subroutine flag
 #define REGEX_TOKEN_FLAG_SUBROUTINE 0x8u
 
-// char literal
+// char literal, char class, utf8 class
 #define REGEX_TOKEN_FLAG_INVERT     0x1u
 
 typedef struct regex_token_s regex_token_t;
 struct regex_token_s {
     eRegexToken_t tokenType;
     union {
-        int c;
-        char *str;
-        unsigned int *bitmap;
-        int group;
-        regex_token_t *sub_sequence;
+        int c; // char literal
+        char *str; // str literal
+        unsigned int *bitmap; // char class, utf8 class
+        int group; // subexpr start
+        regex_token_t *sub_sequence; // call
     };
     int pc; // program counter index, for NFA -> VM
     union {
         int len; // string length, to allow embedded \0 chars
-        unsigned int flags;
+        unsigned int flags; // char any, match, utf8 class, char any dotall
     };
     regex_token_t *out_a;
     regex_token_t *out_b;
@@ -575,7 +617,8 @@ struct regex_vm_build_s {
     int pc;
 };
 
-int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int len, int index);
+int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group,
+                              int len, int index);
 
 /////////////////////////////////////////////////////////////////////////////
 // Token meta attribute helper functions
@@ -651,6 +694,117 @@ int regexGetOperatorArity(regex_token_t *token) {
             return 2;
         default:
             return 0;
+    }
+}
+
+// Token diagnostic emit functions and data /////////////////////////////////
+
+void regexPrintVMCharClassEntry(FILE *fp, regex_vm_t *vm, int class_idx);
+void regexPrintVMStringLiteralEntry(FILE *fp, regex_vm_t *vm, int str_idx);
+void regexPrintVMUtf8ClassEntry(FILE *fp, regex_vm_t *vm, int utf8_idx);
+void regexPrintVMGroupEntry(FILE *fp, regex_vm_t *vm, int group_idx);
+
+void regexPrintCharClassToFP(FILE *fp, unsigned int *bitmap);
+void regexEmitEscapedStr(FILE *fp, const char *str, int len);
+
+void regexPrinter_eTokenCharLiteral(regex_token_t *token) {
+    printf("(%c:%d)", (((token->c < 32) || (token->c > 127)) ? ' ' : token->c), token->c);
+}
+
+void regexPrinter_eTokenCharClass(regex_token_t *token) {
+    putchar('[');
+    regexPrintCharClassToFP(stdout, token->bitmap);
+    putchar(']');
+}
+
+void regexPrinter_eTokenStringLiteral(regex_token_t *token) {
+    putchar('\"');
+    regexEmitEscapedStr(stdout, token->str, token->len);
+    putchar('\"');
+}
+
+void regexPrinter_eTokenUtf8Class(regex_token_t *token) {
+    // TODO
+    printf("[...]");
+}
+
+void regexPrinter_eTokenCall(regex_token_t *token) {
+    // TODO
+    printf("%p", token->sub_sequence);
+}
+
+void regexPrinter_eTokenSubExprStart(regex_token_t *token) {
+    printf("%d", token->group);
+}
+
+typedef void (*regexTokenDetailPrint_t)(regex_token_t *token);
+typedef void (*regexTokenVMInstrPrint_t)(regex_token_t *token, unsigned int oper_a, unsigned int oper_b);
+
+typedef struct regex_token_detail_s regex_token_detail_t;
+struct regex_token_detail_s {
+    eRegexToken_t token;
+    const char *name;
+    regexTokenDetailPrint_t detail_print;
+    regexTokenVMInstrPrint_t vm_print;
+};
+
+#define RE_TOK_DETAIL_P_(token,printer) {token, #token, regexPrinter_ ## token, NULL}
+#define RE_TOK_DETAIL_PV(token,printer) {token, #token, regexPrinter_ ## token, regexPrintVM_ ## token}
+#define RE_TOK_DETAIL_N_(token)         {token, #token, NULL, NULL}
+#define RE_TOK_DETAIL_NV(token)         {token, #token, NULL, regexPrintVM_ ## token}
+
+#define RE_TOK_DETAIL_END       RE_TOK_DETAIL_N_(eTokenUnknown)
+
+regex_token_detail_t _regexTokenDetails[] = {
+        RE_TOK_DETAIL_N_(eTokenNone),
+        RE_TOK_DETAIL_P_(eTokenCharLiteral, regexTokenDetailCharLiteral),
+        RE_TOK_DETAIL_P_(eTokenCharClass, regexTokenDetailCharClass),
+        RE_TOK_DETAIL_P_(eTokenStringLiteral, regexTokenDetailStringLiteral),
+        RE_TOK_DETAIL_N_(eTokenCharAny),
+        RE_TOK_DETAIL_N_(eTokenMatch),
+        RE_TOK_DETAIL_N_(eTokenSplit),
+        RE_TOK_DETAIL_N_(eTokenJmp),
+        RE_TOK_DETAIL_N_(eTokenSave),
+        RE_TOK_DETAIL_P_(eTokenUtf8Class, regexTokenDetailUtf8Class),
+        RE_TOK_DETAIL_N_(eTokenCharAnyDotAll),
+        RE_TOK_DETAIL_P_(eTokenCall, regexTokenDetailCall),
+        RE_TOK_DETAIL_N_(eTokenReturn),
+        RE_TOK_DETAIL_N_(eTokenByte),
+        RE_TOK_DETAIL_N_(eTokenConcatenation),
+        RE_TOK_DETAIL_N_(eTokenAlternative),
+        RE_TOK_DETAIL_N_(eTokenZeroOrOne),
+        RE_TOK_DETAIL_N_(eTokenZeroOrMany),
+        RE_TOK_DETAIL_N_(eTokenOneOrMany),
+        RE_TOK_DETAIL_P_(eTokenSubExprStart, regexTokenDetailSubExprStart),
+        RE_TOK_DETAIL_N_(eTokenSubExprEnd),
+        RE_TOK_DETAIL_END
+};
+
+int regexVerifyTokenDetails(void) {
+    int k;
+    for(k = 0; ((_regexTokenDetails[k].token != eTokenUnknown) &&
+                (_regexTokenDetails[k].token == k)); k++);
+    return ((_regexTokenDetails[k].token == eTokenUnknown) &&
+            (_regexTokenDetails[k].token == k));
+}
+
+void regexEmitTokenStr(regex_token_t *token) {
+    if(token == NULL) {
+        printf("token: NULL\n");
+    } else if((token->tokenType <= eTokenNone) || (token->tokenType >= eTokenUnknown)) {
+        printf("token: INVALID(%d)\n", token->tokenType);
+    } else {
+        printf("token: %s ", _regexTokenDetails[token->tokenType].name);
+        if(token->pc == VM_PC_UNVISITED) {
+            printf("UNVISITED ");
+        } else {
+            printf("PC:%d ", token->pc);
+        }
+        if(_regexTokenDetails[token->tokenType].detail_print != NULL) {
+            putchar(' ');
+            _regexTokenDetails[token->tokenType].detail_print(token);
+        }
+        putchar('\n');
     }
 }
 
@@ -737,7 +891,7 @@ int regexRegUnicodeCharClassAdd(const char *classId, const char *classStr) {
         return 0;
     }
     entry->dynamic = 1;
-    entry->id = _regexStrdup(classId);
+    entry->id = _regexStrdup(classId, -1);
     entry->class_str = classStr;
     if(_regex_unicode_charclass_registry == NULL) {
         _regex_unicode_charclass_registry = entry;
@@ -1012,7 +1166,7 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
         .state = eRegexPatternInvalid
     };
     int k;
-    char classId[3], c;
+    char classId[3];
 
     if(**pattern == '\0') {
         result.state = eRegexPatternEnd;
@@ -3305,7 +3459,6 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_token_t **tokens, regex_fr
     }
 
     if(group_flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
-        printf("Creating return instruction\n");
         if(!regexOperatorReturnCreate(&operands)) {
             SET_YARD_RESULT(eCompileOutOfMem);
         }
@@ -3358,71 +3511,60 @@ eRegexCompileStatus_t regexShuntingYard(regex_token_t **tokens) {
 // String table /////////////////////////////////////////////////////////////
 
 int regexVMStringTableEntryAdd(regex_vm_build_t *build, const char *str, int len) {
-    int index, count = build->vm->string_tbl_size, deduped;
-
-    if((index = tableEntryAdd((void ***)&(build->vm->string_table),
-                              &(build->vm->string_tbl_size),
-                              len + 1, (void *)str, REGEX_TABLE_DEDUPE,
-                              &deduped)) == -1) {
-        return -1;
-    }
-    if(!deduped) {
-        build->vm->string_table[index][len] = '\0';
-        return tableEntryAdd((void ***)&(build->vm->string_tbl_len),
-                             &count, 0, (void *)len,
-                             REGEX_TABLE_KEEP_PTR, NULL);
-    }
-    return index;
+    return regexStrTableEntryAdd(&(build->vm->string_table),
+                                 &(build->vm->string_tbl_size),
+                                 len, str, &(build->vm->string_tbl_len),
+                                 REGEX_TABLE_DEDUPE, NULL);
 }
 
 const char *regexVMStringTableEntryGet(regex_vm_t *vm, int string_table_id, int *len) {
-    if(string_table_id >= vm->string_tbl_size) {
-        return NULL;
-    }
-    *len = vm->string_tbl_len[string_table_id];
-    return vm->string_table[string_table_id];
+    return regexStrTableEntryGet(vm->string_table, vm->string_tbl_size,
+                                 vm->string_tbl_len, string_table_id, len);
 }
 
 void regexVMStringTableFree(regex_vm_t *vm) {
-    int count = vm->string_tbl_size;
-
-    tableEntryFree((void ***)&(vm->string_table), &(vm->string_tbl_size), 1);
-    tableEntryFree((void ***)&(vm->string_tbl_len), &count, 0);
+    regexStrTableFreeAll(&(vm->string_table), &(vm->string_tbl_size),
+                         &(vm->string_tbl_len));
 }
 
 // Class table //////////////////////////////////////////////////////////////
 
 int regexVMClassTableEntryAdd(regex_vm_build_t *build, const unsigned int *bitmap) {
-    return tableEntryAdd((void ***)&(build->vm->class_table),
-                         &(build->vm->class_tbl_size), 32, (void *)bitmap,
-                         REGEX_TABLE_DEDUPE | REGEX_TABLE_KEEP_PTR, NULL);
+    return regexStrTableEntryAdd((char ***)&(build->vm->class_table),
+                                 &(build->vm->class_tbl_size),
+                                 32, (char *)bitmap, NULL,
+                                 REGEX_TABLE_DEDUPE | REGEX_TABLE_KEEP_PTR, NULL);
 }
 
 const unsigned int *regexVMClassTableEntryGet(regex_vm_t *vm, int class_table_id) {
-    return (unsigned int *)tableEntryGet((void **)vm->class_table, vm->class_tbl_size, class_table_id);
+    return (unsigned int *)regexStrTableEntryGet((char **)&(vm->class_table),
+                                                 vm->class_tbl_size, NULL,
+                                                 class_table_id, NULL);
 }
 
 void regexVMClassTableFree(regex_vm_t *vm) {
-    tableEntryFree((void ***)&(vm->class_table), &(vm->class_tbl_size), 1);
+    regexStrTableFreeAll((char ***)&(vm->class_table), &(vm->class_tbl_size),
+                         NULL);
 }
 
 // utf8 table ///////////////////////////////////////////////////////////////
 
 int regexVMUtf8TableEntryAdd(regex_vm_build_t *build, const unsigned int *bitmap) {
-    return tableEntryAdd((void ***)&(build->vm->utf8_class_table),
-                         &(build->vm->utf8_tbl_size), 8, (void *)bitmap,
-                         REGEX_TABLE_KEEP_PTR | REGEX_TABLE_DEDUPE, NULL);
+    return regexStrTableEntryAdd((char ***)&(build->vm->utf8_class_table),
+                                 &(build->vm->utf8_tbl_size),
+                                 8, (char *)bitmap, NULL,
+                                 REGEX_TABLE_KEEP_PTR | REGEX_TABLE_DEDUPE, NULL);
 }
 
 const unsigned int *regexVMUtf8TableEntryGet(regex_vm_t *vm, int utf8_table_id) {
-    if(utf8_table_id >= vm->utf8_tbl_size) {
-        return NULL;
-    }
-    return vm->utf8_class_table[utf8_table_id];
+    return (unsigned int *)regexStrTableEntryGet((char **)&(vm->utf8_class_table),
+                                                 vm->utf8_tbl_size, NULL,
+                                                 utf8_table_id, NULL);
 }
 
 void regexVMUtf8TableFree(regex_vm_t *vm) {
-    tableEntryFree((void ***)&(vm->utf8_class_table), &(vm->utf8_tbl_size), 1);
+    regexStrTableFreeAll((char ***)&(vm->utf8_class_table), &(vm->utf8_tbl_size),
+                         NULL);
 }
 
 // Group table //////////////////////////////////////////////////////////////
@@ -3431,30 +3573,20 @@ int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group, int le
     int k;
 
     for(k = build->vm->group_tbl_size; k < index; k++) {
-        if(tableEntryAdd((void ***)&(build->vm->group_table), &(build->vm->group_tbl_size),
-                         0, NULL, REGEX_TABLE_KEEP_PTR, NULL) == -1) {
+        if(regexStrTableEntryAdd(&(build->vm->group_table),
+                                 &(build->vm->group_tbl_size), 0,
+                                 NULL, NULL,
+                                 REGEX_TABLE_KEEP_PTR, NULL) == -1) {
             return 0;
         }
     }
-    if(group == NULL) {
-        if((tableEntryAdd((void ***)&(build->vm->group_table),
-                          &(build->vm->group_tbl_size),
-                          0, NULL, REGEX_TABLE_KEEP_PTR, NULL)) != index) {
-            return 0;
-        }
-    } else {
-        if((tableEntryAdd((void ***)&(build->vm->group_table),
-                          &(build->vm->group_tbl_size),
-                          len + 1, (void *)group, 0, NULL)) != index) {
-            return 0;
-        }
-        build->vm->group_table[index][len] = '\0';
-    }
-    return 1;
+    return regexStrTableEntryAdd(&(build->vm->group_table),
+                                 &(build->vm->group_tbl_size),
+                                 len, group, NULL, REGEX_TABLE_NULL_TERMINATE, NULL);
 }
 
 void regexVMGroupTableFree(regex_vm_t *vm) {
-    tableEntryFree((void ***)&(vm->group_table), &(vm->group_tbl_size), 1);
+    regexStrTableFreeAll(&(vm->group_table), &(vm->group_tbl_size), NULL);
 }
 
 const char *regexVMGroupNameFromIndex(regex_vm_t *vm, int index) {
@@ -3904,7 +4036,7 @@ void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
         fprintf(fp, "\n};\n\n");
     }
 
-    fprintf(fp, "unsigned int *_%s_utf_class_table[] = {\n    ", symbol, k);
+    fprintf(fp, "unsigned int *_%s_utf_class_table[] = {\n    ", symbol);
     for(k = 0; k < vm->utf8_tbl_size; k++) {
         fprintf(fp, "    _%s_class_entry_%d,\n", symbol, k);
     }
@@ -4026,6 +4158,11 @@ const char *regexGetCompileStatusStr(eRegexCompileStatus_t status) {
 eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
                                    unsigned int flags) {
     regex_vm_build_t build;
+
+    if(!regexVerifyTokenDetails()) {
+        ctx->status = eCompileInternalError;
+        return ctx->status;
+    }
 
     memset(ctx, 0, sizeof(regex_compile_ctx_t));
     ctx->pattern = pattern;
@@ -4561,6 +4698,7 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
 
     for(; eval->pos != eval->len; eval->sp++, eval->pos++) {
         c = *eval->sp;
+        printf("[%c:%d]\n", c, c);
         if(eval->queue == NULL) {
             break;
         }
@@ -4823,14 +4961,14 @@ int main(int argc, char **argv) {
             printf("]\n");
             if((match = regexMatch(result.vm, argv[2], REGEX_STR_NULL_TERMINATED, 0)) == NULL) {
                 printf("No match\n");
-                return 1;
+                //return 1;
             } else {
                 regexDumpMatch(match);
                 regexMatchFree(match);
             }
         }
         //regexVMGenerateDeclaration(result.vm, "myparser", stdout);
-        //regexVMGenerateDefinition(result.vm, "myparser", stdout);
+        regexVMGenerateDefinition(result.vm, "myparser", stdout);
     }
 
     return 0;
