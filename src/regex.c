@@ -536,13 +536,6 @@ typedef unsigned int uint32_t;
 typedef unsigned char uint8_t;
 #endif // uint8_t
 
-typedef enum {
-    ePriorityNone,
-    ePriorityLow,
-    ePriorityMedium,
-    ePriorityHigh
-} eRegexTokenPriority_t;
-
 // Token attribute flags ///////////////////////////
 // Subexpression flags
 #define REGEX_TOKEN_FLAG_CASEINS    0x1u
@@ -630,80 +623,19 @@ int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group,
 // Token meta attribute helper functions
 /////////////////////////////////////////////////////////////////////////////
 
-// Determines whether a given token is a terminal operand. Used when comparing
-// two adjacent tokens, the preceeding flag indicates whether the token be
-// checked is leftmost.
-int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
-    switch(token->tokenType) {
-        case eTokenCharLiteral:
-        case eTokenStringLiteral:
-        case eTokenCharClass:
-        case eTokenByte:
-        case eTokenUtf8Class:
-        case eTokenCall:
-        case eTokenReturn:
-        case eTokenCharAny:
-            return 1;
-        case eTokenZeroOrOne:
-        case eTokenZeroOrMany:
-        case eTokenOneOrMany:
-            return preceeding;
-        case eTokenSubExprEnd:
-            return preceeding;
-        case eTokenSubExprStart:
-            return !preceeding;
-        default:
-            return 0;
-    }
-}
+typedef enum {
+    ePriorityNone,
+    ePriorityLow,
+    ePriorityMedium,
+    ePriorityHigh
+} eRegexTokenPriority_t;
 
-// Token priority when applying operators to operands in the shunting yard
-eRegexTokenPriority_t regexGetTokenTypePriority(eRegexToken_t tokenType) {
-    switch(tokenType) {
-        case eTokenCharLiteral:
-        case eTokenCharClass:
-        case eTokenStringLiteral:
-        case eTokenCharAny:
-        case eTokenByte:
-        case eTokenUtf8Class:
-        case eTokenCall:
-        case eTokenReturn:
-        case eTokenMatch:
-        default:
-            return ePriorityNone;
-
-        case eTokenZeroOrOne:
-        case eTokenZeroOrMany:
-        case eTokenOneOrMany:
-            return ePriorityHigh;
-
-        case eTokenConcatenation:
-        case eTokenAlternative:
-            return ePriorityMedium;
-
-        case eTokenSubExprStart:
-        case eTokenSubExprEnd:
-            return ePriorityLow;
-    }
-}
-
-// Operator arity (number of tokens that the operator functions on) in the
-// shunting yard
-int regexGetOperatorArity(regex_token_t *token) {
-    switch(token->tokenType) {
-        case eTokenZeroOrOne:
-        case eTokenZeroOrMany:
-        case eTokenOneOrMany:
-            return 1;
-        case eTokenConcatenation:
-        case eTokenAlternative:
-            return 2;
-        default:
-            return 0;
-    }
-}
-
-// Token diagnostic emit functions and data /////////////////////////////////
+typedef enum {
+    eReTokNotTerminal = 0,
+    eReTokTerminal,
+    eReTokPreceeding,
+    eReTokNotPreceeding
+} eRegexTokenTerminality_t;
 
 typedef void (*regexTokenDetailPrint_t)(FILE *fp, regex_token_t *token);
 typedef void (*regexTokenVMInstrPrint_t)(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b);
@@ -855,38 +787,45 @@ struct regex_token_detail_s {
     const char *name;
     regexTokenDetailPrint_t detail_print;
     regexTokenVMInstrPrint_t vm_print;
+    eRegexTokenPriority_t priority;
+    eRegexTokenTerminality_t terminal;
+    int arity;
 };
 
-#define RE_TOK_DETAIL_P_(token,printer) {token, #token, regexPrinter_ ## token, regexPrintVM_eTokenUnknown}
-#define RE_TOK_DETAIL_PV(token,printer) {token, #token, regexPrinter_ ## token, regexPrintVM_ ## token}
-#define RE_TOK_DETAIL_N_(token)         {token, #token, NULL, regexPrintVM_eTokenUnknown}
-#define RE_TOK_DETAIL_NV(token)         {token, #token, NULL, regexPrintVM_ ## token}
+#define RE_TOK_DETAIL_P_(token,printer,priority,terminal,arity) \
+        {token, #token, regexPrinter_ ## token, regexPrintVM_eTokenUnknown, priority, terminal, arity}
+#define RE_TOK_DETAIL_PV(token,printer,priority,terminal,arity) \
+        {token, #token, regexPrinter_ ## token, regexPrintVM_ ## token, priority, terminal, arity}
+#define RE_TOK_DETAIL_N_(token,priority,terminal,arity) \
+        {token, #token, NULL, regexPrintVM_eTokenUnknown, priority, terminal, arity}
+#define RE_TOK_DETAIL_NV(token,priority,terminal,arity) \
+        {token, #token, NULL, regexPrintVM_ ## token, priority, terminal, arity}
 
-#define RE_TOK_DETAIL_END       RE_TOK_DETAIL_N_(eTokenUnknown)
+#define RE_TOK_DETAIL_END       RE_TOK_DETAIL_N_(eTokenUnknown, ePriorityNone, eReTokNotTerminal, 0)
 
 regex_token_detail_t _regexTokenDetails[] = {
-        RE_TOK_DETAIL_N_(eTokenNone),
-        RE_TOK_DETAIL_PV(eTokenCharLiteral, regexTokenDetailCharLiteral),
-        RE_TOK_DETAIL_PV(eTokenCharClass, regexTokenDetailCharClass),
-        RE_TOK_DETAIL_PV(eTokenStringLiteral, regexTokenDetailStringLiteral),
-        RE_TOK_DETAIL_NV(eTokenCharAny),
-        RE_TOK_DETAIL_NV(eTokenMatch),
-        RE_TOK_DETAIL_NV(eTokenSplit),
-        RE_TOK_DETAIL_NV(eTokenJmp),
-        RE_TOK_DETAIL_NV(eTokenSave),
-        RE_TOK_DETAIL_PV(eTokenUtf8Class, regexTokenDetailUtf8Class),
-        RE_TOK_DETAIL_NV(eTokenCharAnyDotAll),
-        RE_TOK_DETAIL_PV(eTokenCall, regexTokenDetailCall),
-        RE_TOK_DETAIL_NV(eTokenReturn),
-        RE_TOK_DETAIL_NV(eTokenByte),
-        RE_TOK_DETAIL_N_(eTokenConcatenation),
-        RE_TOK_DETAIL_N_(eTokenAlternative),
-        RE_TOK_DETAIL_N_(eTokenZeroOrOne),
-        RE_TOK_DETAIL_N_(eTokenZeroOrMany),
-        RE_TOK_DETAIL_N_(eTokenOneOrMany),
-        RE_TOK_DETAIL_P_(eTokenSubExprStart, regexTokenDetailSubExprStart),
-        RE_TOK_DETAIL_N_(eTokenSubExprEnd),
-        RE_TOK_DETAIL_END
+    RE_TOK_DETAIL_N_(eTokenNone, ePriorityNone, eReTokNotTerminal, 0),
+    RE_TOK_DETAIL_PV(eTokenCharLiteral, regexTokenDetailCharLiteral, ePriorityNone, eReTokTerminal, 0),
+    RE_TOK_DETAIL_PV(eTokenCharClass, regexTokenDetailCharClass, ePriorityNone, eReTokTerminal, 0),
+    RE_TOK_DETAIL_PV(eTokenStringLiteral, regexTokenDetailStringLiteral, ePriorityNone, eReTokTerminal, 0),
+    RE_TOK_DETAIL_NV(eTokenCharAny, ePriorityNone, eReTokTerminal, 0),
+    RE_TOK_DETAIL_NV(eTokenMatch, ePriorityNone, eReTokNotTerminal, 0),
+    RE_TOK_DETAIL_NV(eTokenSplit, ePriorityNone, eReTokNotTerminal, 0),
+    RE_TOK_DETAIL_NV(eTokenJmp, ePriorityNone, eReTokNotTerminal, 0),
+    RE_TOK_DETAIL_NV(eTokenSave, ePriorityNone, eReTokNotTerminal, 0),
+    RE_TOK_DETAIL_PV(eTokenUtf8Class, regexTokenDetailUtf8Class, ePriorityNone, eReTokTerminal, 0),
+    RE_TOK_DETAIL_NV(eTokenCharAnyDotAll, ePriorityNone, eReTokNotTerminal, 0),
+    RE_TOK_DETAIL_PV(eTokenCall, regexTokenDetailCall, ePriorityNone, eReTokTerminal, 0),
+    RE_TOK_DETAIL_NV(eTokenReturn, ePriorityNone, eReTokTerminal, 0),
+    RE_TOK_DETAIL_NV(eTokenByte, ePriorityNone, eReTokTerminal, 0),
+    RE_TOK_DETAIL_N_(eTokenConcatenation, ePriorityMedium, eReTokNotTerminal, 2),
+    RE_TOK_DETAIL_N_(eTokenAlternative, ePriorityMedium, eReTokNotTerminal, 2),
+    RE_TOK_DETAIL_N_(eTokenZeroOrOne, ePriorityHigh, eReTokPreceeding, 1),
+    RE_TOK_DETAIL_N_(eTokenZeroOrMany, ePriorityHigh, eReTokPreceeding, 1),
+    RE_TOK_DETAIL_N_(eTokenOneOrMany, ePriorityHigh, eReTokPreceeding, 1),
+    RE_TOK_DETAIL_P_(eTokenSubExprStart, regexTokenDetailSubExprStart, ePriorityLow, eReTokNotPreceeding, 0),
+    RE_TOK_DETAIL_N_(eTokenSubExprEnd, ePriorityLow, eReTokPreceeding, 0),
+    RE_TOK_DETAIL_END
 };
 
 int regexVerifyTokenDetails(void) {
@@ -929,6 +868,26 @@ void regexEmitVMInstr(FILE *fp, regex_vm_t *vm, int pc) {
     fprintf(fp, "%4d ", pc);
     _regexTokenDetails[token].vm_print(fp, vm, oper_a, oper_b);
     fputc('\n', fp);
+}
+
+// Determines whether a given token is a terminal operand. Used when comparing
+// two adjacent tokens, the preceeding flag indicates whether the token be
+// checked is leftmost.
+int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
+    return ((_regexTokenDetails[token->tokenType].terminal == eReTokTerminal) ||
+            (preceeding && (_regexTokenDetails[token->tokenType].terminal == eReTokPreceeding)) ||
+            (!preceeding && (_regexTokenDetails[token->tokenType].terminal == eReTokNotPreceeding)));
+}
+
+// Token priority when applying operators to operands in the shunting yard
+eRegexTokenPriority_t regexGetTokenTypePriority(eRegexToken_t tokenType) {
+    return _regexTokenDetails[tokenType].priority;
+}
+
+// Operator arity (number of tokens that the operator functions on) in the
+// shunting yard
+int regexGetOperatorArity(regex_token_t *token) {
+    return _regexTokenDetails[token->tokenType].arity;
 }
 
 /////////////////////////////////////////////////////////////////////////////
