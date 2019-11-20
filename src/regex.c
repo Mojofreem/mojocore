@@ -4,8 +4,9 @@
 #define MOJO_REGEX_TEST_MAIN
 #define MOJO_REGEX_COMPILE_IMPLEMENTATION
 #define MOJO_REGEX_VM_SOURCE_GENERATION
+//#define MOJO_REGEX_VM_DEBUG
 #define MOJO_REGEX_EVALUATE_IMPLEMENTATION
-#define MOJO_UNICODE_SUPPORT
+#define MOJO_REGEX_UNICODE
 #define MOJO_REGEX_IMPLEMENTATION
 
 #include <stdio.h>
@@ -87,6 +88,7 @@
     (?P<name>...)  named subexpressions
     (?:...) non capturing subexpressions
     (?*...) compound subexpressions
+    (?R<name>...) named subroutine
     (?i) case insensitive match - TODO
 
     multiple subexpression meta prefixes may be defined, but must be at the
@@ -293,7 +295,11 @@ struct regex_match_s {
     const char _buffer[0];
 };
 
+#ifdef MOJO_REGEX_VM_DEBUG
+regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchored, FILE *debug);
+#else // !MOJO_REGEX_VM_DEBUG
 regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchored);
+#endif // MOJO_REGEX_VM_DEBUG
 void regexMatchFree(regex_match_t *match);
 const char *regexGroupValueGet(regex_match_t *match, int group, int *len);
 const char *regexGroupValueGetByName(regex_match_t *match, const char *name, int *len);
@@ -699,46 +705,149 @@ int regexGetOperatorArity(regex_token_t *token) {
 
 // Token diagnostic emit functions and data /////////////////////////////////
 
-void regexPrintVMCharClassEntry(FILE *fp, regex_vm_t *vm, int class_idx);
-void regexPrintVMStringLiteralEntry(FILE *fp, regex_vm_t *vm, int str_idx);
-void regexPrintVMUtf8ClassEntry(FILE *fp, regex_vm_t *vm, int utf8_idx);
-void regexPrintVMGroupEntry(FILE *fp, regex_vm_t *vm, int group_idx);
+typedef void (*regexTokenDetailPrint_t)(FILE *fp, regex_token_t *token);
+typedef void (*regexTokenVMInstrPrint_t)(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b);
 
-void regexPrintCharClassToFP(FILE *fp, unsigned int *bitmap);
+void regexEmitCharClassBitmap(FILE *fp, const unsigned int *bitmap);
 void regexEmitEscapedStr(FILE *fp, const char *str, int len);
 
-void regexPrinter_eTokenCharLiteral(regex_token_t *token) {
-    printf("(%c:%d)", (((token->c < 32) || (token->c > 127)) ? ' ' : token->c), token->c);
+const unsigned int *regexVMClassTableEntryGet(regex_vm_t *vm, int class_table_id);
+const char *regexVMStringTableEntryGet(regex_vm_t *vm, int string_table_id, int *len);
+const unsigned int *regexVMUtf8TableEntryGet(regex_vm_t *vm, int utf8_table_id);
+const char *regexVMGroupNameFromIndex(regex_vm_t *vm, int index);
+
+void regexPrintVMCharClass(FILE *fp, regex_vm_t *vm, int class_idx) {
+    const unsigned int *bitmap;
+
+    if((bitmap = regexVMClassTableEntryGet(vm, class_idx)) == NULL) {
+        printf("index %d was null", class_idx);
+    } else {
+        regexEmitCharClassBitmap(fp, bitmap);
+    }
 }
 
-void regexPrinter_eTokenCharClass(regex_token_t *token) {
-    putchar('[');
-    regexPrintCharClassToFP(stdout, token->bitmap);
-    putchar(']');
+void regexPrintVMStringLiteralEntry(FILE *fp, regex_vm_t *vm, int str_idx) {
+    const char *str;
+    int len;
+
+    str = regexVMStringTableEntryGet(vm, str_idx, &len);
+    regexEmitEscapedStr(fp, str, len);
 }
 
-void regexPrinter_eTokenStringLiteral(regex_token_t *token) {
-    putchar('\"');
+void regexPrintVMUtf8ClassEntry(FILE *fp, regex_vm_t *vm, int utf8_idx) {
+    const unsigned int *bitmap;
+
+    bitmap = regexVMUtf8TableEntryGet(vm, utf8_idx);
+    if(bitmap == NULL) {
+        printf("NULL");
+    } else {
+        printf("0x%8.8X%8.8X", bitmap[0], bitmap[1]);
+    }
+}
+
+// Token detail printers
+
+void regexPrinter_eTokenCharLiteral(FILE *fp, regex_token_t *token) {
+    fprintf(fp, "(%c:%d)", (((token->c < 32) || (token->c > 127)) ? ' ' : token->c), token->c);
+}
+
+void regexPrinter_eTokenCharClass(FILE *fp, regex_token_t *token) {
+    fputc('[', fp);
+    regexEmitCharClassBitmap(stdout, token->bitmap);
+    fputc(']', fp);
+}
+
+void regexPrinter_eTokenStringLiteral(FILE *fp, regex_token_t *token) {
+    fputc('\"', fp);
     regexEmitEscapedStr(stdout, token->str, token->len);
-    putchar('\"');
+    fputc('\"', fp);
 }
 
-void regexPrinter_eTokenUtf8Class(regex_token_t *token) {
-    // TODO
-    printf("[...]");
+void regexPrinter_eTokenUtf8Class(FILE *fp, regex_token_t *token) {
+    fputc('[', fp);
+    regexEmitCharClassBitmap(fp, token->bitmap);
+    fputc(']', fp);
 }
 
-void regexPrinter_eTokenCall(regex_token_t *token) {
-    // TODO
-    printf("%p", token->sub_sequence);
+void regexPrinter_eTokenCall(FILE *fp, regex_token_t *token) {
+    fprintf(fp, "%p", token->sub_sequence);
 }
 
-void regexPrinter_eTokenSubExprStart(regex_token_t *token) {
-    printf("%d", token->group);
+void regexPrinter_eTokenSubExprStart(FILE *fp, regex_token_t *token) {
+    fprintf(fp, "%d", token->group);
 }
 
-typedef void (*regexTokenDetailPrint_t)(regex_token_t *token);
-typedef void (*regexTokenVMInstrPrint_t)(regex_token_t *token, unsigned int oper_a, unsigned int oper_b);
+// Token VM instruction printers
+
+void regexPrintVM_eTokenCharLiteral(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "char (%c:%d)%s", (((oper_a < 32) || (oper_a > 127)) ? '_' : oper_a),
+            oper_a, (oper_b ? " inverted" : ""));
+}
+
+void regexPrintVM_eTokenStringLiteral(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "string (%d) \"", oper_a);
+    regexPrintVMStringLiteralEntry(fp, vm, (int)oper_a);
+    fputc('\"', fp);
+}
+
+void regexPrintVM_eTokenCharClass(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "class (%d)[", oper_a);
+    regexPrintVMCharClass(fp, vm, (int) oper_a);
+    fputc(']', fp);
+}
+
+void regexPrintVM_eTokenCharAny(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "anychar");
+}
+
+void regexPrintVM_eTokenSave(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    const char *str;
+
+    str = regexVMGroupNameFromIndex(vm, (int)oper_a);
+
+    fprintf(fp, "save %d", oper_a);
+    if(str != NULL) {
+        fprintf(fp, " (%s)", str);
+    }
+}
+
+void regexPrintVM_eTokenSplit(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "split %d, %d", oper_a, oper_b);
+}
+
+void regexPrintVM_eTokenMatch(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "match");
+}
+
+void regexPrintVM_eTokenJmp(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "jmp %d", oper_a);
+}
+
+void regexPrintVM_eTokenUtf8Class(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "utf8 (%d)[", oper_a);
+    regexPrintVMUtf8ClassEntry(fp, vm, (int)oper_a);
+    fputc(']', fp);
+}
+
+void regexPrintVM_eTokenCharAnyDotAll(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "anybyte");
+}
+
+void regexPrintVM_eTokenCall(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "call %d", oper_a);
+}
+
+void regexPrintVM_eTokenReturn(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "return");
+}
+
+void regexPrintVM_eTokenByte(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "byte");
+}
+
+void regexPrintVM_eTokenUnknown(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "UNKNOWN [0x%4.4X] [0x%4.4X]", oper_a & 0x3FFFu, oper_b & 0x3FFFu);
+}
 
 typedef struct regex_token_detail_s regex_token_detail_t;
 struct regex_token_detail_s {
@@ -748,28 +857,28 @@ struct regex_token_detail_s {
     regexTokenVMInstrPrint_t vm_print;
 };
 
-#define RE_TOK_DETAIL_P_(token,printer) {token, #token, regexPrinter_ ## token, NULL}
+#define RE_TOK_DETAIL_P_(token,printer) {token, #token, regexPrinter_ ## token, regexPrintVM_eTokenUnknown}
 #define RE_TOK_DETAIL_PV(token,printer) {token, #token, regexPrinter_ ## token, regexPrintVM_ ## token}
-#define RE_TOK_DETAIL_N_(token)         {token, #token, NULL, NULL}
+#define RE_TOK_DETAIL_N_(token)         {token, #token, NULL, regexPrintVM_eTokenUnknown}
 #define RE_TOK_DETAIL_NV(token)         {token, #token, NULL, regexPrintVM_ ## token}
 
 #define RE_TOK_DETAIL_END       RE_TOK_DETAIL_N_(eTokenUnknown)
 
 regex_token_detail_t _regexTokenDetails[] = {
         RE_TOK_DETAIL_N_(eTokenNone),
-        RE_TOK_DETAIL_P_(eTokenCharLiteral, regexTokenDetailCharLiteral),
-        RE_TOK_DETAIL_P_(eTokenCharClass, regexTokenDetailCharClass),
-        RE_TOK_DETAIL_P_(eTokenStringLiteral, regexTokenDetailStringLiteral),
-        RE_TOK_DETAIL_N_(eTokenCharAny),
-        RE_TOK_DETAIL_N_(eTokenMatch),
-        RE_TOK_DETAIL_N_(eTokenSplit),
-        RE_TOK_DETAIL_N_(eTokenJmp),
-        RE_TOK_DETAIL_N_(eTokenSave),
-        RE_TOK_DETAIL_P_(eTokenUtf8Class, regexTokenDetailUtf8Class),
-        RE_TOK_DETAIL_N_(eTokenCharAnyDotAll),
-        RE_TOK_DETAIL_P_(eTokenCall, regexTokenDetailCall),
-        RE_TOK_DETAIL_N_(eTokenReturn),
-        RE_TOK_DETAIL_N_(eTokenByte),
+        RE_TOK_DETAIL_PV(eTokenCharLiteral, regexTokenDetailCharLiteral),
+        RE_TOK_DETAIL_PV(eTokenCharClass, regexTokenDetailCharClass),
+        RE_TOK_DETAIL_PV(eTokenStringLiteral, regexTokenDetailStringLiteral),
+        RE_TOK_DETAIL_NV(eTokenCharAny),
+        RE_TOK_DETAIL_NV(eTokenMatch),
+        RE_TOK_DETAIL_NV(eTokenSplit),
+        RE_TOK_DETAIL_NV(eTokenJmp),
+        RE_TOK_DETAIL_NV(eTokenSave),
+        RE_TOK_DETAIL_PV(eTokenUtf8Class, regexTokenDetailUtf8Class),
+        RE_TOK_DETAIL_NV(eTokenCharAnyDotAll),
+        RE_TOK_DETAIL_PV(eTokenCall, regexTokenDetailCall),
+        RE_TOK_DETAIL_NV(eTokenReturn),
+        RE_TOK_DETAIL_NV(eTokenByte),
         RE_TOK_DETAIL_N_(eTokenConcatenation),
         RE_TOK_DETAIL_N_(eTokenAlternative),
         RE_TOK_DETAIL_N_(eTokenZeroOrOne),
@@ -788,24 +897,38 @@ int regexVerifyTokenDetails(void) {
             (_regexTokenDetails[k].token == k));
 }
 
-void regexEmitTokenStr(regex_token_t *token) {
+void regexEmitTokenStr(FILE *fp, regex_token_t *token) {
     if(token == NULL) {
-        printf("token: NULL\n");
+        fprintf(fp, "token: NULL\n");
     } else if((token->tokenType <= eTokenNone) || (token->tokenType >= eTokenUnknown)) {
-        printf("token: INVALID(%d)\n", token->tokenType);
+        fprintf(fp, "token: INVALID(%d)\n", token->tokenType);
     } else {
-        printf("token: %s ", _regexTokenDetails[token->tokenType].name);
+        fprintf(fp, "token: %s ", _regexTokenDetails[token->tokenType].name);
         if(token->pc == VM_PC_UNVISITED) {
-            printf("UNVISITED ");
+            fprintf(fp, "UNVISITED ");
         } else {
-            printf("PC:%d ", token->pc);
+            fprintf(fp, "PC:%d ", token->pc);
         }
         if(_regexTokenDetails[token->tokenType].detail_print != NULL) {
-            putchar(' ');
-            _regexTokenDetails[token->tokenType].detail_print(token);
+            fputc(' ', fp);
+            _regexTokenDetails[token->tokenType].detail_print(fp, token);
         }
-        putchar('\n');
+        fputc('\n', fp);
     }
+}
+
+void regexEmitVMInstr(FILE *fp, regex_vm_t *vm, int pc) {
+    eRegexToken_t token;
+    unsigned int oper_a, oper_b, instr;
+
+    instr = vm->program[pc];
+    token = (eRegexToken_t)(instr & 0xFu);
+    oper_a = (instr >> 4u) & 0x3FFFu;
+    oper_b = (instr >> 18u) & 0x3FFFu;
+
+    fprintf(fp, "%4d ", pc);
+    _regexTokenDetails[token].vm_print(fp, vm, oper_a, oper_b);
+    fputc('\n', fp);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1587,6 +1710,9 @@ void regexEmitEscapedStr(FILE *fp, const char *str, int len) {
     int k;
     int codepoint;
 
+    if(str == NULL) {
+        fputs("NULL", fp);
+    }
     for(k = 0; k < len; k++) {
         // Check for utf8 encoding
         if((codepoint = parseUtf8DecodeSequence(str + k)) != -1) {
@@ -2570,7 +2696,7 @@ int parseUnicodeClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_buil
     return parseCharClassAndCreateToken(status, build, &classStr, 0, tokens);
 }
 
-void regexPrintCharClassToFP(FILE *fp, unsigned int *bitmap) {
+void regexEmitCharClassBitmap(FILE *fp, const unsigned int *bitmap) {
     int k;
     int run;
 
@@ -3532,12 +3658,12 @@ void regexVMStringTableFree(regex_vm_t *vm) {
 int regexVMClassTableEntryAdd(regex_vm_build_t *build, const unsigned int *bitmap) {
     return regexStrTableEntryAdd((char ***)&(build->vm->class_table),
                                  &(build->vm->class_tbl_size),
-                                 32, (char *)bitmap, NULL,
-                                 REGEX_TABLE_DEDUPE | REGEX_TABLE_KEEP_PTR, NULL);
+                                32, (char *)bitmap, NULL,
+                                REGEX_TABLE_DEDUPE | REGEX_TABLE_KEEP_PTR, NULL);
 }
 
 const unsigned int *regexVMClassTableEntryGet(regex_vm_t *vm, int class_table_id) {
-    return (unsigned int *)regexStrTableEntryGet((char **)&(vm->class_table),
+    return (unsigned int *)regexStrTableEntryGet((char **)(vm->class_table),
                                                  vm->class_tbl_size, NULL,
                                                  class_table_id, NULL);
 }
@@ -3557,7 +3683,7 @@ int regexVMUtf8TableEntryAdd(regex_vm_build_t *build, const unsigned int *bitmap
 }
 
 const unsigned int *regexVMUtf8TableEntryGet(regex_vm_t *vm, int utf8_table_id) {
-    return (unsigned int *)regexStrTableEntryGet((char **)&(vm->utf8_class_table),
+    return (unsigned int *)regexStrTableEntryGet((char **)(vm->utf8_class_table),
                                                  vm->utf8_tbl_size, NULL,
                                                  utf8_table_id, NULL);
 }
@@ -4066,66 +4192,9 @@ void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
 
 void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
     int pc;
-    unsigned int instr[3];
-    const char *name;
 
     for(pc = 0; pc < vm->size; pc++) {
-        REGEX_VM_INSTR_DECODE(instr, vm, pc);
-        fprintf(fp, "%3.3d  ", pc);
-        switch(instr[0]) {
-            case eTokenCharLiteral:
-                fprintf(fp, "char (%c:%d)%s\n",
-                        ((instr[1] < 32 || instr[1] > 127) ? '-' : instr[1]), instr[1],
-                        (instr[2] ? " inverted" : ""));
-                break;
-            case eTokenStringLiteral:
-                fputs("string(\"", fp);
-                regexEmitEscapedStr(fp, vm->string_table[instr[1]], vm->string_tbl_len[instr[1]]);
-                fputs("\")\n", fp);
-                break;
-            case eTokenCharClass:
-                fprintf(fp, "class([");
-                regexPrintCharClassToFP(fp, vm->class_table[instr[1]]);
-                fprintf(fp, "])\n");
-                break;
-            case eTokenCharAny:
-                fprintf(fp, "anychar\n");
-                break;
-            case eTokenSave:
-                fprintf(fp, "save %d", instr[1]);
-                if((name = regexVMGroupNameFromIndex(vm, (((int)instr[1])/2) + 1)) != NULL) {
-                    fprintf(fp, " [%s]", name);
-                }
-                fprintf(fp, "%s\n", (instr[2] ? " compound" : ""));
-                break;
-            case eTokenSplit:
-                fprintf(fp, "split %d, %d\n", instr[1], instr[2]);
-                break;
-            case eTokenMatch:
-                fprintf(fp, "match\n");
-                break;
-            case eTokenJmp:
-                fprintf(fp, "jmp %d\n", instr[1]);
-                break;
-            case eTokenUtf8Class:
-                fprintf(fp, "utf8 [%d]\n", instr[1]);
-                break;
-            case eTokenCharAnyDotAll:
-                fprintf(fp, "anybyte\n");
-                break;
-            case eTokenCall:
-                fprintf(fp, "call %d\n", instr[1]);
-                break;
-            case eTokenReturn:
-                fprintf(fp, "return\n");
-                break;
-            case eTokenByte:
-                fprintf(fp, "byte\n");
-                break;
-            default:
-                fprintf(fp, "UNKNOWN [%d]!\n", instr[0]);
-                return;
-        }
+        regexEmitVMInstr(fp, vm, pc);
     }
 }
 
@@ -4250,6 +4319,9 @@ struct regex_eval_s {
     const char **subexprs;
     regex_compound_t *compound_pool;
     regex_thread_t *pool;
+#ifdef MOJO_REGEX_VM_DEBUG
+    FILE *debug;
+#endif // MOJO_REGEX_VM_DEBUG
 };
 
 regex_compound_t *regexThreadCompoundCreate(regex_eval_t *eval, regex_thread_t *thread, int append) {
@@ -4528,8 +4600,20 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
     int k;
     unsigned int instr[3];
     unsigned char c = *eval->sp;
+#ifdef MOJO_REGEX_VM_DEBUG
+    int first = 1;
+#endif // MOJO_REGEX_VM_DEBUG
 
     while(regexVMNoTextAdvance(eval->vm->program[thread->pc])) {
+#ifdef MOJO_REGEX_VM_DEBUG
+        if(eval->debug != NULL) {
+            if(!first) {
+                fprintf(eval->debug, "             ");
+            }
+            regexEmitVMInstr(eval->debug, eval->vm, thread->pc);
+            first = 0;
+        }
+#endif // MOJO_REGEX_VM_DEBUG
         REGEX_VM_INSTR_DECODE(instr, eval->vm, thread->pc);
         switch(instr[0]) {
             case eTokenSave:
@@ -4599,6 +4683,15 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                 return eEvalInternalError;
         }
     }
+#ifdef MOJO_REGEX_VM_DEBUG
+    if(eval->debug) {
+        if(!first) {
+            fprintf(eval->debug, "             ");
+        }
+        regexEmitVMInstr(eval->debug, eval->vm, thread->pc);
+        first = 0;
+    }
+#endif // MOJO_REGEX_VM_DEBUG
     REGEX_VM_INSTR_DECODE(instr, eval->vm, thread->pc);
     switch(instr[0]) {
         case eTokenCharLiteral:
@@ -4674,7 +4767,11 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
     }
 }
 
+#ifdef MOJO_REGEX_VM_DEBUG
+regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchored, FILE *debug) {
+#else // !MOJO_REGEX_VM_DEBUG
 regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchored) {
+#endif // MOJO_REGEX_VM_DEBUG
     regex_match_t *match;
     regex_eval_t *eval;
     regex_thread_t *thread;
@@ -4691,6 +4788,10 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
         return NULL;
     }
 
+#ifdef MOJO_REGEX_VM_DEBUG
+    eval->debug = debug;
+#endif // MOJO_REGEX_VM_DEBUG
+
     if(!regexThreadCreate(eval, NULL, 0, 1)) {
         regexEvalFree(eval);
         return NULL;
@@ -4698,19 +4799,33 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
 
     for(; eval->pos != eval->len; eval->sp++, eval->pos++) {
         c = *eval->sp;
-        printf("[%c:%d]\n", c, c);
+#ifdef MOJO_REGEX_VM_DEBUG
+        if(eval->debug != NULL) {
+            fprintf(eval->debug, "[%2d] (%c:%3d)\n", eval->pos, c, c);
+        }
+#endif // MOJO_REGEX_VM_DEBUG
         if(eval->queue == NULL) {
             break;
         }
         eval->thread = eval->queue;
         eval->queue = NULL;
         for(thread = eval->thread; thread != NULL; thread = eval->thread) {
+#ifdef MOJO_REGEX_VM_DEBUG
+            if(eval->debug != NULL) {
+                fprintf(eval->debug, "    %p ", thread);
+            }
+#endif // MOJO_REGEX_VM_DEBUG
             eval->thread = thread->next;
             switch(regexThreadProcess(eval, thread, anchored)) {
                 default:
                 case eEvalStackOverrun:
                 case eEvalInternalError:
                 case eEvalOutOfMem:
+#ifdef MOJO_REGEX_VM_DEBUG
+                    if(eval->debug) {
+                        fprintf(eval->debug, "    %p --- thread failure\n", thread);
+                    }
+#endif // MOJO_REGEX_VM_DEBUG
                     regexEvalFree(eval);
                     return NULL;
                 case eEvalMatch:
@@ -4724,6 +4839,11 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
                     eval->queue = thread;
                     break;
                 case eEvalNoMatch:
+#ifdef MOJO_REGEX_VM_DEBUG
+                    if(eval->debug) {
+                        fprintf(eval->debug, "    %p --- thread exit\n", thread);
+                    }
+#endif // MOJO_REGEX_VM_DEBUG
                     regexThreadFree(eval, thread);
                     break;
             }
@@ -4868,50 +4988,6 @@ const char *regexGroupCompoundValueGet(regex_match_t *match, int group, int num,
 
 #ifdef MOJO_REGEX_TEST_MAIN
 
-void printEscapedStr(FILE *fp, const char *text, int len) {
-    int k;
-    int codepoint;
-    char fmt[10];
-
-    for(k = 0; k < len; k++) {
-        // Check for utf8 encoding
-        if((codepoint = parseUtf8DecodeSequence(text + k)) != -1) {
-            if(codepoint > 0xFFFF) {
-                k += 3;
-                fprintf(fp, "\\U%6.6X", codepoint);
-            } else {
-                if(codepoint > 2047) {
-                    k += 2;
-                } else if(codepoint > 127) {
-                    k += 1;
-                }
-                snprintf(fmt, sizeof(fmt) - 1, "\\u%4.4X", codepoint);
-                fmt[6] = '\0';
-                fputs(fmt, fp);
-            }
-        } else {
-            switch(text[k]) {
-                case '\0': fputs("\\0", fp); break;
-                case '\a': fputs("\\a", fp); break;
-                case '\b': fputs("\\b", fp); break;
-                case '\x1b': fputs("\\e", fp); break;
-                case '\f': fputs("\\f", fp); break;
-                case '\n': fputs("\\n", fp); break;
-                case '\r': fputs("\\r", fp); break;
-                case '\t': fputs("\\t", fp); break;
-                case '\v': fputs("\\v", fp); break;
-                default:
-                    if((text[k] >= ' ') && (text[k] <= 127)) {
-                        fputc(text[k], fp);
-                    } else {
-                        fprintf(fp, "\\x%2.2X", text[k]);
-                    }
-                    break;
-            }
-        }
-    }
-}
-
 void regexDumpMatch(regex_match_t *match) {
     int k, m, n, len;
     const char *ptr;
@@ -4927,13 +5003,13 @@ void regexDumpMatch(regex_match_t *match) {
             printf("        %d [%s]: no match\n", k, regexGroupNameLookup(match->vm, k));
         } else {
             printf("        %d [%s]: [", k, regexGroupNameLookup(match->vm, k));
-            printEscapedStr(stdout, ptr, len);
+            regexEmitEscapedStr(stdout, ptr, len);
             printf("]\n");
             if((m = regexGroupCompoundCountGet(match, k)) > 0) {
                 for(n = 0; n < m; n++) {
                     ptr = regexGroupCompoundValueGet(match, k, n, &len);
                     printf("            %d [", n);
-                    printEscapedStr(stdout, ptr, len);
+                    regexEmitEscapedStr(stdout, ptr, len);
                     printf("]\n");
 
                 }
@@ -4957,9 +5033,13 @@ int main(int argc, char **argv) {
 
             printf("Evaluating [%s]\n", argv[2]);
             printf(" (escaped) [");
-            printEscapedStr(stdout, argv[2], strlen(argv[2]));
+            regexEmitEscapedStr(stdout, argv[2], (int)strlen(argv[2]));
             printf("]\n");
+#ifdef MOJO_REGEX_VM_DEBUG
+            if((match = regexMatch(result.vm, argv[2], REGEX_STR_NULL_TERMINATED, 0, stdout)) == NULL) {
+#else // !MOJO_REGEX_VM_DEBUG
             if((match = regexMatch(result.vm, argv[2], REGEX_STR_NULL_TERMINATED, 0)) == NULL) {
+#endif // MOJO_REGEX_VM_DEBUG
                 printf("No match\n");
                 //return 1;
             } else {
@@ -4968,7 +5048,7 @@ int main(int argc, char **argv) {
             }
         }
         //regexVMGenerateDeclaration(result.vm, "myparser", stdout);
-        regexVMGenerateDefinition(result.vm, "myparser", stdout);
+        //regexVMGenerateDefinition(result.vm, "myparser", stdout);
     }
 
     return 0;
@@ -4980,8 +5060,629 @@ int main(int argc, char **argv) {
 // Unicode property class definitions
 /////////////////////////////////////////////////////////////////////////////
 
-// TODO - integrate directly
-#include "unicode_props.c"
+#ifdef MOJO_REGEX_UNICODE
 
+// These property classes were generated from the unicode database by the
+// extract_unicode_props.py script
+
+const char unicode_combining_marks[] =
+    "\\u05BF\\u05C7\\u0670\\u0711\\u09D7\\u0A51\\u0A75\\u0B82\\u0BD7\\u0D57"\
+    "\\u0DD6\\u0E31\\u0EB1\\u108F\\u18A9\\uA802\\uA80B\\uA8FF\\uA9E5\\uAA43"\
+    "\\uAAB0\\uFB1E\\U01123E\\U011357\\U0119E4\\U011D3A\\U011D47\\U016F4F"\
+    "\\u05BF\\u05C7\\u0670\\u0711\\u07FD\\u09BC\\u09FE\\u0A3C\\u0A51\\u0A75"\
+    "\\u0ABC\\u0B3C\\u0B82\\u0CBC\\u0DCA\\u0DD6\\u0E31\\u0EB1\\u0F35\\u0F37"\
+    "\\u0F39\\u0FC6\\u17DD\\u18A9\\u1A7F\\u1CED\\u1CF4\\u2D7F\\uA802\\uA806"\
+    "\\uA80B\\uA8FF\\uA9E5\\uAA43\\uAAB0\\uAAC1\\uFB1E\\U0101FD\\U0102E0"\
+    "\\U010A3F\\U011173\\U01123E\\U01145E\\U011A47\\U011D3A\\U011D47"\
+    "\\U016F4F\\U01DA75\\U01DA84\\u05BF\\u05C7\\u0670\\u0711\\u07FD\\u09BC"\
+    "\\u09D7\\u09FE\\u0A3C\\u0A51\\u0A75\\u0ABC\\u0B3C\\u0B82\\u0BD7\\u0CBC"\
+    "\\u0D57\\u0DCA\\u0DD6\\u0E31\\u0EB1\\u0F35\\u0F37\\u0F39\\u0FC6\\u108F"\
+    "\\u17DD\\u18A9\\u1A7F\\u1CED\\u1CF4\\u2D7F\\uA802\\uA806\\uA80B\\uA8FF"\
+    "\\uA9E5\\uAA43\\uAAB0\\uAAC1\\uFB1E\\U0101FD\\U0102E0\\U010A3F"\
+    "\\U011173\\U01123E\\U011357\\U01145E\\U0119E4\\U011A47\\U011D3A"\
+    "\\U011D47\\U016F4F\\U01DA75\\U01DA84\\u05BF\\u05C7\\u0670\\u0711"\
+    "\\u07FD\\u09BC\\u09D7\\u09FE\\u0A3C\\u0A51\\u0A75\\u0ABC\\u0B3C\\u0B82"\
+    "\\u0BD7\\u0CBC\\u0D57\\u0DCA\\u0DD6\\u0E31\\u0EB1\\u0F35\\u0F37\\u0F39"\
+    "\\u0FC6\\u108F\\u17DD\\u18A9\\u1A7F\\u1CED\\u1CF4\\u2D7F\\uA802\\uA806"\
+    "\\uA80B\\uA8FF\\uA9E5\\uAA43\\uAAB0\\uAAC1\\uFB1E\\U0101FD\\U0102E0"\
+    "\\U010A3F\\U011173\\U01123E\\U011357\\U01145E\\U0119E4\\U011A47"\
+    "\\U011D3A\\U011D47\\U016F4F\\U01DA75\\U01DA84\\u05BF\\u05C7\\u0670"\
+    "\\u0711\\u07FD\\u09BC\\u09D7\\u09FE\\u0A3C\\u0A51\\u0A75\\u0ABC\\u0B3C"\
+    "\\u0B82\\u0BD7\\u0CBC\\u0D57\\u0DCA\\u0DD6\\u0E31\\u0EB1\\u0F35\\u0F37"\
+    "\\u0F39\\u0FC6\\u17DD\\u18A9\\u1A7F\\u1CED\\u1CF4\\u2D7F\\uA802\\uA806"\
+    "\\uA80B\\uA8FF\\uA9E5\\uAA43\\uAAB0\\uAAC1\\uFB1E\\U0101FD\\U0102E0"\
+    "\\U010A3F\\U011173\\U01123E\\U011357\\U01145E\\U011A47\\U011D3A"\
+    "\\U011D47\\U016F4F\\U01DA75\\U01DA84\\u108F\\U0119E4\\u05BF\\u05C7"\
+    "\\u0670\\u0711\\u07FD\\u09BC\\u09D7\\u09FE\\u0A3C\\u0A51\\u0A75\\u0ABC"\
+    "\\u0B3C\\u0B82\\u0BD7\\u0CBC\\u0D57\\u0DCA\\u0DD6\\u0E31\\u0EB1\\u0F35"\
+    "\\u0F37\\u0F39\\u0FC6\\u108F\\u17DD\\u18A9\\u1A7F\\u1CED\\u1CF4\\u2D7F"\
+    "\\uA802\\uA806\\uA80B\\uA8FF\\uA9E5\\uAA43\\uAAB0\\uAAC1\\uFB1E"\
+    "\\U0101FD\\U0102E0\\U010A3F\\U011173\\U01123E\\U011357\\U01145E"\
+    "\\U0119E4\\U011A47\\U011D3A\\U011D47\\U016F4F\\U01DA75\\U01DA84"\
+    "\\u20D0-\\u20F0\\u0591-\\u05BD\\u05C1-\\u05C2\\u05C4-\\u05C5"\
+    "\\u0610-\\u061A\\u064B-\\u065F\\u06D6-\\u06DC\\u06DF-\\u06E4"\
+    "\\u06E7-\\u06E8\\u0730-\\u074A\\u07A6-\\u07B0\\u0816-\\u0819"\
+    "\\u081B-\\u0823\\u0825-\\u0827\\u0829-\\u082D\\u08D3-\\u08E1"\
+    "\\u08E3-\\u0903\\u093A-\\u093C\\u093E-\\u094F\\u0951-\\u0957"\
+    "\\u0962-\\u0963\\u0981-\\u0983\\u09BE-\\u09C4\\u09C7-\\u09C8"\
+    "\\u09CB-\\u09CD\\u09E2-\\u09E3\\u0A01-\\u0A03\\u0A3E-\\u0A42"\
+    "\\u0A47-\\u0A48\\u0A4B-\\u0A4D\\u0A70-\\u0A71\\u0A81-\\u0A83"\
+    "\\u0ABE-\\u0AC5\\u0AC7-\\u0AC9\\u0ACB-\\u0ACD\\u0AE2-\\u0AE3"\
+    "\\u0AFA-\\u0AFF\\u0B01-\\u0B03\\u0B3E-\\u0B44\\u0B47-\\u0B48"\
+    "\\u0B4B-\\u0B4D\\u0B56-\\u0B57\\u0B62-\\u0B63\\u0BBE-\\u0BC2"\
+    "\\u0BC6-\\u0BC8\\u0BCA-\\u0BCD\\u0C00-\\u0C04\\u0C3E-\\u0C44"\
+    "\\u0C46-\\u0C48\\u0C4A-\\u0C4D\\u0C55-\\u0C56\\u0C62-\\u0C63"\
+    "\\u0C81-\\u0C83\\u0CBE-\\u0CC4\\u0CC6-\\u0CC8\\u0CCA-\\u0CCD"\
+    "\\u0CD5-\\u0CD6\\u0CE2-\\u0CE3\\u0D00-\\u0D03\\u0D3E-\\u0D44"\
+    "\\u0D46-\\u0D48\\u0D4A-\\u0D4D\\u0D62-\\u0D63\\u0D82-\\u0D83"\
+    "\\u0DCF-\\u0DD4\\u0DD8-\\u0DDF\\u0DF2-\\u0DF3\\u0E34-\\u0E3A"\
+    "\\u0EB4-\\u0EBC\\u0F71-\\u0F84\\u0F8D-\\u0F97\\u0F99-\\u0FBC"\
+    "\\u102B-\\u103E\\u1056-\\u1059\\u105E-\\u1060\\u1062-\\u1064"\
+    "\\u1067-\\u106D\\u1071-\\u1074\\u1082-\\u108D\\u109A-\\u109D"\
+    "\\u1712-\\u1714\\u1732-\\u1734\\u1752-\\u1753\\u1772-\\u1773"\
+    "\\u1885-\\u1886\\u1920-\\u192B\\u1930-\\u193B\\u1A17-\\u1A1B"\
+    "\\u1A55-\\u1A5E\\u1A60-\\u1A7C\\u1B00-\\u1B04\\u1B34-\\u1B44"\
+    "\\u1B80-\\u1B82\\u1BA1-\\u1BAD\\u1BE6-\\u1BF3\\u1C24-\\u1C37"\
+    "\\u1DC0-\\u1DF9\\u2DE0-\\u2DFF\\uA674-\\uA67D\\uA69E-\\uA69F"\
+    "\\uA823-\\uA827\\uA880-\\uA881\\uA8B4-\\uA8C5\\uA926-\\uA92D"\
+    "\\uA947-\\uA953\\uA980-\\uA983\\uA9B3-\\uA9C0\\uAA29-\\uAA36"\
+    "\\uAA4C-\\uAA4D\\uAA7B-\\uAA7D\\uAAB2-\\uAAB4\\uAAB7-\\uAAB8"\
+    "\\uAAEB-\\uAAEF\\uABE3-\\uABEA\\U010376-\\U01037A\\U010A01-\\U010A03"\
+    "\\U010A05-\\U010A06\\U010A0C-\\U010A0F\\U010D24-\\U010D27"\
+    "\\U011000-\\U011002\\U011038-\\U011046\\U0110B0-\\U0110BA"\
+    "\\U011100-\\U011102\\U011127-\\U011134\\U011145-\\U011146"\
+    "\\U011180-\\U011182\\U0111B3-\\U0111C0\\U0112DF-\\U0112EA"\
+    "\\U011300-\\U011303\\U01133E-\\U011344\\U011347-\\U011348"\
+    "\\U01134B-\\U01134D\\U011362-\\U011363\\U011435-\\U011446"\
+    "\\U0114B0-\\U0114C3\\U0115AF-\\U0115B5\\U0115B8-\\U0115C0"\
+    "\\U0115DC-\\U0115DD\\U011630-\\U011640\\U0116AB-\\U0116B7"\
+    "\\U01171D-\\U01172B\\U01182C-\\U01183A\\U0119D1-\\U0119D7"\
+    "\\U0119DA-\\U0119E0\\U011A01-\\U011A0A\\U011A33-\\U011A39"\
+    "\\U011A3B-\\U011A3E\\U011A51-\\U011A5B\\U011A8A-\\U011A99"\
+    "\\U011C2F-\\U011C36\\U011C38-\\U011C3F\\U011C92-\\U011CA7"\
+    "\\U011CA9-\\U011CB6\\U011D31-\\U011D36\\U011D3C-\\U011D3D"\
+    "\\U011D3F-\\U011D45\\U011D8A-\\U011D8E\\U011D90-\\U011D91"\
+    "\\U011D93-\\U011D97\\U011EF3-\\U011EF6\\U016F51-\\U016F87"\
+    "\\U016F8F-\\U016F92\\U01E000-\\U01E006\\U01E008-\\U01E018"\
+    "\\U01E01B-\\U01E021\\U01E023-\\U01E024\\U01E026-\\U01E02A"\
+    "\\u0300-\\u036F\\u0483-\\u0489\\u06EA-\\u06ED\\u07EB-\\u07F3"\
+    "\\u0859-\\u085B\\u0D3B-\\u0D3C\\u0E47-\\u0E4E\\u0EC8-\\u0ECD"\
+    "\\u0F18-\\u0F19\\u0F86-\\u0F87\\u135D-\\u135F\\u17B4-\\u17D3"\
+    "\\u180B-\\u180D\\u1AB0-\\u1ABE\\u1B6B-\\u1B73\\u1CD0-\\u1CD2"\
+    "\\u1CD4-\\u1CE8\\u1CF7-\\u1CF9\\u1DFB-\\u1DFF\\u2CEF-\\u2CF1"\
+    "\\u302A-\\u302F\\u3099-\\u309A\\uA66F-\\uA672\\uA6F0-\\uA6F1"\
+    "\\uA8E0-\\uA8F1\\uAABE-\\uAABF\\uAAF5-\\uAAF6\\uFE00-\\uFE0F"\
+    "\\uFE20-\\uFE2F\\U010A38-\\U010A3A\\U010AE5-\\U010AE6"\
+    "\\U010F46-\\U010F50\\U01107F-\\U011082\\U0111C9-\\U0111CC"\
+    "\\U01122C-\\U011237\\U01133B-\\U01133C\\U011366-\\U01136C"\
+    "\\U011370-\\U011374\\U016AF0-\\U016AF4\\U016B30-\\U016B36"\
+    "\\U01BC9D-\\U01BC9E\\U01D165-\\U01D169\\U01D17B-\\U01D182"\
+    "\\U01D185-\\U01D18B\\U01D1AA-\\U01D1AD\\U01D242-\\U01D244"\
+    "\\U01DA00-\\U01DA36\\U01DA3B-\\U01DA6C\\U01DA9B-\\U01DA9F"\
+    "\\U01DAA1-\\U01DAAF\\U01E130-\\U01E136\\U01E2EC-\\U01E2EF"\
+    "\\U01E8D0-\\U01E8D6\\U01E944-\\U01E94A\\U0E0100-\\U0E01EF"\
+    "\\u0F3E-\\u0F3F\\uABEC-\\uABED\\U01D16D-\\U01D172";
+
+const char unicode_numeric[] =
+    "\\u3007\\U010341\\U01034A\\u3007\\U010341\\U01034A\\u3007\\U010341"\
+    "\\U01034A\\u3007\\U010341\\U01034A\\u3007\\U010341\\U01034A\\u00B9"\
+    "\\u2070\\u2CFD\\u3007\\U010341\\U01034A\\u00B9\\u2070\\u2CFD\\u3007"\
+    "\\U010341\\U01034A\\U01D7CE-\\U01D7FF\\u16EE-\\u16F0\\u2150-\\u2182"\
+    "\\u2185-\\u2189\\u3021-\\u3029\\u3038-\\u303A\\uA6E6-\\uA6EF"\
+    "\\U010140-\\U010178\\U0103D1-\\U0103D5\\U012400-\\U01246E"\
+    "\\u0030-\\u0039\\u0660-\\u0669\\u06F0-\\u06F9\\u07C0-\\u07C9"\
+    "\\u0966-\\u096F\\u09E6-\\u09EF\\u0A66-\\u0A6F\\u0AE6-\\u0AEF"\
+    "\\u0B66-\\u0B6F\\u0BE6-\\u0BF2\\u0C66-\\u0C6F\\u0CE6-\\u0CEF"\
+    "\\u0D66-\\u0D78\\u0DE6-\\u0DEF\\u0E50-\\u0E59\\u0ED0-\\u0ED9"\
+    "\\u0F20-\\u0F33\\u1040-\\u1049\\u1090-\\u1099\\u1369-\\u137C"\
+    "\\u17E0-\\u17E9\\u1810-\\u1819\\u1946-\\u194F\\u19D0-\\u19DA"\
+    "\\u1A80-\\u1A89\\u1A90-\\u1A99\\u1B50-\\u1B59\\u1BB0-\\u1BB9"\
+    "\\u1C40-\\u1C49\\u1C50-\\u1C59\\uA620-\\uA629\\uA8D0-\\uA8D9"\
+    "\\uA900-\\uA909\\uA9D0-\\uA9D9\\uA9F0-\\uA9F9\\uAA50-\\uAA59"\
+    "\\uABF0-\\uABF9\\uFF10-\\uFF19\\U0104A0-\\U0104A9\\U010D30-\\U010D39"\
+    "\\U011052-\\U01106F\\U0110F0-\\U0110F9\\U011136-\\U01113F"\
+    "\\U0111D0-\\U0111D9\\U0112F0-\\U0112F9\\U011450-\\U011459"\
+    "\\U0114D0-\\U0114D9\\U011650-\\U011659\\U0116C0-\\U0116C9"\
+    "\\U011730-\\U01173B\\U0118E0-\\U0118F2\\U011C50-\\U011C6C"\
+    "\\U011D50-\\U011D59\\U011DA0-\\U011DA9\\U016A60-\\U016A69"\
+    "\\U016B50-\\U016B59\\U01E140-\\U01E149\\U01E2F0-\\U01E2F9"\
+    "\\U01E950-\\U01E959\\u00B2-\\u00B3\\u00BC-\\u00BE\\u09F4-\\u09F9"\
+    "\\u0B72-\\u0B77\\u0C78-\\u0C7E\\u0D58-\\u0D5E\\u17F0-\\u17F9"\
+    "\\u2074-\\u2079\\u2080-\\u2089\\u2460-\\u249B\\u24EA-\\u24FF"\
+    "\\u2776-\\u2793\\u3192-\\u3195\\u3220-\\u3229\\u3248-\\u324F"\
+    "\\u3251-\\u325F\\u3280-\\u3289\\u32B1-\\u32BF\\uA830-\\uA835"\
+    "\\U010107-\\U010133\\U01018A-\\U01018B\\U0102E1-\\U0102FB"\
+    "\\U010320-\\U010323\\U010858-\\U01085F\\U010879-\\U01087F"\
+    "\\U0108A7-\\U0108AF\\U0108FB-\\U0108FF\\U010916-\\U01091B"\
+    "\\U0109BC-\\U0109BD\\U0109C0-\\U0109CF\\U0109D2-\\U0109FF"\
+    "\\U010A40-\\U010A48\\U010A7D-\\U010A7E\\U010A9D-\\U010A9F"\
+    "\\U010AEB-\\U010AEF\\U010B58-\\U010B5F\\U010B78-\\U010B7F"\
+    "\\U010BA9-\\U010BAF\\U010CFA-\\U010CFF\\U010E60-\\U010E7E"\
+    "\\U010F1D-\\U010F26\\U010F51-\\U010F54\\U0111E1-\\U0111F4"\
+    "\\U011FC0-\\U011FD4\\U016B5B-\\U016B61\\U016E80-\\U016E96"\
+    "\\U01D2E0-\\U01D2F3\\U01D360-\\U01D378\\U01E8C7-\\U01E8CF"\
+    "\\U01EC71-\\U01ECAB\\U01ECAD-\\U01ECAF\\U01ECB1-\\U01ECB4"\
+    "\\U01ED01-\\U01ED2D\\U01ED2F-\\U01ED3D\\U01F100-\\U01F10C";
+
+const char unicode_punctuation[] =
+    "\\uFE63\\uFE68\\u0387\\u005F\\u0387\\uFF3F\\u005F\\u0387\\uFF3F\\u005F"\
+    "\\u007B\\u007D\\u00A1\\u00A7\\u00AB\\u00BB\\u00BF\\u037E\\u0387\\u05BE"\
+    "\\u05C0\\u05C3\\u05C6\\u061B\\u06D4\\u085E\\u0970\\u09FD\\u0A76\\u0AF0"\
+    "\\u0C77\\u0C84\\u0DF4\\u0E4F\\u0F14\\u0F85\\u10FB\\u1400\\u166E\\u1CD3"\
+    "\\u2D70\\u3030\\u303D\\u30A0\\u30FB\\uA673\\uA67E\\uA8FC\\uA95F\\uABEB"\
+    "\\uFE63\\uFE68\\uFF3F\\uFF5B\\uFF5D\\U01039F\\U0103D0\\U01056F"\
+    "\\U010857\\U01091F\\U01093F\\U010A7F\\U0111CD\\U0111DB\\U0112A9"\
+    "\\U01145B\\U01145D\\U0114C6\\U01183B\\U0119E2\\U011FFF\\U016AF5"\
+    "\\U016B44\\U016FE2\\U01BC9F\\u005F\\u007B\\u007D\\u00A1\\u00A7\\u00AB"\
+    "\\u00BB\\u00BF\\u037E\\u0387\\u05BE\\u05C0\\u05C3\\u05C6\\u061B\\u06D4"\
+    "\\u085E\\u0970\\u09FD\\u0A76\\u0AF0\\u0C77\\u0C84\\u0DF4\\u0E4F\\u0F14"\
+    "\\u0F85\\u10FB\\u1400\\u166E\\u1CD3\\u2D70\\u3030\\u303D\\u30A0\\u30FB"\
+    "\\uA673\\uA67E\\uA8FC\\uA95F\\uABEB\\uFE63\\uFE68\\uFF3F\\uFF5B\\uFF5D"\
+    "\\U01039F\\U0103D0\\U01056F\\U010857\\U01091F\\U01093F\\U010A7F"\
+    "\\U0111CD\\U0111DB\\U0112A9\\U01145B\\U01145D\\U0114C6\\U01183B"\
+    "\\U0119E2\\U011FFF\\U016AF5\\U016B44\\U016FE2\\U01BC9F\\u207D-\\u207E"\
+    "\\u208D-\\u208E\\u2308-\\u230B\\u27C5-\\u27C6\\u27E6-\\u27EF"\
+    "\\u2983-\\u2998\\u29D8-\\u29DB\\u29FC-\\u29FD\\u2030-\\u2043"\
+    "\\uFE30-\\uFE52\\u0021-\\u0023\\u0025-\\u002A\\u002C-\\u002F"\
+    "\\u003A-\\u003B\\u003F-\\u0040\\u005B-\\u005D\\u00B6-\\u00B7"\
+    "\\u055A-\\u055F\\u0589-\\u058A\\u05F3-\\u05F4\\u0609-\\u060A"\
+    "\\u060C-\\u060D\\u061E-\\u061F\\u066A-\\u066D\\u0700-\\u070D"\
+    "\\u07F7-\\u07F9\\u0830-\\u083E\\u0964-\\u0965\\u0E5A-\\u0E5B"\
+    "\\u0F04-\\u0F12\\u0F3A-\\u0F3D\\u0FD0-\\u0FD4\\u0FD9-\\u0FDA"\
+    "\\u104A-\\u104F\\u1360-\\u1368\\u169B-\\u169C\\u16EB-\\u16ED"\
+    "\\u1735-\\u1736\\u17D4-\\u17D6\\u17D8-\\u17DA\\u1800-\\u180A"\
+    "\\u1944-\\u1945\\u1A1E-\\u1A1F\\u1AA0-\\u1AA6\\u1AA8-\\u1AAD"\
+    "\\u1B5A-\\u1B60\\u1BFC-\\u1BFF\\u1C3B-\\u1C3F\\u1C7E-\\u1C7F"\
+    "\\u1CC0-\\u1CC7\\u2010-\\u2027\\u2045-\\u2051\\u2053-\\u205E"\
+    "\\u2329-\\u232A\\u2768-\\u2775\\u2CF9-\\u2CFC\\u2CFE-\\u2CFF"\
+    "\\u2E00-\\u2E2E\\u2E30-\\u2E4F\\u3001-\\u3003\\u3008-\\u3011"\
+    "\\u3014-\\u301F\\uA4FE-\\uA4FF\\uA60D-\\uA60F\\uA6F2-\\uA6F7"\
+    "\\uA874-\\uA877\\uA8CE-\\uA8CF\\uA8F8-\\uA8FA\\uA92E-\\uA92F"\
+    "\\uA9C1-\\uA9CD\\uA9DE-\\uA9DF\\uAA5C-\\uAA5F\\uAADE-\\uAADF"\
+    "\\uAAF0-\\uAAF1\\uFD3E-\\uFD3F\\uFE10-\\uFE19\\uFE54-\\uFE61"\
+    "\\uFE6A-\\uFE6B\\uFF01-\\uFF03\\uFF05-\\uFF0A\\uFF0C-\\uFF0F"\
+    "\\uFF1A-\\uFF1B\\uFF1F-\\uFF20\\uFF3B-\\uFF3D\\uFF5F-\\uFF65"\
+    "\\U010100-\\U010102\\U010A50-\\U010A58\\U010AF0-\\U010AF6"\
+    "\\U010B39-\\U010B3F\\U010B99-\\U010B9C\\U010F55-\\U010F59"\
+    "\\U011047-\\U01104D\\U0110BB-\\U0110BC\\U0110BE-\\U0110C1"\
+    "\\U011140-\\U011143\\U011174-\\U011175\\U0111C5-\\U0111C8"\
+    "\\U0111DD-\\U0111DF\\U011238-\\U01123D\\U01144B-\\U01144F"\
+    "\\U0115C1-\\U0115D7\\U011641-\\U011643\\U011660-\\U01166C"\
+    "\\U01173C-\\U01173E\\U011A3F-\\U011A46\\U011A9A-\\U011A9C"\
+    "\\U011A9E-\\U011AA2\\U011C41-\\U011C45\\U011C70-\\U011C71"\
+    "\\U011EF7-\\U011EF8\\U012470-\\U012474\\U016A6E-\\U016A6F"\
+    "\\U016B37-\\U016B3B\\U016E97-\\U016E9A\\U01DA87-\\U01DA8B"\
+    "\\U01E95E-\\U01E95F";
+
+const char unicode_whitespace[] =
+    "\\u0020\\u00A0\\u1680\\u202F\\u205F\\u3000\\u0020\\u00A0\\u1680\\u202F"\
+    "\\u205F\\u3000\\u2000-\\u200A\\u2028-\\u2029";
+
+const char unicode_letter[] =
+    "\\u2102\\u2107\\u2115\\u2124\\u2128\\U01D4A2\\U01D4BB\\U01D546"\
+    "\\U01EE24\\U01EE27\\U01EE39\\U01EE3B\\U01EE42\\U01EE47\\U01EE49"\
+    "\\U01EE4B\\U01EE54\\U01EE57\\U01EE59\\U01EE5B\\U01EE5D\\U01EE5F"\
+    "\\U01EE64\\U01EE7E\\u00AA\\u00B5\\u00BA\\u02EC\\u02EE\\u037F\\u0386"\
+    "\\u038C\\u0559\\u06D5\\u06FF\\u0710\\u07B1\\u07FA\\u081A\\u0824\\u0828"\
+    "\\u093D\\u0950\\u09B2\\u09BD\\u09CE\\u09FC\\u0A5E\\u0ABD\\u0AD0\\u0AF9"\
+    "\\u0B3D\\u0B71\\u0B83\\u0B9C\\u0BD0\\u0C3D\\u0C80\\u0CBD\\u0CDE\\u0D3D"\
+    "\\u0D4E\\u0DBD\\u0E84\\u0EA5\\u0EBD\\u0EC6\\u0F00\\u103F\\u1061\\u108E"\
+    "\\u10C7\\u10CD\\u1258\\u12C0\\u17D7\\u17DC\\u18AA\\u1AA7\\u1CFA\\u1F59"\
+    "\\u1F5B\\u1F5D\\u1FBE\\u2071\\u207F\\u2102\\u2107\\u2115\\u2124\\u2126"\
+    "\\u2128\\u214E\\u2D27\\u2D2D\\u2D6F\\u2E2F\\uA8FB\\uA9CF\\uAA7A\\uAAB1"\
+    "\\uAAC0\\uAAC2\\uFB1D\\uFB3E\\U010808\\U01083C\\U010A00\\U010F27"\
+    "\\U011144\\U011176\\U0111DA\\U0111DC\\U011288\\U01133D\\U011350"\
+    "\\U01145F\\U0114C7\\U011644\\U0116B8\\U0118FF\\U0119E1\\U0119E3"\
+    "\\U011A00\\U011A3A\\U011A50\\U011A9D\\U011C40\\U011D46\\U011D98"\
+    "\\U016F50\\U016FE3\\U01D4A2\\U01D4BB\\U01D546\\U01E14E\\U01E94B"\
+    "\\U01EE24\\U01EE27\\U01EE39\\U01EE3B\\U01EE42\\U01EE47\\U01EE49"\
+    "\\U01EE4B\\U01EE54\\U01EE57\\U01EE59\\U01EE5B\\U01EE5D\\U01EE5F"\
+    "\\U01EE64\\U01EE7E\\u00AA\\u00B5\\u00BA\\u1FBE\\u2071\\u207F\\u214E"\
+    "\\u2D27\\u2D2D\\U01D4BB\\u037F\\u0386\\u038C\\u10C7\\u10CD\\u1F59"\
+    "\\u1F5B\\u1F5D\\u2102\\u2107\\u2115\\u2124\\u2126\\u2128\\U01D4A2"\
+    "\\U01D546\\u00AA\\u00B5\\u00BA\\u037F\\u0386\\u038C\\u10C7\\u10CD"\
+    "\\u1F59\\u1F5B\\u1F5D\\u1FBE\\u2071\\u207F\\u2102\\u2107\\u2115\\u2124"\
+    "\\u2126\\u2128\\u214E\\u2D27\\u2D2D\\U01D4A2\\U01D4BB\\U01D546\\u02EC"\
+    "\\u02EE\\u0559\\u07FA\\u081A\\u0824\\u0828\\u0EC6\\u17D7\\u1AA7\\u2071"\
+    "\\u207F\\u2D6F\\u2E2F\\uA9CF\\U016FE3\\U01E94B\\u037F\\u0386\\u038C"\
+    "\\u10C7\\u10CD\\u1F59\\u1F5B\\u1F5D\\u2126\\u00B5\\u1FBE\\u214E\\u2D27"\
+    "\\u2D2D\\u00B5\\u1FBE\\u214E\\u2D27\\u2D2D\\u00B5\\u037F\\u0386\\u038C"\
+    "\\u10C7\\u10CD\\u1F59\\u1F5B\\u1F5D\\u2126\\u00B5\\u037F\\u0386\\u038C"\
+    "\\u10C7\\u10CD\\u1F59\\u1F5B\\u1F5D\\u1FBE\\u2126\\u214E\\u2D27\\u2D2D"\
+    "\\u00AA\\u00B5\\u00BA\\u02EC\\u02EE\\u037F\\u0386\\u038C\\u0559\\u06D5"\
+    "\\u06FF\\u0710\\u07B1\\u07FA\\u081A\\u0824\\u0828\\u093D\\u0950\\u09B2"\
+    "\\u09BD\\u09CE\\u09FC\\u0A5E\\u0ABD\\u0AD0\\u0AF9\\u0B3D\\u0B71\\u0B83"\
+    "\\u0B9C\\u0BD0\\u0C3D\\u0C80\\u0CBD\\u0CDE\\u0D3D\\u0D4E\\u0DBD\\u0E84"\
+    "\\u0EA5\\u0EBD\\u0EC6\\u0F00\\u103F\\u1061\\u108E\\u10C7\\u10CD\\u1258"\
+    "\\u12C0\\u17D7\\u17DC\\u18AA\\u1AA7\\u1CFA\\u1F59\\u1F5B\\u1F5D\\u1FBE"\
+    "\\u2071\\u207F\\u2102\\u2107\\u2115\\u2124\\u2126\\u2128\\u214E\\u2D27"\
+    "\\u2D2D\\u2D6F\\uA8FB\\uA9CF\\uAA7A\\uAAB1\\uAAC0\\uAAC2\\uFB1D\\uFB3E"\
+    "\\U010808\\U01083C\\U010A00\\U010F27\\U011144\\U011176\\U0111DA"\
+    "\\U0111DC\\U011288\\U01133D\\U011350\\U01145F\\U0114C7\\U011644"\
+    "\\U0116B8\\U0118FF\\U0119E1\\U0119E3\\U011A00\\U011A3A\\U011A50"\
+    "\\U011A9D\\U011C40\\U011D46\\U011D98\\U016F50\\U016FE3\\U01D4A2"\
+    "\\U01D4BB\\U01D546\\U01E14E\\U01E94B\\U01EE24\\U01EE27\\U01EE39"\
+    "\\U01EE3B\\U01EE42\\U01EE47\\U01EE49\\U01EE4B\\U01EE54\\U01EE57"\
+    "\\U01EE59\\U01EE5B\\U01EE5D\\U01EE5F\\U01EE64\\U01EE7E\\u00AA\\u00B5"\
+    "\\u00BA\\u02EC\\u02EE\\u037F\\u0386\\u038C\\u0559\\u06D5\\u06FF\\u0710"\
+    "\\u07B1\\u07FA\\u081A\\u0824\\u0828\\u093D\\u0950\\u09B2\\u09BD\\u09CE"\
+    "\\u09FC\\u0A5E\\u0ABD\\u0AD0\\u0AF9\\u0B3D\\u0B71\\u0B83\\u0B9C\\u0BD0"\
+    "\\u0C3D\\u0C80\\u0CBD\\u0CDE\\u0D3D\\u0D4E\\u0DBD\\u0E84\\u0EA5\\u0EBD"\
+    "\\u0EC6\\u0F00\\u103F\\u1061\\u108E\\u10C7\\u10CD\\u1258\\u12C0\\u17D7"\
+    "\\u17DC\\u18AA\\u1AA7\\u1CFA\\u1F59\\u1F5B\\u1F5D\\u1FBE\\u2071\\u207F"\
+    "\\u2102\\u2107\\u2115\\u2124\\u2126\\u2128\\u214E\\u2D27\\u2D2D\\u2D6F"\
+    "\\uA8FB\\uA9CF\\uAA7A\\uAAB1\\uAAC0\\uAAC2\\uFB1D\\uFB3E\\U010808"\
+    "\\U01083C\\U010A00\\U010F27\\U011144\\U011176\\U0111DA\\U0111DC"\
+    "\\U011288\\U01133D\\U011350\\U01145F\\U0114C7\\U011644\\U0116B8"\
+    "\\U0118FF\\U0119E1\\U0119E3\\U011A00\\U011A3A\\U011A50\\U011A9D"\
+    "\\U011C40\\U011D46\\U011D98\\U016F50\\U016FE3\\U01D4A2\\U01D4BB"\
+    "\\U01D546\\U01E14E\\U01E94B\\U01EE24\\U01EE27\\U01EE39\\U01EE3B"\
+    "\\U01EE42\\U01EE47\\U01EE49\\U01EE4B\\U01EE54\\U01EE57\\U01EE59"\
+    "\\U01EE5B\\U01EE5D\\U01EE5F\\U01EE64\\U01EE7E\\u00AA\\u00B5\\u00BA"\
+    "\\u02EC\\u02EE\\u037F\\u0386\\u038C\\u0559\\u06D5\\u06FF\\u0710\\u07B1"\
+    "\\u07FA\\u081A\\u0824\\u0828\\u093D\\u0950\\u09B2\\u09BD\\u09CE\\u09FC"\
+    "\\u0A5E\\u0ABD\\u0AD0\\u0AF9\\u0B3D\\u0B71\\u0B83\\u0B9C\\u0BD0\\u0C3D"\
+    "\\u0C80\\u0CBD\\u0CDE\\u0D3D\\u0D4E\\u0DBD\\u0E84\\u0EA5\\u0EBD\\u0EC6"\
+    "\\u0F00\\u103F\\u1061\\u108E\\u10C7\\u10CD\\u1258\\u12C0\\u17D7\\u17DC"\
+    "\\u18AA\\u1AA7\\u1CFA\\u1F59\\u1F5B\\u1F5D\\u1FBE\\u2071\\u207F\\u2102"\
+    "\\u2107\\u2115\\u2124\\u2126\\u2128\\u214E\\u2D27\\u2D2D\\u2D6F\\uA8FB"\
+    "\\uA9CF\\uAA7A\\uAAB1\\uAAC0\\uAAC2\\uFB1D\\uFB3E\\U010808\\U01083C"\
+    "\\U010A00\\U010F27\\U011144\\U011176\\U0111DA\\U0111DC\\U011288"\
+    "\\U01133D\\U011350\\U01145F\\U0114C7\\U011644\\U0116B8\\U0118FF"\
+    "\\U0119E1\\U0119E3\\U011A00\\U011A3A\\U011A50\\U011A9D\\U011C40"\
+    "\\U011D46\\U011D98\\U016F50\\U016FE3\\U01D4A2\\U01D4BB\\U01D546"\
+    "\\U01E14E\\U01E94B\\U01EE24\\U01EE27\\U01EE39\\U01EE3B\\U01EE42"\
+    "\\U01EE47\\U01EE49\\U01EE4B\\U01EE54\\U01EE57\\U01EE59\\U01EE5B"\
+    "\\U01EE5D\\U01EE5F\\U01EE64\\U01EE7E\\u00AA\\u00B5\\u00BA\\u02EC"\
+    "\\u02EE\\u037F\\u0386\\u038C\\u0559\\u06D5\\u06FF\\u0710\\u07B1\\u07FA"\
+    "\\u081A\\u0824\\u0828\\u093D\\u0950\\u09B2\\u09BD\\u09CE\\u09FC\\u0A5E"\
+    "\\u0ABD\\u0AD0\\u0AF9\\u0B3D\\u0B71\\u0B83\\u0B9C\\u0BD0\\u0C3D\\u0C80"\
+    "\\u0CBD\\u0CDE\\u0D3D\\u0D4E\\u0DBD\\u0E84\\u0EA5\\u0EBD\\u0EC6\\u0F00"\
+    "\\u103F\\u1061\\u108E\\u10C7\\u10CD\\u1258\\u12C0\\u17D7\\u17DC\\u18AA"\
+    "\\u1AA7\\u1CFA\\u1F59\\u1F5B\\u1F5D\\u1FBE\\u2071\\u207F\\u2102\\u2107"\
+    "\\u2115\\u2124\\u2126\\u2128\\u214E\\u2D27\\u2D2D\\u2D6F\\uA8FB\\uA9CF"\
+    "\\uAA7A\\uAAB1\\uAAC0\\uAAC2\\uFB1D\\uFB3E\\U010808\\U01083C\\U010A00"\
+    "\\U010F27\\U011144\\U011176\\U0111DA\\U0111DC\\U011288\\U01133D"\
+    "\\U011350\\U01145F\\U0114C7\\U011644\\U0116B8\\U0118FF\\U0119E1"\
+    "\\U0119E3\\U011A00\\U011A3A\\U011A50\\U011A9D\\U011C40\\U011D46"\
+    "\\U011D98\\U016F50\\U016FE3\\U01D4A2\\U01D4BB\\U01D546\\U01E14E"\
+    "\\U01E94B\\U01EE24\\U01EE27\\U01EE39\\U01EE3B\\U01EE42\\U01EE47"\
+    "\\U01EE49\\U01EE4B\\U01EE54\\U01EE57\\U01EE59\\U01EE5B\\U01EE5D"\
+    "\\U01EE5F\\U01EE64\\U01EE7E\\u00AA\\u00B5\\u00BA\\u02EC\\u02EE\\u037F"\
+    "\\u0386\\u038C\\u0559\\u06D5\\u06FF\\u0710\\u07B1\\u07FA\\u081A\\u0824"\
+    "\\u0828\\u093D\\u0950\\u09B2\\u09BD\\u09CE\\u09FC\\u0A5E\\u0ABD\\u0AD0"\
+    "\\u0AF9\\u0B3D\\u0B71\\u0B83\\u0B9C\\u0BD0\\u0C3D\\u0C80\\u0CBD\\u0CDE"\
+    "\\u0D3D\\u0D4E\\u0DBD\\u0E84\\u0EA5\\u0EBD\\u0EC6\\u0F00\\u103F\\u1061"\
+    "\\u108E\\u10C7\\u10CD\\u1258\\u12C0\\u17D7\\u17DC\\u18AA\\u1AA7\\u1CFA"\
+    "\\u1F59\\u1F5B\\u1F5D\\u1FBE\\u2071\\u207F\\u2102\\u2107\\u2115\\u2124"\
+    "\\u2126\\u2128\\u214E\\u2D27\\u2D2D\\u2D6F\\u2E2F\\uA8FB\\uA9CF\\uAA7A"\
+    "\\uAAB1\\uAAC0\\uAAC2\\uFB1D\\uFB3E\\U010808\\U01083C\\U010A00"\
+    "\\U010F27\\U011144\\U011176\\U0111DA\\U0111DC\\U011288\\U01133D"\
+    "\\U011350\\U01145F\\U0114C7\\U011644\\U0116B8\\U0118FF\\U0119E1"\
+    "\\U0119E3\\U011A00\\U011A3A\\U011A50\\U011A9D\\U011C40\\U011D46"\
+    "\\U011D98\\U016F50\\U016FE3\\U01D4A2\\U01D4BB\\U01D546\\U01E14E"\
+    "\\U01E94B\\U01EE24\\U01EE27\\U01EE39\\U01EE3B\\U01EE42\\U01EE47"\
+    "\\U01EE49\\U01EE4B\\U01EE54\\U01EE57\\U01EE59\\U01EE5B\\U01EE5D"\
+    "\\U01EE5F\\U01EE64\\U01EE7E\\u00AA\\u00B5\\u00BA\\u02EC\\u02EE\\u037F"\
+    "\\u0386\\u038C\\u0559\\u06D5\\u06FF\\u0710\\u07B1\\u07FA\\u081A\\u0824"\
+    "\\u0828\\u093D\\u0950\\u09B2\\u09BD\\u09CE\\u09FC\\u0A5E\\u0ABD\\u0AD0"\
+    "\\u0AF9\\u0B3D\\u0B71\\u0B83\\u0B9C\\u0BD0\\u0C3D\\u0C80\\u0CBD\\u0CDE"\
+    "\\u0D3D\\u0D4E\\u0DBD\\u0E84\\u0EA5\\u0EBD\\u0EC6\\u0F00\\u103F\\u1061"\
+    "\\u108E\\u10C7\\u10CD\\u1258\\u12C0\\u17D7\\u17DC\\u18AA\\u1AA7\\u1CFA"\
+    "\\u1F59\\u1F5B\\u1F5D\\u1FBE\\u2071\\u207F\\u2102\\u2107\\u2115\\u2124"\
+    "\\u2126\\u2128\\u214E\\u2D27\\u2D2D\\u2D6F\\u2E2F\\uA8FB\\uA9CF\\uAA7A"\
+    "\\uAAB1\\uAAC0\\uAAC2\\uFB1D\\uFB3E\\U010808\\U01083C\\U010A00"\
+    "\\U010F27\\U011144\\U011176\\U0111DA\\U0111DC\\U011288\\U01133D"\
+    "\\U011350\\U01145F\\U0114C7\\U011644\\U0116B8\\U0118FF\\U0119E1"\
+    "\\U0119E3\\U011A00\\U011A3A\\U011A50\\U011A9D\\U011C40\\U011D46"\
+    "\\U011D98\\U016F50\\U016FE3\\U01D4A2\\U01D4BB\\U01D546\\U01E14E"\
+    "\\U01E94B\\U01EE24\\U01EE27\\U01EE39\\U01EE3B\\U01EE42\\U01EE47"\
+    "\\U01EE49\\U01EE4B\\U01EE54\\U01EE57\\U01EE59\\U01EE5B\\U01EE5D"\
+    "\\U01EE5F\\U01EE64\\U01EE7E\\u03A3-\\u03F5\\u210A-\\u2113"\
+    "\\u2119-\\u211D\\u212A-\\u212D\\u212F-\\u2139\\u213C-\\u213F"\
+    "\\u2145-\\u2149\\U01D400-\\U01D454\\U01D456-\\U01D49C"\
+    "\\U01D49E-\\U01D49F\\U01D4A5-\\U01D4A6\\U01D4A9-\\U01D4AC"\
+    "\\U01D4AE-\\U01D4B9\\U01D4BD-\\U01D4C3\\U01D4C5-\\U01D505"\
+    "\\U01D507-\\U01D50A\\U01D50D-\\U01D514\\U01D516-\\U01D51C"\
+    "\\U01D51E-\\U01D539\\U01D53B-\\U01D53E\\U01D540-\\U01D544"\
+    "\\U01D54A-\\U01D550\\U01D552-\\U01D6A5\\U01D6A8-\\U01D6C0"\
+    "\\U01D6C2-\\U01D6DA\\U01D6DC-\\U01D6FA\\U01D6FC-\\U01D714"\
+    "\\U01D716-\\U01D734\\U01D736-\\U01D74E\\U01D750-\\U01D76E"\
+    "\\U01D770-\\U01D788\\U01D78A-\\U01D7A8\\U01D7AA-\\U01D7C2"\
+    "\\U01D7C4-\\U01D7CB\\U01EE00-\\U01EE03\\U01EE05-\\U01EE1F"\
+    "\\U01EE21-\\U01EE22\\U01EE29-\\U01EE32\\U01EE34-\\U01EE37"\
+    "\\U01EE4D-\\U01EE4F\\U01EE51-\\U01EE52\\U01EE61-\\U01EE62"\
+    "\\U01EE67-\\U01EE6A\\U01EE6C-\\U01EE72\\U01EE74-\\U01EE77"\
+    "\\U01EE79-\\U01EE7C\\U01EE80-\\U01EE89\\U01EE8B-\\U01EE9B"\
+    "\\U01EEA1-\\U01EEA3\\U01EEA5-\\U01EEA9\\U01EEAB-\\U01EEBB"\
+    "\\u0041-\\u005A\\u0061-\\u007A\\u00C0-\\u00D6\\u00D8-\\u00F6"\
+    "\\u00F8-\\u02C1\\u02C6-\\u02D1\\u02E0-\\u02E4\\u0370-\\u0374"\
+    "\\u0376-\\u0377\\u037A-\\u037D\\u0388-\\u038A\\u038E-\\u03A1"\
+    "\\u03F7-\\u0481\\u048A-\\u052F\\u0531-\\u0556\\u0560-\\u0588"\
+    "\\u05D0-\\u05EA\\u05EF-\\u05F2\\u0620-\\u064A\\u066E-\\u066F"\
+    "\\u0671-\\u06D3\\u06E5-\\u06E6\\u06EE-\\u06EF\\u06FA-\\u06FC"\
+    "\\u0712-\\u072F\\u074D-\\u07A5\\u07CA-\\u07EA\\u07F4-\\u07F5"\
+    "\\u0800-\\u0815\\u0840-\\u0858\\u0860-\\u086A\\u08A0-\\u08B4"\
+    "\\u08B6-\\u08BD\\u0904-\\u0939\\u0958-\\u0961\\u0971-\\u0980"\
+    "\\u0985-\\u098C\\u098F-\\u0990\\u0993-\\u09A8\\u09AA-\\u09B0"\
+    "\\u09B6-\\u09B9\\u09DC-\\u09DD\\u09DF-\\u09E1\\u09F0-\\u09F1"\
+    "\\u0A05-\\u0A0A\\u0A0F-\\u0A10\\u0A13-\\u0A28\\u0A2A-\\u0A30"\
+    "\\u0A32-\\u0A33\\u0A35-\\u0A36\\u0A38-\\u0A39\\u0A59-\\u0A5C"\
+    "\\u0A72-\\u0A74\\u0A85-\\u0A8D\\u0A8F-\\u0A91\\u0A93-\\u0AA8"\
+    "\\u0AAA-\\u0AB0\\u0AB2-\\u0AB3\\u0AB5-\\u0AB9\\u0AE0-\\u0AE1"\
+    "\\u0B05-\\u0B0C\\u0B0F-\\u0B10\\u0B13-\\u0B28\\u0B2A-\\u0B30"\
+    "\\u0B32-\\u0B33\\u0B35-\\u0B39\\u0B5C-\\u0B5D\\u0B5F-\\u0B61"\
+    "\\u0B85-\\u0B8A\\u0B8E-\\u0B90\\u0B92-\\u0B95\\u0B99-\\u0B9A"\
+    "\\u0B9E-\\u0B9F\\u0BA3-\\u0BA4\\u0BA8-\\u0BAA\\u0BAE-\\u0BB9"\
+    "\\u0C05-\\u0C0C\\u0C0E-\\u0C10\\u0C12-\\u0C28\\u0C2A-\\u0C39"\
+    "\\u0C58-\\u0C5A\\u0C60-\\u0C61\\u0C85-\\u0C8C\\u0C8E-\\u0C90"\
+    "\\u0C92-\\u0CA8\\u0CAA-\\u0CB3\\u0CB5-\\u0CB9\\u0CE0-\\u0CE1"\
+    "\\u0CF1-\\u0CF2\\u0D05-\\u0D0C\\u0D0E-\\u0D10\\u0D12-\\u0D3A"\
+    "\\u0D54-\\u0D56\\u0D5F-\\u0D61\\u0D7A-\\u0D7F\\u0D85-\\u0D96"\
+    "\\u0D9A-\\u0DB1\\u0DB3-\\u0DBB\\u0DC0-\\u0DC6\\u0E01-\\u0E30"\
+    "\\u0E32-\\u0E33\\u0E40-\\u0E46\\u0E81-\\u0E82\\u0E86-\\u0E8A"\
+    "\\u0E8C-\\u0EA3\\u0EA7-\\u0EB0\\u0EB2-\\u0EB3\\u0EC0-\\u0EC4"\
+    "\\u0EDC-\\u0EDF\\u0F40-\\u0F47\\u0F49-\\u0F6C\\u0F88-\\u0F8C"\
+    "\\u1000-\\u102A\\u1050-\\u1055\\u105A-\\u105D\\u1065-\\u1066"\
+    "\\u106E-\\u1070\\u1075-\\u1081\\u10A0-\\u10C5\\u10D0-\\u10FA"\
+    "\\u10FC-\\u1248\\u124A-\\u124D\\u1250-\\u1256\\u125A-\\u125D"\
+    "\\u1260-\\u1288\\u128A-\\u128D\\u1290-\\u12B0\\u12B2-\\u12B5"\
+    "\\u12B8-\\u12BE\\u12C2-\\u12C5\\u12C8-\\u12D6\\u12D8-\\u1310"\
+    "\\u1312-\\u1315\\u1318-\\u135A\\u1380-\\u138F\\u13A0-\\u13F5"\
+    "\\u13F8-\\u13FD\\u1401-\\u166C\\u166F-\\u167F\\u1681-\\u169A"\
+    "\\u16A0-\\u16EA\\u16F1-\\u16F8\\u1700-\\u170C\\u170E-\\u1711"\
+    "\\u1720-\\u1731\\u1740-\\u1751\\u1760-\\u176C\\u176E-\\u1770"\
+    "\\u1780-\\u17B3\\u1820-\\u1878\\u1880-\\u1884\\u1887-\\u18A8"\
+    "\\u18B0-\\u18F5\\u1900-\\u191E\\u1950-\\u196D\\u1970-\\u1974"\
+    "\\u1980-\\u19AB\\u19B0-\\u19C9\\u1A00-\\u1A16\\u1A20-\\u1A54"\
+    "\\u1B05-\\u1B33\\u1B45-\\u1B4B\\u1B83-\\u1BA0\\u1BAE-\\u1BAF"\
+    "\\u1BBA-\\u1BE5\\u1C00-\\u1C23\\u1C4D-\\u1C4F\\u1C5A-\\u1C7D"\
+    "\\u1C80-\\u1C88\\u1C90-\\u1CBA\\u1CBD-\\u1CBF\\u1CE9-\\u1CEC"\
+    "\\u1CEE-\\u1CF3\\u1CF5-\\u1CF6\\u1D00-\\u1DBF\\u1E00-\\u1F15"\
+    "\\u1F18-\\u1F1D\\u1F20-\\u1F45\\u1F48-\\u1F4D\\u1F50-\\u1F57"\
+    "\\u1F5F-\\u1F7D\\u1F80-\\u1FB4\\u1FB6-\\u1FBC\\u1FC2-\\u1FC4"\
+    "\\u1FC6-\\u1FCC\\u1FD0-\\u1FD3\\u1FD6-\\u1FDB\\u1FE0-\\u1FEC"\
+    "\\u1FF2-\\u1FF4\\u1FF6-\\u1FFC\\u2090-\\u209C\\u2183-\\u2184"\
+    "\\u2C00-\\u2C2E\\u2C30-\\u2C5E\\u2C60-\\u2CE4\\u2CEB-\\u2CEE"\
+    "\\u2CF2-\\u2CF3\\u2D00-\\u2D25\\u2D30-\\u2D67\\u2D80-\\u2D96"\
+    "\\u2DA0-\\u2DA6\\u2DA8-\\u2DAE\\u2DB0-\\u2DB6\\u2DB8-\\u2DBE"\
+    "\\u2DC0-\\u2DC6\\u2DC8-\\u2DCE\\u2DD0-\\u2DD6\\u2DD8-\\u2DDE"\
+    "\\u3005-\\u3006\\u3031-\\u3035\\u303B-\\u303C\\u3041-\\u3096"\
+    "\\u309D-\\u309F\\u30A1-\\u30FA\\u30FC-\\u30FF\\u3105-\\u312F"\
+    "\\u3131-\\u318E\\u31A0-\\u31BA\\u31F0-\\u31FF\\u3400-\\u4DB5"\
+    "\\u4E00-\\u9FEF\\uA000-\\uA48C\\uA4D0-\\uA4FD\\uA500-\\uA60C"\
+    "\\uA610-\\uA61F\\uA62A-\\uA62B\\uA640-\\uA66E\\uA67F-\\uA69D"\
+    "\\uA6A0-\\uA6E5\\uA717-\\uA71F\\uA722-\\uA788\\uA78B-\\uA7BF"\
+    "\\uA7C2-\\uA7C6\\uA7F7-\\uA801\\uA803-\\uA805\\uA807-\\uA80A"\
+    "\\uA80C-\\uA822\\uA840-\\uA873\\uA882-\\uA8B3\\uA8F2-\\uA8F7"\
+    "\\uA8FD-\\uA8FE\\uA90A-\\uA925\\uA930-\\uA946\\uA960-\\uA97C"\
+    "\\uA984-\\uA9B2\\uA9E0-\\uA9E4\\uA9E6-\\uA9EF\\uA9FA-\\uA9FE"\
+    "\\uAA00-\\uAA28\\uAA40-\\uAA42\\uAA44-\\uAA4B\\uAA60-\\uAA76"\
+    "\\uAA7E-\\uAAAF\\uAAB5-\\uAAB6\\uAAB9-\\uAABD\\uAADB-\\uAADD"\
+    "\\uAAE0-\\uAAEA\\uAAF2-\\uAAF4\\uAB01-\\uAB06\\uAB09-\\uAB0E"\
+    "\\uAB11-\\uAB16\\uAB20-\\uAB26\\uAB28-\\uAB2E\\uAB30-\\uAB5A"\
+    "\\uAB5C-\\uAB67\\uAB70-\\uABE2\\uAC00-\\uD7A3\\uD7B0-\\uD7C6"\
+    "\\uD7CB-\\uD7FB\\uF900-\\uFA6D\\uFA70-\\uFAD9\\uFB00-\\uFB06"\
+    "\\uFB13-\\uFB17\\uFB1F-\\uFB28\\uFB2A-\\uFB36\\uFB38-\\uFB3C"\
+    "\\uFB40-\\uFB41\\uFB43-\\uFB44\\uFB46-\\uFBB1\\uFBD3-\\uFD3D"\
+    "\\uFD50-\\uFD8F\\uFD92-\\uFDC7\\uFDF0-\\uFDFB\\uFE70-\\uFE74"\
+    "\\uFE76-\\uFEFC\\uFF21-\\uFF3A\\uFF41-\\uFF5A\\uFF66-\\uFFBE"\
+    "\\uFFC2-\\uFFC7\\uFFCA-\\uFFCF\\uFFD2-\\uFFD7\\uFFDA-\\uFFDC"\
+    "\\U010000-\\U01000B\\U01000D-\\U010026\\U010028-\\U01003A"\
+    "\\U01003C-\\U01003D\\U01003F-\\U01004D\\U010050-\\U01005D"\
+    "\\U010080-\\U0100FA\\U010280-\\U01029C\\U0102A0-\\U0102D0"\
+    "\\U010300-\\U01031F\\U01032D-\\U010340\\U010342-\\U010349"\
+    "\\U010350-\\U010375\\U010380-\\U01039D\\U0103A0-\\U0103C3"\
+    "\\U0103C8-\\U0103CF\\U010400-\\U01049D\\U0104B0-\\U0104D3"\
+    "\\U0104D8-\\U0104FB\\U010500-\\U010527\\U010530-\\U010563"\
+    "\\U010600-\\U010736\\U010740-\\U010755\\U010760-\\U010767"\
+    "\\U010800-\\U010805\\U01080A-\\U010835\\U010837-\\U010838"\
+    "\\U01083F-\\U010855\\U010860-\\U010876\\U010880-\\U01089E"\
+    "\\U0108E0-\\U0108F2\\U0108F4-\\U0108F5\\U010900-\\U010915"\
+    "\\U010920-\\U010939\\U010980-\\U0109B7\\U0109BE-\\U0109BF"\
+    "\\U010A10-\\U010A13\\U010A15-\\U010A17\\U010A19-\\U010A35"\
+    "\\U010A60-\\U010A7C\\U010A80-\\U010A9C\\U010AC0-\\U010AC7"\
+    "\\U010AC9-\\U010AE4\\U010B00-\\U010B35\\U010B40-\\U010B55"\
+    "\\U010B60-\\U010B72\\U010B80-\\U010B91\\U010C00-\\U010C48"\
+    "\\U010C80-\\U010CB2\\U010CC0-\\U010CF2\\U010D00-\\U010D23"\
+    "\\U010F00-\\U010F1C\\U010F30-\\U010F45\\U010FE0-\\U010FF6"\
+    "\\U011003-\\U011037\\U011083-\\U0110AF\\U0110D0-\\U0110E8"\
+    "\\U011103-\\U011126\\U011150-\\U011172\\U011183-\\U0111B2"\
+    "\\U0111C1-\\U0111C4\\U011200-\\U011211\\U011213-\\U01122B"\
+    "\\U011280-\\U011286\\U01128A-\\U01128D\\U01128F-\\U01129D"\
+    "\\U01129F-\\U0112A8\\U0112B0-\\U0112DE\\U011305-\\U01130C"\
+    "\\U01130F-\\U011310\\U011313-\\U011328\\U01132A-\\U011330"\
+    "\\U011332-\\U011333\\U011335-\\U011339\\U01135D-\\U011361"\
+    "\\U011400-\\U011434\\U011447-\\U01144A\\U011480-\\U0114AF"\
+    "\\U0114C4-\\U0114C5\\U011580-\\U0115AE\\U0115D8-\\U0115DB"\
+    "\\U011600-\\U01162F\\U011680-\\U0116AA\\U011700-\\U01171A"\
+    "\\U011800-\\U01182B\\U0118A0-\\U0118DF\\U0119A0-\\U0119A7"\
+    "\\U0119AA-\\U0119D0\\U011A0B-\\U011A32\\U011A5C-\\U011A89"\
+    "\\U011AC0-\\U011AF8\\U011C00-\\U011C08\\U011C0A-\\U011C2E"\
+    "\\U011C72-\\U011C8F\\U011D00-\\U011D06\\U011D08-\\U011D09"\
+    "\\U011D0B-\\U011D30\\U011D60-\\U011D65\\U011D67-\\U011D68"\
+    "\\U011D6A-\\U011D89\\U011EE0-\\U011EF2\\U012000-\\U012399"\
+    "\\U012480-\\U012543\\U013000-\\U01342E\\U014400-\\U014646"\
+    "\\U016800-\\U016A38\\U016A40-\\U016A5E\\U016AD0-\\U016AED"\
+    "\\U016B00-\\U016B2F\\U016B40-\\U016B43\\U016B63-\\U016B77"\
+    "\\U016B7D-\\U016B8F\\U016E40-\\U016E7F\\U016F00-\\U016F4A"\
+    "\\U016F93-\\U016F9F\\U016FE0-\\U016FE1\\U017000-\\U0187F7"\
+    "\\U018800-\\U018AF2\\U01B000-\\U01B11E\\U01B150-\\U01B152"\
+    "\\U01B164-\\U01B167\\U01B170-\\U01B2FB\\U01BC00-\\U01BC6A"\
+    "\\U01BC70-\\U01BC7C\\U01BC80-\\U01BC88\\U01BC90-\\U01BC99"\
+    "\\U01E100-\\U01E12C\\U01E137-\\U01E13D\\U01E2C0-\\U01E2EB"\
+    "\\U01E800-\\U01E8C4\\U01E900-\\U01E943\\U020000-\\U02A6D6"\
+    "\\U02A700-\\U02B734\\U02B740-\\U02B81D\\U02B820-\\U02CEA1"\
+    "\\U02CEB0-\\U02EBE0\\U02F800-\\U02FA1D";
+
+const char unicode_uppercase[] =
+    "\\u0100\\u0102\\u0104\\u0106\\u0108\\u010A\\u010C\\u010E\\u0110\\u0112"\
+    "\\u0114\\u0116\\u0118\\u011A\\u011C\\u011E\\u0120\\u0122\\u0124\\u0126"\
+    "\\u0128\\u012A\\u012C\\u012E\\u0130\\u0132\\u0134\\u0136\\u0139\\u013B"\
+    "\\u013D\\u013F\\u0141\\u0143\\u0145\\u0147\\u014A\\u014C\\u014E\\u0150"\
+    "\\u0152\\u0154\\u0156\\u0158\\u015A\\u015C\\u015E\\u0160\\u0162\\u0164"\
+    "\\u0166\\u0168\\u016A\\u016C\\u016E\\u0170\\u0172\\u0174\\u0176\\u017B"\
+    "\\u017D\\u0184\\u01A2\\u01A4\\u01A9\\u01AC\\u01B5\\u01BC\\u01C4\\u01C7"\
+    "\\u01CA\\u01CD\\u01CF\\u01D1\\u01D3\\u01D5\\u01D7\\u01D9\\u01DB\\u01DE"\
+    "\\u01E0\\u01E2\\u01E4\\u01E6\\u01E8\\u01EA\\u01EC\\u01EE\\u01F1\\u01F4"\
+    "\\u01FA\\u01FC\\u01FE\\u0200\\u0202\\u0204\\u0206\\u0208\\u020A\\u020C"\
+    "\\u020E\\u0210\\u0212\\u0214\\u0216\\u0218\\u021A\\u021C\\u021E\\u0220"\
+    "\\u0222\\u0224\\u0226\\u0228\\u022A\\u022C\\u022E\\u0230\\u0232\\u0241"\
+    "\\u0248\\u024A\\u024C\\u024E\\u0370\\u0372\\u0376\\u037F\\u0386\\u038C"\
+    "\\u03CF\\u03D8\\u03DA\\u03DC\\u03DE\\u03E0\\u03E2\\u03E4\\u03E6\\u03E8"\
+    "\\u03EA\\u03EC\\u03EE\\u03F4\\u03F7\\u0460\\u0462\\u0464\\u0466\\u0468"\
+    "\\u046A\\u046C\\u046E\\u0470\\u0472\\u0474\\u0476\\u0478\\u047A\\u047C"\
+    "\\u047E\\u0480\\u048A\\u048C\\u048E\\u0490\\u0492\\u0494\\u0496\\u0498"\
+    "\\u049A\\u049C\\u049E\\u04A0\\u04A2\\u04A4\\u04A6\\u04A8\\u04AA\\u04AC"\
+    "\\u04AE\\u04B0\\u04B2\\u04B4\\u04B6\\u04B8\\u04BA\\u04BC\\u04BE\\u04C3"\
+    "\\u04C5\\u04C7\\u04C9\\u04CB\\u04CD\\u04D0\\u04D2\\u04D4\\u04D6\\u04D8"\
+    "\\u04DA\\u04DC\\u04DE\\u04E0\\u04E2\\u04E4\\u04E6\\u04E8\\u04EA\\u04EC"\
+    "\\u04EE\\u04F0\\u04F2\\u04F4\\u04F6\\u04F8\\u04FA\\u04FC\\u04FE\\u0500"\
+    "\\u0502\\u0504\\u0506\\u0508\\u050A\\u050C\\u050E\\u0510\\u0512\\u0514"\
+    "\\u0516\\u0518\\u051A\\u051C\\u051E\\u0520\\u0522\\u0524\\u0526\\u0528"\
+    "\\u052A\\u052C\\u052E\\u10C7\\u10CD\\u1E00\\u1E02\\u1E04\\u1E06\\u1E08"\
+    "\\u1E0A\\u1E0C\\u1E0E\\u1E10\\u1E12\\u1E14\\u1E16\\u1E18\\u1E1A\\u1E1C"\
+    "\\u1E1E\\u1E20\\u1E22\\u1E24\\u1E26\\u1E28\\u1E2A\\u1E2C\\u1E2E\\u1E30"\
+    "\\u1E32\\u1E34\\u1E36\\u1E38\\u1E3A\\u1E3C\\u1E3E\\u1E40\\u1E42\\u1E44"\
+    "\\u1E46\\u1E48\\u1E4A\\u1E4C\\u1E4E\\u1E50\\u1E52\\u1E54\\u1E56\\u1E58"\
+    "\\u1E5A\\u1E5C\\u1E5E\\u1E60\\u1E62\\u1E64\\u1E66\\u1E68\\u1E6A\\u1E6C"\
+    "\\u1E6E\\u1E70\\u1E72\\u1E74\\u1E76\\u1E78\\u1E7A\\u1E7C\\u1E7E\\u1E80"\
+    "\\u1E82\\u1E84\\u1E86\\u1E88\\u1E8A\\u1E8C\\u1E8E\\u1E90\\u1E92\\u1E94"\
+    "\\u1E9E\\u1EA0\\u1EA2\\u1EA4\\u1EA6\\u1EA8\\u1EAA\\u1EAC\\u1EAE\\u1EB0"\
+    "\\u1EB2\\u1EB4\\u1EB6\\u1EB8\\u1EBA\\u1EBC\\u1EBE\\u1EC0\\u1EC2\\u1EC4"\
+    "\\u1EC6\\u1EC8\\u1ECA\\u1ECC\\u1ECE\\u1ED0\\u1ED2\\u1ED4\\u1ED6\\u1ED8"\
+    "\\u1EDA\\u1EDC\\u1EDE\\u1EE0\\u1EE2\\u1EE4\\u1EE6\\u1EE8\\u1EEA\\u1EEC"\
+    "\\u1EEE\\u1EF0\\u1EF2\\u1EF4\\u1EF6\\u1EF8\\u1EFA\\u1EFC\\u1EFE\\u1F59"\
+    "\\u1F5B\\u1F5D\\u1F5F\\u2102\\u2107\\u2115\\u2124\\u2126\\u2128\\u2145"\
+    "\\u2183\\u2C60\\u2C67\\u2C69\\u2C6B\\u2C72\\u2C75\\u2C82\\u2C84\\u2C86"\
+    "\\u2C88\\u2C8A\\u2C8C\\u2C8E\\u2C90\\u2C92\\u2C94\\u2C96\\u2C98\\u2C9A"\
+    "\\u2C9C\\u2C9E\\u2CA0\\u2CA2\\u2CA4\\u2CA6\\u2CA8\\u2CAA\\u2CAC\\u2CAE"\
+    "\\u2CB0\\u2CB2\\u2CB4\\u2CB6\\u2CB8\\u2CBA\\u2CBC\\u2CBE\\u2CC0\\u2CC2"\
+    "\\u2CC4\\u2CC6\\u2CC8\\u2CCA\\u2CCC\\u2CCE\\u2CD0\\u2CD2\\u2CD4\\u2CD6"\
+    "\\u2CD8\\u2CDA\\u2CDC\\u2CDE\\u2CE0\\u2CE2\\u2CEB\\u2CED\\u2CF2\\uA640"\
+    "\\uA642\\uA644\\uA646\\uA648\\uA64A\\uA64C\\uA64E\\uA650\\uA652\\uA654"\
+    "\\uA656\\uA658\\uA65A\\uA65C\\uA65E\\uA660\\uA662\\uA664\\uA666\\uA668"\
+    "\\uA66A\\uA66C\\uA680\\uA682\\uA684\\uA686\\uA688\\uA68A\\uA68C\\uA68E"\
+    "\\uA690\\uA692\\uA694\\uA696\\uA698\\uA69A\\uA722\\uA724\\uA726\\uA728"\
+    "\\uA72A\\uA72C\\uA72E\\uA732\\uA734\\uA736\\uA738\\uA73A\\uA73C\\uA73E"\
+    "\\uA740\\uA742\\uA744\\uA746\\uA748\\uA74A\\uA74C\\uA74E\\uA750\\uA752"\
+    "\\uA754\\uA756\\uA758\\uA75A\\uA75C\\uA75E\\uA760\\uA762\\uA764\\uA766"\
+    "\\uA768\\uA76A\\uA76C\\uA76E\\uA779\\uA77B\\uA780\\uA782\\uA784\\uA786"\
+    "\\uA78B\\uA78D\\uA790\\uA792\\uA796\\uA798\\uA79A\\uA79C\\uA79E\\uA7A0"\
+    "\\uA7A2\\uA7A4\\uA7A6\\uA7A8\\uA7B6\\uA7B8\\uA7BA\\uA7BC\\uA7BE\\uA7C2"\
+    "\\U01D49C\\U01D4A2\\U01D546\\U01D7CA\\u0041-\\u005A\\u00C0-\\u00D6"\
+    "\\u00D8-\\u00DE\\u0178-\\u0179\\u0181-\\u0182\\u0186-\\u0187"\
+    "\\u0189-\\u018B\\u018E-\\u0191\\u0193-\\u0194\\u0196-\\u0198"\
+    "\\u019C-\\u019D\\u019F-\\u01A0\\u01A6-\\u01A7\\u01AE-\\u01AF"\
+    "\\u01B1-\\u01B3\\u01B7-\\u01B8\\u01F6-\\u01F8\\u023A-\\u023B"\
+    "\\u023D-\\u023E\\u0243-\\u0246\\u0388-\\u038A\\u038E-\\u038F"\
+    "\\u0391-\\u03A1\\u03A3-\\u03AB\\u03D2-\\u03D4\\u03F9-\\u03FA"\
+    "\\u03FD-\\u042F\\u04C0-\\u04C1\\u0531-\\u0556\\u10A0-\\u10C5"\
+    "\\u13A0-\\u13F5\\u1C90-\\u1CBA\\u1CBD-\\u1CBF\\u1F08-\\u1F0F"\
+    "\\u1F18-\\u1F1D\\u1F28-\\u1F2F\\u1F38-\\u1F3F\\u1F48-\\u1F4D"\
+    "\\u1F68-\\u1F6F\\u1FB8-\\u1FBB\\u1FC8-\\u1FCB\\u1FD8-\\u1FDB"\
+    "\\u1FE8-\\u1FEC\\u1FF8-\\u1FFB\\u210B-\\u210D\\u2110-\\u2112"\
+    "\\u2119-\\u211D\\u212A-\\u212D\\u2130-\\u2133\\u213E-\\u213F"\
+    "\\u2C00-\\u2C2E\\u2C62-\\u2C64\\u2C6D-\\u2C70\\u2C7E-\\u2C80"\
+    "\\uA77D-\\uA77E\\uA7AA-\\uA7AE\\uA7B0-\\uA7B4\\uA7C4-\\uA7C6"\
+    "\\uFF21-\\uFF3A\\U010400-\\U010427\\U0104B0-\\U0104D3"\
+    "\\U010C80-\\U010CB2\\U0118A0-\\U0118BF\\U016E40-\\U016E5F"\
+    "\\U01D400-\\U01D419\\U01D434-\\U01D44D\\U01D468-\\U01D481"\
+    "\\U01D49E-\\U01D49F\\U01D4A5-\\U01D4A6\\U01D4A9-\\U01D4AC"\
+    "\\U01D4AE-\\U01D4B5\\U01D4D0-\\U01D4E9\\U01D504-\\U01D505"\
+    "\\U01D507-\\U01D50A\\U01D50D-\\U01D514\\U01D516-\\U01D51C"\
+    "\\U01D538-\\U01D539\\U01D53B-\\U01D53E\\U01D540-\\U01D544"\
+    "\\U01D54A-\\U01D550\\U01D56C-\\U01D585\\U01D5A0-\\U01D5B9"\
+    "\\U01D5D4-\\U01D5ED\\U01D608-\\U01D621\\U01D63C-\\U01D655"\
+    "\\U01D670-\\U01D689\\U01D6A8-\\U01D6C0\\U01D6E2-\\U01D6FA"\
+    "\\U01D71C-\\U01D734\\U01D756-\\U01D76E\\U01D790-\\U01D7A8"\
+    "\\U01E900-\\U01E921";
+
+const char unicode_lowercase[] =
+    "\\u00B5\\u0101\\u0103\\u0105\\u0107\\u0109\\u010B\\u010D\\u010F\\u0111"\
+    "\\u0113\\u0115\\u0117\\u0119\\u011B\\u011D\\u011F\\u0121\\u0123\\u0125"\
+    "\\u0127\\u0129\\u012B\\u012D\\u012F\\u0131\\u0133\\u0135\\u013A\\u013C"\
+    "\\u013E\\u0140\\u0142\\u0144\\u0146\\u014B\\u014D\\u014F\\u0151\\u0153"\
+    "\\u0155\\u0157\\u0159\\u015B\\u015D\\u015F\\u0161\\u0163\\u0165\\u0167"\
+    "\\u0169\\u016B\\u016D\\u016F\\u0171\\u0173\\u0175\\u0177\\u017A\\u017C"\
+    "\\u0183\\u0185\\u0188\\u0192\\u0195\\u019E\\u01A1\\u01A3\\u01A5\\u01A8"\
+    "\\u01AD\\u01B0\\u01B4\\u01B6\\u01C6\\u01C9\\u01CC\\u01CE\\u01D0\\u01D2"\
+    "\\u01D4\\u01D6\\u01D8\\u01DA\\u01DF\\u01E1\\u01E3\\u01E5\\u01E7\\u01E9"\
+    "\\u01EB\\u01ED\\u01F3\\u01F5\\u01F9\\u01FB\\u01FD\\u01FF\\u0201\\u0203"\
+    "\\u0205\\u0207\\u0209\\u020B\\u020D\\u020F\\u0211\\u0213\\u0215\\u0217"\
+    "\\u0219\\u021B\\u021D\\u021F\\u0221\\u0223\\u0225\\u0227\\u0229\\u022B"\
+    "\\u022D\\u022F\\u0231\\u023C\\u0242\\u0247\\u0249\\u024B\\u024D\\u0371"\
+    "\\u0373\\u0377\\u0390\\u03D9\\u03DB\\u03DD\\u03DF\\u03E1\\u03E3\\u03E5"\
+    "\\u03E7\\u03E9\\u03EB\\u03ED\\u03F5\\u03F8\\u0461\\u0463\\u0465\\u0467"\
+    "\\u0469\\u046B\\u046D\\u046F\\u0471\\u0473\\u0475\\u0477\\u0479\\u047B"\
+    "\\u047D\\u047F\\u0481\\u048B\\u048D\\u048F\\u0491\\u0493\\u0495\\u0497"\
+    "\\u0499\\u049B\\u049D\\u049F\\u04A1\\u04A3\\u04A5\\u04A7\\u04A9\\u04AB"\
+    "\\u04AD\\u04AF\\u04B1\\u04B3\\u04B5\\u04B7\\u04B9\\u04BB\\u04BD\\u04BF"\
+    "\\u04C2\\u04C4\\u04C6\\u04C8\\u04CA\\u04CC\\u04D1\\u04D3\\u04D5\\u04D7"\
+    "\\u04D9\\u04DB\\u04DD\\u04DF\\u04E1\\u04E3\\u04E5\\u04E7\\u04E9\\u04EB"\
+    "\\u04ED\\u04EF\\u04F1\\u04F3\\u04F5\\u04F7\\u04F9\\u04FB\\u04FD\\u04FF"\
+    "\\u0501\\u0503\\u0505\\u0507\\u0509\\u050B\\u050D\\u050F\\u0511\\u0513"\
+    "\\u0515\\u0517\\u0519\\u051B\\u051D\\u051F\\u0521\\u0523\\u0525\\u0527"\
+    "\\u0529\\u052B\\u052D\\u052F\\u1E01\\u1E03\\u1E05\\u1E07\\u1E09\\u1E0B"\
+    "\\u1E0D\\u1E0F\\u1E11\\u1E13\\u1E15\\u1E17\\u1E19\\u1E1B\\u1E1D\\u1E1F"\
+    "\\u1E21\\u1E23\\u1E25\\u1E27\\u1E29\\u1E2B\\u1E2D\\u1E2F\\u1E31\\u1E33"\
+    "\\u1E35\\u1E37\\u1E39\\u1E3B\\u1E3D\\u1E3F\\u1E41\\u1E43\\u1E45\\u1E47"\
+    "\\u1E49\\u1E4B\\u1E4D\\u1E4F\\u1E51\\u1E53\\u1E55\\u1E57\\u1E59\\u1E5B"\
+    "\\u1E5D\\u1E5F\\u1E61\\u1E63\\u1E65\\u1E67\\u1E69\\u1E6B\\u1E6D\\u1E6F"\
+    "\\u1E71\\u1E73\\u1E75\\u1E77\\u1E79\\u1E7B\\u1E7D\\u1E7F\\u1E81\\u1E83"\
+    "\\u1E85\\u1E87\\u1E89\\u1E8B\\u1E8D\\u1E8F\\u1E91\\u1E93\\u1E9F\\u1EA1"\
+    "\\u1EA3\\u1EA5\\u1EA7\\u1EA9\\u1EAB\\u1EAD\\u1EAF\\u1EB1\\u1EB3\\u1EB5"\
+    "\\u1EB7\\u1EB9\\u1EBB\\u1EBD\\u1EBF\\u1EC1\\u1EC3\\u1EC5\\u1EC7\\u1EC9"\
+    "\\u1ECB\\u1ECD\\u1ECF\\u1ED1\\u1ED3\\u1ED5\\u1ED7\\u1ED9\\u1EDB\\u1EDD"\
+    "\\u1EDF\\u1EE1\\u1EE3\\u1EE5\\u1EE7\\u1EE9\\u1EEB\\u1EED\\u1EEF\\u1EF1"\
+    "\\u1EF3\\u1EF5\\u1EF7\\u1EF9\\u1EFB\\u1EFD\\u1FBE\\u210A\\u2113\\u212F"\
+    "\\u2134\\u2139\\u214E\\u2184\\u2C61\\u2C68\\u2C6A\\u2C6C\\u2C71\\u2C81"\
+    "\\u2C83\\u2C85\\u2C87\\u2C89\\u2C8B\\u2C8D\\u2C8F\\u2C91\\u2C93\\u2C95"\
+    "\\u2C97\\u2C99\\u2C9B\\u2C9D\\u2C9F\\u2CA1\\u2CA3\\u2CA5\\u2CA7\\u2CA9"\
+    "\\u2CAB\\u2CAD\\u2CAF\\u2CB1\\u2CB3\\u2CB5\\u2CB7\\u2CB9\\u2CBB\\u2CBD"\
+    "\\u2CBF\\u2CC1\\u2CC3\\u2CC5\\u2CC7\\u2CC9\\u2CCB\\u2CCD\\u2CCF\\u2CD1"\
+    "\\u2CD3\\u2CD5\\u2CD7\\u2CD9\\u2CDB\\u2CDD\\u2CDF\\u2CE1\\u2CEC\\u2CEE"\
+    "\\u2CF3\\u2D27\\u2D2D\\uA641\\uA643\\uA645\\uA647\\uA649\\uA64B\\uA64D"\
+    "\\uA64F\\uA651\\uA653\\uA655\\uA657\\uA659\\uA65B\\uA65D\\uA65F\\uA661"\
+    "\\uA663\\uA665\\uA667\\uA669\\uA66B\\uA66D\\uA681\\uA683\\uA685\\uA687"\
+    "\\uA689\\uA68B\\uA68D\\uA68F\\uA691\\uA693\\uA695\\uA697\\uA699\\uA69B"\
+    "\\uA723\\uA725\\uA727\\uA729\\uA72B\\uA72D\\uA733\\uA735\\uA737\\uA739"\
+    "\\uA73B\\uA73D\\uA73F\\uA741\\uA743\\uA745\\uA747\\uA749\\uA74B\\uA74D"\
+    "\\uA74F\\uA751\\uA753\\uA755\\uA757\\uA759\\uA75B\\uA75D\\uA75F\\uA761"\
+    "\\uA763\\uA765\\uA767\\uA769\\uA76B\\uA76D\\uA76F\\uA77A\\uA77C\\uA77F"\
+    "\\uA781\\uA783\\uA785\\uA787\\uA78C\\uA78E\\uA791\\uA797\\uA799\\uA79B"\
+    "\\uA79D\\uA79F\\uA7A1\\uA7A3\\uA7A5\\uA7A7\\uA7A9\\uA7AF\\uA7B5\\uA7B7"\
+    "\\uA7B9\\uA7BB\\uA7BD\\uA7BF\\uA7C3\\uA7FA\\U01D4BB\\U01D7CB"\
+    "\\u0061-\\u007A\\u00DF-\\u00F6\\u00F8-\\u00FF\\u0137-\\u0138"\
+    "\\u0148-\\u0149\\u017E-\\u0180\\u018C-\\u018D\\u0199-\\u019B"\
+    "\\u01AA-\\u01AB\\u01B9-\\u01BA\\u01BD-\\u01BF\\u01DC-\\u01DD"\
+    "\\u01EF-\\u01F0\\u0233-\\u0239\\u023F-\\u0240\\u024F-\\u0293"\
+    "\\u0295-\\u02AF\\u037B-\\u037D\\u03AC-\\u03CE\\u03D0-\\u03D1"\
+    "\\u03D5-\\u03D7\\u03EF-\\u03F3\\u03FB-\\u03FC\\u0430-\\u045F"\
+    "\\u04CE-\\u04CF\\u0560-\\u0588\\u10D0-\\u10FA\\u10FD-\\u10FF"\
+    "\\u13F8-\\u13FD\\u1C80-\\u1C88\\u1D00-\\u1D2B\\u1D6B-\\u1D77"\
+    "\\u1D79-\\u1D9A\\u1E95-\\u1E9D\\u1EFF-\\u1F07\\u1F10-\\u1F15"\
+    "\\u1F20-\\u1F27\\u1F30-\\u1F37\\u1F40-\\u1F45\\u1F50-\\u1F57"\
+    "\\u1F60-\\u1F67\\u1F70-\\u1F7D\\u1F80-\\u1F87\\u1F90-\\u1F97"\
+    "\\u1FA0-\\u1FA7\\u1FB0-\\u1FB4\\u1FB6-\\u1FB7\\u1FC2-\\u1FC4"\
+    "\\u1FC6-\\u1FC7\\u1FD0-\\u1FD3\\u1FD6-\\u1FD7\\u1FE0-\\u1FE7"\
+    "\\u1FF2-\\u1FF4\\u1FF6-\\u1FF7\\u210E-\\u210F\\u213C-\\u213D"\
+    "\\u2146-\\u2149\\u2C30-\\u2C5E\\u2C65-\\u2C66\\u2C73-\\u2C74"\
+    "\\u2C76-\\u2C7B\\u2CE3-\\u2CE4\\u2D00-\\u2D25\\uA72F-\\uA731"\
+    "\\uA771-\\uA778\\uA793-\\uA795\\uAB30-\\uAB5A\\uAB60-\\uAB67"\
+    "\\uAB70-\\uABBF\\uFB00-\\uFB06\\uFB13-\\uFB17\\uFF41-\\uFF5A"\
+    "\\U010428-\\U01044F\\U0104D8-\\U0104FB\\U010CC0-\\U010CF2"\
+    "\\U0118C0-\\U0118DF\\U016E60-\\U016E7F\\U01D41A-\\U01D433"\
+    "\\U01D44E-\\U01D454\\U01D456-\\U01D467\\U01D482-\\U01D49B"\
+    "\\U01D4B6-\\U01D4B9\\U01D4BD-\\U01D4C3\\U01D4C5-\\U01D4CF"\
+    "\\U01D4EA-\\U01D503\\U01D51E-\\U01D537\\U01D552-\\U01D56B"\
+    "\\U01D586-\\U01D59F\\U01D5BA-\\U01D5D3\\U01D5EE-\\U01D607"\
+    "\\U01D622-\\U01D63B\\U01D656-\\U01D66F\\U01D68A-\\U01D6A5"\
+    "\\U01D6C2-\\U01D6DA\\U01D6DC-\\U01D6E1\\U01D6FC-\\U01D714"\
+    "\\U01D716-\\U01D71B\\U01D736-\\U01D74E\\U01D750-\\U01D755"\
+    "\\U01D770-\\U01D788\\U01D78A-\\U01D78F\\U01D7AA-\\U01D7C2"\
+    "\\U01D7C4-\\U01D7C9\\U01E922-\\U01E943";
+
+#endif // MOJO_REGEX_UNICODE
 #endif // MOJO_REGEX_IMPLEMENTATION
 #endif // _MOJO_REGEX_HEADER_
