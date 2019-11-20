@@ -582,22 +582,13 @@ struct regex_vm_gen_path_s {
     regex_vm_gen_path_t *next;
 };
 
-typedef enum {
-    eReSubroutineIdCrc,
-    eReSubroutineIdPattern,
-    eReSubroutineIdClass,
-    eReSubroutineIdName
-} eReSubroutineIdType_t;
-
 typedef struct regex_subroutine_s regex_subroutine_t;
 struct regex_subroutine_s {
-    union {
-        uint32_t crc;
-        char *pattern;
-        char *charClass;
-        char *name;
-    };
-    eReSubroutineIdType_t type;
+    int id;
+    uint32_t crc;
+    char *charClass;
+    char *name;
+    int infixed;
     regex_token_t *tokens;
     regex_subroutine_t *next;
 };
@@ -702,7 +693,7 @@ void regexPrinter_eTokenUtf8Class(FILE *fp, regex_token_t *token) {
 }
 
 void regexPrinter_eTokenCall(FILE *fp, regex_token_t *token) {
-    fprintf(fp, "%p", token->sub_sequence);
+    fprintf(fp, "%d", token->c);
 }
 
 void regexPrinter_eTokenSubExprStart(FILE *fp, regex_token_t *token) {
@@ -1031,10 +1022,7 @@ regex_token_t *regexAllocToken(eRegexToken_t tokenType, int c, char *str, int si
     memset(token, 0, sizeof(regex_token_t));
     token->tokenType = tokenType;
     token->pc = VM_PC_UNVISITED;
-    if(tokenType == eTokenCall) {
-        token->sub_sequence = (regex_token_t *)str;
-        token->out_b = (regex_token_t *)str;
-    } else if(str != NULL) {
+    if(str != NULL) {
         token->str = str;
         token->len = sizeOrFlags;
     } else {
@@ -1121,51 +1109,34 @@ void calcCrc32(const void *data, size_t n_bytes, uint32_t* crc) {
     }
 }
 
-regex_token_t *regexSubroutineIdxCheckCrc(regex_vm_build_t *build, uint32_t check) {
-    regex_subroutine_t *walk;
+regex_subroutine_t *regexSubroutineIdxCreate(regex_vm_build_t *build) {
+    regex_subroutine_t *entry, *walk;
 
-    for(walk = build->subroutine_index; walk != NULL; walk = walk->next) {
-        if(walk->crc == check) {
-            return walk->tokens;
+    if((entry = _regexAlloc(sizeof(regex_subroutine_t), _regexMemContext)) == NULL) {
+        return NULL;
+    }
+    entry->id = 1;
+    if(build->subroutine_index != NULL) {
+        for(walk = build->subroutine_index; walk != NULL; walk = walk->next) {
+            if(entry->id <= walk->id) {
+                entry->id = walk->id + 1;
+            }
+        }
+    }
+    entry->next = build->subroutine_index;
+    build->subroutine_index = entry;
+    return entry;
+}
+
+regex_subroutine_t *regexSubroutineIdxGet(regex_vm_build_t *build, int id) {
+    regex_subroutine_t *entry;
+
+    for(entry = build->subroutine_index; entry != NULL; entry = entry->next) {
+        if(entry->id == id) {
+            return entry;
         }
     }
     return NULL;
-}
-
-regex_token_t *regexSubroutineIdxCheck(regex_vm_build_t *build, const char *pattern) {
-    uint32_t check = 0;
-
-    calcCrc32(pattern, strlen(pattern), &check);
-    return regexSubroutineIdxCheckCrc(build, check);
-}
-
-int regexSubroutineIdxAddCrc(regex_vm_build_t *build, uint32_t crc, regex_token_t *token) {
-    regex_subroutine_t *entry;
-
-    if((entry = _regexAlloc(sizeof(regex_subroutine_t), _regexMemContext)) == NULL) {
-        return 0;
-    }
-    entry->tokens = token;
-    entry->crc = crc;
-    entry->next = build->subroutine_index;
-    build->subroutine_index = entry;
-    return 1;
-}
-
-int regexSubroutineIdxAdd(regex_vm_build_t *build, const char *pattern, regex_token_t *token) {
-    uint32_t crc = 0;
-
-    calcCrc32(pattern, strlen(pattern), &crc);
-    return regexSubroutineIdxAddCrc(build, crc, token);
-}
-
-void regexSubroutineIdxFree(regex_vm_build_t *build) {
-    regex_subroutine_t *walk, *next;
-
-    for(walk = build->subroutine_index; walk != NULL; walk = next) {
-        next = walk->next;
-        _regexDealloc(walk, _regexMemContext);
-    }
 }
 
 eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
@@ -1173,23 +1144,104 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                                            regex_token_t **tokens,
                                            regex_vm_build_t *build);
 
-eRegexCompileStatus_t regexTokenCreateSubroutine(regex_token_t **tokens, regex_vm_build_t *build, const char *pattern) {
-    regex_token_t *subroutine = NULL;
-    int pos;
-    eRegexCompileStatus_t status;
+regex_subroutine_t *regexSubroutineIdxGetPattern(regex_vm_build_t *build, const char *pattern) {
+    regex_subroutine_t *walk;
+    uint32_t crc = 0;
 
-    if((subroutine = regexSubroutineIdxCheck(build, pattern)) == NULL) {
-        if((status = regexTokenizePattern(pattern, &pos, &subroutine, build)) != eCompileOk) {
-            // TODO - retain sub-compilation status
-            return status;
-        }
-
-        if(!regexSubroutineIdxAdd(build, pattern, subroutine)) {
-            return eCompileOutOfMem;
+    calcCrc32(pattern, strlen(pattern), &crc);
+    for(walk = build->subroutine_index; walk != NULL; walk = walk->next) {
+        if(walk->crc == crc) {
+            return walk;
         }
     }
+    return NULL;
+}
 
-    if(!regexTokenCreate(tokens, eTokenCall, 0, (void *)subroutine, 0)) {
+regex_subroutine_t *regexSubroutineIdxGetClassId(regex_vm_build_t *build, const char *classId) {
+    regex_subroutine_t *walk;
+
+    for(walk = build->subroutine_index; walk != NULL; walk = walk->next) {
+        if(!strcmp(walk->charClass, classId)) {
+            return walk;
+        }
+    }
+    return NULL;
+}
+
+regex_subroutine_t *regexSubroutineIdxGetName(regex_vm_build_t *build, const char *name) {
+    regex_subroutine_t *walk;
+    uint32_t crc = 0;
+
+    for(walk = build->subroutine_index; walk != NULL; walk = walk->next) {
+        if(!strcmp(walk->name, name)) {
+            return walk;
+        }
+    }
+    return NULL;
+}
+
+void regexSubroutineIdxFree(regex_vm_build_t *build) {
+    regex_subroutine_t *walk, *next;
+
+    for(walk = build->subroutine_index; walk != NULL; walk = next) {
+        next = walk->next;
+        if(walk->name != NULL) {
+            _regexDealloc(walk->name, _regexMemContext);
+        }
+        if(walk->charClass != NULL) {
+            _regexDealloc(walk->charClass, _regexMemContext);
+        }
+        _regexDealloc(walk, _regexMemContext);
+    }
+}
+
+eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
+                                                         regex_token_t **subroutine,
+                                                         regex_vm_build_t *build,
+                                                         const char *pattern,
+                                                         const char *name,
+                                                         const char *classId) {
+    int pos;
+    eRegexCompileStatus_t status;
+    regex_subroutine_t *entry = NULL;
+
+    if((pattern != NULL) && (entry = regexSubroutineIdxGetPattern(build, pattern)) == NULL) {
+        if((name != NULL) && ((entry = regexSubroutineIdxGetName(build, name)) == NULL)) {
+            if(classId != NULL) {
+                entry = regexSubroutineIdxGetClassId(build, classId);
+            }
+        }
+    }
+    if(entry == NULL) {
+        if(pattern == NULL) {
+            if(*subroutine == NULL) {
+                return eCompileInternalError;
+            }
+        } else if((status = regexTokenizePattern(pattern, &pos, subroutine, build)) != eCompileOk) {
+                // TODO - retain sub-compilation status
+                return status;
+        }
+        if((entry = regexSubroutineIdxCreate(build)) == NULL) {
+            return eCompileOutOfMem;
+        }
+        entry->tokens = *subroutine;
+    }
+    if((pattern != NULL) && (entry->crc == 0)) {
+        calcCrc32(pattern, strlen(pattern), &(entry->crc));
+    }
+    if((classId != NULL) && (entry->charClass != NULL)) {
+        if((entry->charClass = _regexStrdup(classId, strlen(classId) + 1)) == NULL) {
+            return 0;
+        }
+        entry->charClass[strlen(classId)] = '\0';
+    }
+    if((name != NULL) && (entry->name == NULL)) {
+        if((entry->charClass = _regexStrdup(classId, strlen(name) + 1)) == NULL) {
+            return 0;
+        }
+        entry->charClass[strlen(name)] = '\0';
+    }
+    if(!regexTokenCreate(tokens, eTokenCall, entry->id, NULL, 0)) {
         return eCompileOutOfMem;
     }
     return eCompileOk;
@@ -2007,7 +2059,8 @@ uint32_t regexCalUtf8ClassCrc(utf8_charclass_tree_t *tree) {
 }
 
 int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus_t *status,
-                              regex_token_t **tokens, utf8_charclass_tree_t *tree, int invert) {
+                              regex_token_t **tokens, utf8_charclass_tree_t *tree,
+                              int invert, const char *pattern) {
     regex_token_t *utf8class = NULL;
     utf8_charclass_midlow_byte_t *midlow;
     utf8_charclass_midhigh_byte_t *midhigh;
@@ -2019,8 +2072,7 @@ int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus_t *st
     // Preset to OoM, change to eCompileOk on success
     *status = eCompileOutOfMem;
 
-    crc = regexCalUtf8ClassCrc(tree);
-    if((utf8class = regexSubroutineIdxCheckCrc(build, crc)) == NULL) {
+    if(regexSubroutineIdxGetPattern(build, pattern) == NULL) {
         if(!regexTokenCreate(&utf8class, eTokenSubExprStart, 0, NULL, REGEX_TOKEN_FLAG_NOCAPTURE)) {
             return 0;
         }
@@ -2116,14 +2168,10 @@ int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus_t *st
         if(!regexTokenCreate(&utf8class, eTokenSubExprEnd, 0, NULL, 0)) {
             return 0;
         }
-
-        if(!regexSubroutineIdxAddCrc(build, crc, utf8class)) {
-            return eCompileOutOfMem;
-        }
     }
 
-    if(!regexTokenCreate(tokens, eTokenCall, 0, (void *)utf8class, 0)) {
-        return eCompileOutOfMem;
+    if((*status = regexSubroutineGenerateFromPattern(tokens, &utf8class, build, pattern, NULL, NULL)) != eCompileOk) {
+        return 0;
     }
 
     *status = eCompileOk;
@@ -2611,7 +2659,7 @@ parseClassCompleted:
             }
         }
 
-        if(!regexTokenUtf8ClassCreate(build, status, tokens, utf8tree, invert)) {
+        if(!regexTokenUtf8ClassCreate(build, status, tokens, utf8tree, invert, *pattern)) {
             regexCharClassUtf8TreeFree(utf8tree);
             return 0;
         }
@@ -3425,11 +3473,12 @@ eRegexCompileStatus_t regexOperatorApply(regex_token_t **operators, eRegexOpAppl
 
 #define SET_YARD_RESULT(res)    status = res; goto ShuntingYardFailure;
 
-eRegexCompileStatus_t regexShuntingYardFragment(regex_token_t **tokens, regex_fragment_t **root_stack,
+eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_token_t **tokens, regex_fragment_t **root_stack,
                                                 regex_sub_index_t **sub_index, int sub_expression,
                                                 unsigned int group_flags) {
     regex_token_t *token = NULL, *routine, *operators = NULL;
     regex_fragment_t *operands = NULL, *subexpr;
+    regex_subroutine_t *subindex;
     eRegexCompileStatus_t status;
     int group_num;
 
@@ -3476,18 +3525,20 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_token_t **tokens, regex_fr
                 // Generate the sub sequence pattern, and tie it into the current pattern
                 // with an eTokenCall
                 subexpr = NULL;
-                if((subexpr = regexSubroutineGet(*sub_index, token->sub_sequence)) == NULL) {
-                    routine = token->sub_sequence;
-                    if((status = regexShuntingYardFragment(&(token->sub_sequence), &subexpr, sub_index,
+                if((subindex = regexSubroutineIdxGet(build, token->c)) == NULL) {
+                    SET_YARD_RESULT(eCompileInternalError);
+                }
+                if(!subindex->infixed) {
+                    routine = subindex->tokens;
+                    if((status = regexShuntingYardFragment(build, &(routine), &subexpr, sub_index,
                                                            REGEX_SHUNTING_YARD_NO_CAPTURE,
                                                            REGEX_TOKEN_FLAG_SUBROUTINE)) != eCompileOk) {
                         SET_YARD_RESULT(status);
                     }
-                    if(!regexSubroutineStore(sub_index, routine, subexpr)) {
-                        SET_YARD_RESULT(eCompileOutOfMem);
-                    }
+                    subindex->tokens = subexpr->token;
+                    subindex->infixed = 1;
                 }
-                token->out_b = subexpr->token;
+                token->out_b = subindex->tokens;
                 if(!regexOperatorLiteralCreate(&operands, token)) {
                     SET_YARD_RESULT(eCompileOutOfMem);
                 }
@@ -3505,7 +3556,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_token_t **tokens, regex_fr
                         SET_YARD_RESULT(eCompileOutOfMem);
                     }
                 }
-                if((status = regexShuntingYardFragment(tokens, &subexpr, sub_index,
+                if((status = regexShuntingYardFragment(build, tokens, &subexpr, sub_index,
                                                        group_num, token->flags)) != eCompileOk) {
                     SET_YARD_RESULT(status);
                 }
@@ -3570,12 +3621,12 @@ ShuntingYardFailure:
     return status;
 }
 
-eRegexCompileStatus_t regexShuntingYard(regex_token_t **tokens) {
+eRegexCompileStatus_t regexShuntingYard(regex_vm_build_t *build, regex_token_t **tokens) {
     regex_fragment_t *stack = NULL;
     eRegexCompileStatus_t status;
     regex_sub_index_t *sub_index = NULL;
 
-    status = regexShuntingYardFragment(tokens, &stack, &sub_index, REGEX_SHUNTING_YARD_NO_PARENT, 0);
+    status = regexShuntingYardFragment(build, tokens, &stack, &sub_index, REGEX_SHUNTING_YARD_NO_PARENT, 0);
     regexSubroutineFree(&sub_index);
     if(status != eCompileOk) {
         regexFragmentFree(stack);
@@ -4219,7 +4270,7 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
     // yard algorithm. This is then converted into a VM bytecode sequence, for
     // runtime evaluation.
 
-    if((ctx->status = regexShuntingYard(&(build.tokens))) != eCompileOk) {
+    if((ctx->status = regexShuntingYard(&build, &(build.tokens))) != eCompileOk) {
         regexVMBuildDestroy(&build);
         ctx->vm = NULL;
         return ctx->status;
