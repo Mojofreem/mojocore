@@ -88,7 +88,7 @@
     (?P<name>...)  named subexpressions
     (?:...) non capturing subexpressions
     (?*...) compound subexpressions
-    (?R<name>...) named subroutine
+    (?R<name>...) named subroutine - TODO
     (?i) case insensitive match - TODO
 
     multiple subexpression meta prefixes may be defined, but must be at the
@@ -862,7 +862,7 @@ void regexEmitVMInstr(FILE *fp, regex_vm_t *vm, int pc) {
 }
 
 // Determines whether a given token is a terminal operand. Used when comparing
-// two adjacent tokens, the preceeding flag indicates whether the token be
+// two adjacent tokens, the preceeding flag indicates whether the token being
 // checked is leftmost.
 int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
     return ((_regexTokenDetails[token->tokenType].terminal == eReTokTerminal) ||
@@ -1170,7 +1170,6 @@ regex_subroutine_t *regexSubroutineIdxGetClassId(regex_vm_build_t *build, const 
 
 regex_subroutine_t *regexSubroutineIdxGetName(regex_vm_build_t *build, const char *name) {
     regex_subroutine_t *walk;
-    uint32_t crc = 0;
 
     for(walk = build->subroutine_index; walk != NULL; walk = walk->next) {
         if(!strcmp(walk->name, name)) {
@@ -2027,37 +2026,6 @@ int regexTokenUtf8ClassHighCreate(regex_token_t **tokens, utf8_charclass_high_by
     return 1;
 }
 
-uint32_t regexCalUtf8ClassCrc(utf8_charclass_tree_t *tree) {
-    utf8_charclass_midlow_byte_t *midlow;
-    utf8_charclass_midhigh_byte_t *midhigh;
-    utf8_charclass_high_byte_t *high;
-    uint32_t crc = 0;
-
-    calcCrc32(tree->one_byte, 32, &crc);
-    for(midlow = tree->two_byte; midlow != NULL; midlow = midlow->next) {
-        calcCrc32(&(midlow->prefix), 1, &crc);
-        calcCrc32(midlow->bitmap, 8, &crc);
-    }
-    for(midhigh = tree->three_byte; midhigh != NULL; midhigh = midhigh->next) {
-        calcCrc32(&(midhigh->prefix), 1, &crc);
-        for(midlow = midhigh->midlow_byte; midlow != NULL; midlow = midlow->next) {
-            calcCrc32(&(midlow->prefix), 1, &crc);
-            calcCrc32(midlow->bitmap, 8, &crc);
-        }
-    }
-    for(high = tree->four_byte; high != NULL; high = high->next) {
-        calcCrc32(&(high->prefix), 1, &crc);
-        for(midhigh = high->midhigh_byte; midhigh != NULL; midhigh = midhigh->next) {
-            calcCrc32(&(midhigh->prefix), 1, &crc);
-            for(midlow = midhigh->midlow_byte; midlow != NULL; midlow = midlow->next) {
-                calcCrc32(&(midlow->prefix), 1, &crc);
-                calcCrc32(midlow->bitmap, 8, &crc);
-            }
-        }
-    }
-    return crc;
-}
-
 int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus_t *status,
                               regex_token_t **tokens, utf8_charclass_tree_t *tree,
                               int invert, const char *pattern) {
@@ -2066,7 +2034,6 @@ int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus_t *st
     utf8_charclass_midhigh_byte_t *midhigh;
     utf8_charclass_high_byte_t *high;
     unsigned int *bitmap;
-    uint32_t crc;
     int k, first = 1;
 
     // Preset to OoM, change to eCompileOk on success
@@ -2690,6 +2657,7 @@ int parseUnicodeClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_buil
                                     int unicodeClass, regex_token_t **tokens) {
     char classId[3];
     const char *classStr;
+    regex_token_t *utf8class;
 
     classId[0] = (char)((unsigned int)unicodeClass & 0xFFu);
     classId[1] = (char)(((unsigned int)unicodeClass & 0xFF00u) >> 8u);
@@ -2698,6 +2666,13 @@ int parseUnicodeClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_buil
     if((classStr = regexRegUnicodeCharClassGet(classId)) == NULL) {
         *status = eCompileUnknownUnicodeClass;
         return 0;
+    }
+
+    if(regexSubroutineIdxGetPattern(build, classStr) != NULL) {
+        if((*status = regexSubroutineGenerateFromPattern(tokens, &utf8class, build, classStr, NULL, classId)) != eCompileOk) {
+            return 0;
+        }
+        return 1;
     }
 
     return parseCharClassAndCreateToken(status, build, &classStr, 0, tokens);
@@ -3078,55 +3053,6 @@ int regexStackTypeGreaterOrEqualToToken(regex_token_t *stack, eRegexToken_t toke
 }
 
 /////////////////////////////////////////////////////////////////////////////
-// Subroutine support functions
-//
-// Since subroutines may be called from multiple places, multiple positions
-// in the pattern may reference the same subroutine token stream. We use an
-// index to keep track of a subroutine when it is converted to an NFA so that
-// we only need to generate the NFA once, and subsequent references can then
-// refer to the same NFA.
-/////////////////////////////////////////////////////////////////////////////
-
-typedef struct regex_sub_index_s regex_sub_index_t;
-struct regex_sub_index_s {
-    regex_token_t *sequence;
-    regex_fragment_t *fragment;
-    regex_sub_index_t *next;
-};
-
-regex_fragment_t *regexSubroutineGet(regex_sub_index_t *index, regex_token_t *token) {
-    for(; index != NULL; index = index->next) {
-        if(index->sequence == token) {
-            return index->fragment;
-        }
-    }
-    return NULL;
-}
-
-int regexSubroutineStore(regex_sub_index_t **index, regex_token_t *token, regex_fragment_t *fragment) {
-    regex_sub_index_t *entry;
-
-    if((entry = _regexAlloc(sizeof(regex_sub_index_t), _regexMemContext)) == NULL) {
-        return 0;
-    }
-    memset(entry, 0, sizeof(regex_sub_index_t));
-    entry->sequence = token;
-    entry->fragment = fragment;
-    entry->next = *index;
-    *index = entry;
-    return 1;
-}
-
-void regexSubroutineFree(regex_sub_index_t **index) {
-    regex_sub_index_t *walk, *next;
-
-    for(walk = *index; walk != NULL; walk = next) {
-        next = walk->next;
-        _regexDealloc(walk, _regexMemContext);
-    }
-}
-
-/////////////////////////////////////////////////////////////////////////////
 // NFA form regex support
 /////////////////////////////////////////////////////////////////////////////
 
@@ -3474,8 +3400,7 @@ eRegexCompileStatus_t regexOperatorApply(regex_token_t **operators, eRegexOpAppl
 #define SET_YARD_RESULT(res)    status = res; goto ShuntingYardFailure;
 
 eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_token_t **tokens, regex_fragment_t **root_stack,
-                                                regex_sub_index_t **sub_index, int sub_expression,
-                                                unsigned int group_flags) {
+                                                int sub_expression, unsigned int group_flags) {
     regex_token_t *token = NULL, *routine, *operators = NULL;
     regex_fragment_t *operands = NULL, *subexpr;
     regex_subroutine_t *subindex;
@@ -3530,7 +3455,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
                 }
                 if(!subindex->infixed) {
                     routine = subindex->tokens;
-                    if((status = regexShuntingYardFragment(build, &(routine), &subexpr, sub_index,
+                    if((status = regexShuntingYardFragment(build, &(routine), &subexpr,
                                                            REGEX_SHUNTING_YARD_NO_CAPTURE,
                                                            REGEX_TOKEN_FLAG_SUBROUTINE)) != eCompileOk) {
                         SET_YARD_RESULT(status);
@@ -3556,7 +3481,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
                         SET_YARD_RESULT(eCompileOutOfMem);
                     }
                 }
-                if((status = regexShuntingYardFragment(build, tokens, &subexpr, sub_index,
+                if((status = regexShuntingYardFragment(build, tokens, &subexpr,
                                                        group_num, token->flags)) != eCompileOk) {
                     SET_YARD_RESULT(status);
                 }
@@ -3624,10 +3549,8 @@ ShuntingYardFailure:
 eRegexCompileStatus_t regexShuntingYard(regex_vm_build_t *build, regex_token_t **tokens) {
     regex_fragment_t *stack = NULL;
     eRegexCompileStatus_t status;
-    regex_sub_index_t *sub_index = NULL;
 
-    status = regexShuntingYardFragment(build, tokens, &stack, &sub_index, REGEX_SHUNTING_YARD_NO_PARENT, 0);
-    regexSubroutineFree(&sub_index);
+    status = regexShuntingYardFragment(build, tokens, &stack, REGEX_SHUNTING_YARD_NO_PARENT, 0);
     if(status != eCompileOk) {
         regexFragmentFree(stack);
         return status;
@@ -4787,7 +4710,6 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
     regex_thread_t *thread;
     size_t capture_size;
     size_t compound_size;
-    unsigned char c;
     int k;
 
     if(vm->vm_version != REGEX_VM_MACHINE_VERSION) {
@@ -4808,10 +4730,9 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
     }
 
     for(; eval->pos != eval->len; eval->sp++, eval->pos++) {
-        c = *eval->sp;
 #ifdef MOJO_REGEX_VM_DEBUG
         if(eval->debug != NULL) {
-            fprintf(eval->debug, "[%2d] (%c:%3d)\n", eval->pos, c, c);
+            fprintf(eval->debug, "[%2d] (%c:%3d)\n", eval->pos, *eval->sp, *eval->sp);
         }
 #endif // MOJO_REGEX_VM_DEBUG
         if(eval->queue == NULL) {
