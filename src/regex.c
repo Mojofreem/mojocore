@@ -583,6 +583,12 @@ typedef unsigned char uint8_t;
 #define REGEX_TOKEN_FLAG_INVERT     0x1u
 
 typedef struct regex_token_s regex_token_t;
+typedef struct regex_ptrlist_s regex_ptrlist_t;
+struct regex_ptrlist_s {
+    regex_token_t **out;
+    regex_ptrlist_t *next;
+};
+
 struct regex_token_s {
     eRegexToken_t tokenType;
     union {
@@ -599,6 +605,7 @@ struct regex_token_s {
             short sub_index;
         };
     };
+    regex_ptrlist_t *ptrlist;
     regex_token_t *out_a;
     regex_token_t *out_b;
     regex_token_t *next;
@@ -1073,6 +1080,46 @@ void regexRegUnicodeCharClassRemove(const char *classId) {
 // Token management functions
 /////////////////////////////////////////////////////////////////////////////
 
+regex_ptrlist_t *regexPtrlistCreate(regex_token_t **state) {
+    regex_ptrlist_t *entry;
+
+    if((entry = _regexAlloc(sizeof(regex_ptrlist_t), _regexMemContext)) == NULL) {
+        return NULL;
+    }
+    memset(entry, 0, sizeof(regex_ptrlist_t));
+    entry->out = state;
+    return entry;
+}
+
+regex_ptrlist_t *regexPtrlistAppend(regex_ptrlist_t *lista, regex_ptrlist_t *listb) {
+    regex_ptrlist_t *walk;
+
+    if(lista == NULL) {
+        return listb;
+    }
+    if(listb == NULL) {
+        return lista;
+    }
+
+    for(walk = lista; walk->next != NULL; walk = walk->next);
+    walk->next = listb;
+    return lista;
+}
+
+void regexPtrlistPatch(regex_ptrlist_t *list, regex_token_t *token) {
+    for(; list != NULL; list = list->next) {
+        *(list->out) = token;
+    }
+}
+
+void regexPtrListFree(regex_ptrlist_t *list) {
+    regex_ptrlist_t *next = NULL;
+    for(; list != NULL; list = next) {
+        next = list->next;
+        _regexDealloc(list, _regexMemContext);
+    }
+}
+
 regex_token_t *regexAllocToken(eRegexToken_t tokenType, int c, char *str, int sizeOrFlags, int sub_index) {
     regex_token_t *token;
 
@@ -1138,6 +1185,7 @@ void regexTokenDestroy(regex_token_t *token, int stack) {
             default:
                 break;
         }
+        regexPtrListFree(token->ptrlist);
         _regexDealloc(token, _regexMemContext);
         if(!stack) {
             break;
@@ -3132,18 +3180,7 @@ compileFailure:
 // Shunting yard implementation - convert infix to postfix to an NFA
 /////////////////////////////////////////////////////////////////////////////
 
-typedef struct regex_ptrlist_s regex_ptrlist_t;
-struct regex_ptrlist_s {
-    regex_token_t **out;
-    regex_ptrlist_t *next;
-};
-
-typedef struct regex_fragment_s regex_fragment_t;
-struct regex_fragment_s {
-    regex_token_t *token;
-    regex_ptrlist_t *ptrlist;
-    regex_fragment_t *next;
-};
+typedef struct regex_token_s regex_fragment_t;
 
 typedef enum {
     OP_GREATER_OR_EQUAL,
@@ -3190,155 +3227,52 @@ int regexStackTypeGreaterOrEqualToToken(regex_token_t *stack, eRegexToken_t toke
 // NFA form regex support
 /////////////////////////////////////////////////////////////////////////////
 
-regex_fragment_t *regexFragmentCreate(regex_token_t *token, regex_ptrlist_t *list) {
-    regex_fragment_t *fragment;
-
-    if((fragment = _regexAlloc(sizeof(regex_fragment_t), _regexMemContext)) == NULL) {
-        return NULL;
-    }
-    memset(fragment, 0, sizeof(regex_fragment_t));
-    fragment->token = token;
-    fragment->ptrlist = list;
-    return fragment;
-}
-
-regex_ptrlist_t *regexPtrlistCreate(regex_token_t **state) {
-    regex_ptrlist_t *entry;
-
-    if((entry = _regexAlloc(sizeof(regex_ptrlist_t), _regexMemContext)) == NULL) {
-        return NULL;
-    }
-    memset(entry, 0, sizeof(regex_ptrlist_t));
-    entry->out = state;
-    return entry;
-}
-
-regex_ptrlist_t *regexPtrlistAppend(regex_ptrlist_t *lista, regex_ptrlist_t *listb) {
-    regex_ptrlist_t *walk;
-
-    if(lista == NULL) {
-        return listb;
-    }
-    if(listb == NULL) {
-        return lista;
-    }
-
-    for(walk = lista; walk->next != NULL; walk = walk->next);
-    walk->next = listb;
-    return lista;
-}
-
-void regexPtrlistPatch(regex_ptrlist_t *list, regex_token_t *token) {
-    for(; list != NULL; list = list->next) {
-        *(list->out) = token;
-    }
-}
-
-void regexPtrListFree(regex_ptrlist_t *list) {
-    regex_ptrlist_t *next = NULL;
-    for(; list != NULL; list = next) {
-        next = list->next;
-        _regexDealloc(list, _regexMemContext);
-    }
-}
-
-void regexFragmentFree(regex_fragment_t *fragment) {
-    regex_fragment_t *next;
-
-    while(fragment != NULL) {
-        next = fragment->next;
-        if(fragment->token != NULL) {
-            regexTokenDestroy(fragment->token, 0);
-            fragment->token = NULL;
-        }
-        if(fragment->ptrlist != NULL) {
-            regexPtrListFree(fragment->ptrlist);
-            fragment->ptrlist = NULL;
-        }
-        _regexDealloc(fragment, _regexMemContext);
-        fragment = next;
-    }
-}
-
-void regexFragmentStackPush(regex_fragment_t **stack, regex_fragment_t *fragment) {
-    fragment->next = *stack;
-    *stack = fragment;
-}
-
-regex_fragment_t *regexFragmentStackPop(regex_fragment_t **stack) {
-    regex_fragment_t *fragment;
-    fragment = *stack;
-    if(fragment != NULL) {
-        *stack = fragment->next;
-        fragment->next = NULL;
-    }
-    return fragment;
-}
-
 int regexOperatorLiteralCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_fragment_t *fragment;
     regex_ptrlist_t *list;
 
     if((list = regexPtrlistCreate(&(token->out_a))) == NULL) {
         return 0;
     }
-    if((fragment = regexFragmentCreate(token, list)) == NULL) {
-        regexPtrListFree(list);
-        return 0;
-    }
-    regexFragmentStackPush(stack, fragment);
+    token->ptrlist = list;
+    regexTokenStackPush(stack, token);
     return 1;
 }
 
 int regexOperatorSubexprCreate(regex_fragment_t **stack, regex_token_t *token) {
     regex_ptrlist_t *list;
-    regex_fragment_t *fragment;
 
     token->tokenType = eTokenSave;
     if((list = regexPtrlistCreate(&(token->out_a))) == NULL) {
         return 0;
     }
-    if((fragment = regexFragmentCreate(token, list)) == NULL) {
-        regexPtrListFree(list);
-        return 0;
-    }
-    regexFragmentStackPush(stack, fragment);
+    token->ptrlist = list;
+    regexTokenStackPush(stack, token);
     return 1;
 }
 
 int regexOperatorConcatenationCreate(regex_fragment_t **stack, regex_token_t *token) {
     regex_fragment_t *e1, *e2;
-    regex_fragment_t *fragment;
 
     regexTokenDestroy(token, 1);
-    if(((e2 = regexFragmentStackPop(stack)) == NULL) ||
-       ((e1 = regexFragmentStackPop(stack)) == NULL)) {
+    if(((e2 = regexTokenStackPop(stack)) == NULL) ||
+       ((e1 = regexTokenStackPop(stack)) == NULL)) {
         return 0;
     }
-    regexPtrlistPatch(e1->ptrlist, e2->token);
-    if((fragment = regexFragmentCreate(e1->token, e2->ptrlist)) == NULL) {
-        return 0;
-    }
-    regexFragmentStackPush(stack, fragment);
-
-    regexPtrListFree(e1->ptrlist);
-    e1->ptrlist = NULL;
-    e1->token = NULL;
-    regexFragmentFree(e1);
-    e2->token = NULL;
+    regexPtrlistPatch(e1->ptrlist, e2);
+    e1->ptrlist = e2->ptrlist;
     e2->ptrlist = NULL;
-    regexFragmentFree(e2);
+    regexTokenStackPush(stack, e1);
 
     return 1;
 }
 
 int regexOperatorAlternationCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_fragment_t *e1, *e2, *fragment;
+    regex_fragment_t *e1, *e2;
     regex_ptrlist_t *list;
     regex_token_t *jmp = NULL;
 
-    if(((e2 = regexFragmentStackPop(stack)) == NULL) ||
-       ((e1 = regexFragmentStackPop(stack)) == NULL)) {
+    if(((e2 = regexTokenStackPop(stack)) == NULL) ||
+       ((e1 = regexTokenStackPop(stack)) == NULL)) {
         return 0;
     }
 
@@ -3351,58 +3285,44 @@ int regexOperatorAlternationCreate(regex_fragment_t **stack, regex_token_t *toke
     }
 
     token->tokenType = eTokenSplit;
-    token->out_a = e1->token;
-    token->out_b = e2->token;
-    if((fragment = regexFragmentCreate(token, regexPtrlistAppend(list, e2->ptrlist))) == NULL) {
-        return 0;
-    }
-    regexFragmentStackPush(stack, fragment);
-
-    regexPtrListFree(e1->ptrlist);
-    e1->ptrlist = NULL;
-    e1->token = NULL;
-    regexFragmentFree(e1);
+    token->out_a = e1;
+    token->out_b = e2;
+    token->ptrlist = regexPtrlistAppend(list, e2->ptrlist);
     e2->ptrlist = NULL;
-    e2->token = NULL;
-    regexFragmentFree(e2);
+    regexTokenStackPush(stack, token);
 
     return 1;
 }
 
 int regexOperatorZeroOrOneCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_fragment_t *e, *fragment;
+    regex_fragment_t *e;
     regex_ptrlist_t *list;
 
-    if((e = regexFragmentStackPop(stack)) == NULL) {
+    if((e = regexTokenStackPop(stack)) == NULL) {
         return 0;
     }
     token->tokenType = eTokenSplit;
-    token->out_a = e->token;
+    token->out_a = e;
     if((list = regexPtrlistCreate(&(token->out_b))) == NULL) {
         return 0;
     }
-    if((fragment = regexFragmentCreate(token, regexPtrlistAppend(e->ptrlist, list))) == NULL) {
-        return 0;
-    }
-    regexFragmentStackPush(stack, fragment);
-
+    token->ptrlist = regexPtrlistAppend(e->ptrlist, list);
     e->ptrlist = NULL;
-    e->token = NULL;
-    regexFragmentFree(e);
+    regexTokenStackPush(stack, token);
 
     return 1;
 }
 
 int regexOperatorZeroOrMoreCreate(regex_fragment_t **stack, regex_token_t *token) {
     regex_ptrlist_t *list;
-    regex_fragment_t *fragment, *e;
+    regex_fragment_t *e;
     regex_token_t *jmp = NULL;
 
-    if((e = regexFragmentStackPop(stack)) == NULL) {
+    if((e = regexTokenStackPop(stack)) == NULL) {
         return 0;
     }
     token->tokenType = eTokenSplit;
-    token->out_a = e->token;
+    token->out_a = e;
     if((list = regexPtrlistCreate(&(token->out_b))) == NULL) {
         return 0;
     }
@@ -3411,36 +3331,27 @@ int regexOperatorZeroOrMoreCreate(regex_fragment_t **stack, regex_token_t *token
     }
     jmp->out_a = token;
     regexPtrlistPatch(e->ptrlist, jmp);
-    if((fragment = regexFragmentCreate(token, list)) == NULL) {
-        return 0;
-    }
-    regexFragmentStackPush(stack, fragment);
-
-    e->ptrlist = NULL;
-    e->token = NULL;
-    regexFragmentFree(e);
+    token->ptrlist = list;
+    regexTokenStackPush(stack, token);
 
     return 1;
 }
 
 int regexOperatorOneOrMoreCreate(regex_fragment_t **stack, regex_token_t *token) {
     regex_ptrlist_t *list;
-    regex_fragment_t *fragment, *e;
+    regex_fragment_t *e;
 
-    if((e = regexFragmentStackPop(stack)) == NULL) {
+    if((e = regexTokenStackPop(stack)) == NULL) {
         return 0;
     }
     token->tokenType = eTokenSplit;
-    token->out_a = e->token;
+    token->out_a = e;
     regexPtrlistPatch(e->ptrlist, token);
     if((list = regexPtrlistCreate(&(token->out_b))) == NULL) {
         return 0;
     }
-    if((fragment = regexFragmentCreate(e->token, list)) == NULL) {
-        _regexDealloc(list, _regexMemContext);
-        return 0;
-    }
-    regexFragmentStackPush(stack, fragment);
+    e->ptrlist = list;
+    regexTokenStackPush(stack, e);
     return 1;
 }
 
@@ -3448,14 +3359,14 @@ int regexOperatorMatchCreate(regex_fragment_t **stack) {
     regex_fragment_t *e;
     regex_token_t *token = NULL;
 
-    if((e = regexFragmentStackPop(stack)) == NULL) {
+    if((e = regexTokenStackPop(stack)) == NULL) {
         return 0;
     }
     if(!regexTokenCreate(&token, eTokenMatch, 0, NULL, 0, 0)) {
         return 0;
     }
     regexPtrlistPatch(e->ptrlist, token);
-    regexFragmentStackPush(stack, e);
+    regexTokenStackPush(stack, e);
 
     return 1;
 }
@@ -3464,14 +3375,14 @@ int regexOperatorReturnCreate(regex_fragment_t **stack) {
     regex_fragment_t *e;
     regex_token_t *token = NULL;
 
-    if((e = regexFragmentStackPop(stack)) == NULL) {
+    if((e = regexTokenStackPop(stack)) == NULL) {
         return 0;
     }
     if(!regexTokenCreate(&token, eTokenReturn, 0, NULL, 0, 0)) {
         return 0;
     }
     regexPtrlistPatch(e->ptrlist, token);
-    regexFragmentStackPush(stack, e);
+    regexTokenStackPush(stack, e);
 
     return 1;
 }
@@ -3594,7 +3505,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
                                                            REGEX_TOKEN_FLAG_SUBROUTINE)) != eCompileOk) {
                         SET_YARD_RESULT(status);
                     }
-                    subindex->tokens = subexpr->token;
+                    subindex->tokens = subexpr;
                     subindex->infixed = 1;
                 }
                 token->out_b = subindex->tokens;
@@ -3625,7 +3536,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
                                                                group_num, token->flags)) != eCompileOk) {
                             SET_YARD_RESULT(status);
                         }
-                        subindex->tokens = subexpr->token;
+                        subindex->tokens = subexpr;
                         subindex->infixed = 1;
                     }
                     token->out_b = subindex->tokens;
@@ -3638,7 +3549,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
                                                            group_num, token->flags)) != eCompileOk) {
                         SET_YARD_RESULT(status);
                     }
-                    regexFragmentStackPush(&operands, subexpr);
+                    regexTokenStackPush(&operands, subexpr);
                 }
                 break;
 
@@ -3698,7 +3609,6 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
     return status;
 
 ShuntingYardFailure:
-    regexFragmentFree(operands);
     regexTokenDestroy(operators, 1);
     operands = NULL;
 
@@ -3711,13 +3621,11 @@ eRegexCompileStatus_t regexShuntingYard(regex_vm_build_t *build, regex_token_t *
 
     status = regexShuntingYardFragment(build, tokens, &stack, REGEX_SHUNTING_YARD_NO_PARENT, 0);
     if(status != eCompileOk) {
-        regexFragmentFree(stack);
+        regexTokenDestroy(stack, 1);
         return status;
     }
 
-    *tokens = stack->token;
-    stack->token = NULL;
-    regexFragmentFree(stack);
+    *tokens = stack;
 
     return status;
 }
