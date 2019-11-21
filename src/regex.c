@@ -84,6 +84,30 @@
             build NFA from class tree
         create utf8 class table
         output utf8 class table
+        DFA generation rework:
+            fix return (and match?), inserted at the wrong position
+            eliminate seperate fragment struct (integrate ptrlist into token)
+            refactor ptrlist to reference the parent instead of the out node
+                ensure never cull first instruction jmp to 1:
+                    ie.   0 jmp 1
+                    may be neccessary for char literal split logic (since it
+                    cannot jump to index 0)
+                cull redundant jmps, and jmps to match/return
+                    ie:   0 jmp 1
+                          1 jmp 2   -->   0 jmp 2
+                          2 jmp 4         1 ...
+                          3 ...
+                reduce '?', '+', and '*' quantifiers on char literal
+                    '?'   0 split 1, 2
+                          1 char 'a'    -->  0 char 'a', 1
+                          2 ...              1 ...
+                    '+'   0 char 'a'
+                          1 split 0, 2  -->  1 char 'a', 1
+                          2 ...              2 ...
+                    '*'   0 split 1, 3
+                          1 char 'a'    -->  1 char 'a' invert, 1
+                          2 jump             2 ...
+                          3 ...
 
     (?P<name>...)  named subexpressions
     (?:...) non capturing subexpressions
@@ -609,6 +633,7 @@ typedef struct regex_vm_build_s regex_vm_build_t;
 struct regex_vm_build_s {
     regex_vm_t *vm;
     regex_token_t *tokens;
+    unsigned char barrier[8];
     regex_subroutine_t *subroutine_index;
     regex_vm_pc_patch_t *patch_list;
     regex_vm_gen_path_t *gen_list;
@@ -709,7 +734,16 @@ void regexPrinter_eTokenCall(FILE *fp, regex_token_t *token) {
 }
 
 void regexPrinter_eTokenSubExprStart(FILE *fp, regex_token_t *token) {
-    fprintf(fp, "%d", token->group);
+    regex_subroutine_t *sub;
+
+    if(token->flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
+        fprintf(fp, "subroutine %d", token->sub_index);
+    } else {
+        fprintf(fp, "group %d", token->group);
+    }
+    if(token->flags & REGEX_TOKEN_FLAG_COMPOUND) { fputs(", compound", fp); }
+    if(token->flags & REGEX_TOKEN_FLAG_NOCAPTURE) { fputs(", no capture", fp); }
+    if(token->flags & REGEX_TOKEN_FLAG_CASEINS) { fputs(", case insensitive", fp); }
 }
 
 // Token VM instruction printers
@@ -859,6 +893,12 @@ void regexEmitTokenStr(FILE *fp, regex_token_t *token) {
     }
 }
 
+void regexEmitTokenStrStack(FILE *fp, regex_token_t *token) {
+    for(; token != NULL; token = token->next) {
+        regexEmitTokenStr(fp, token);
+    }
+}
+
 void regexEmitVMInstr(FILE *fp, regex_vm_t *vm, int pc) {
     eRegexToken_t token;
     unsigned int oper_a, oper_b, instr;
@@ -891,6 +931,15 @@ eRegexTokenPriority_t regexGetTokenTypePriority(eRegexToken_t tokenType) {
 // shunting yard
 int regexGetOperatorArity(regex_token_t *token) {
     return _regexTokenDetails[token->tokenType].arity;
+}
+
+void checkBarrier(regex_vm_build_t *build) {
+    for(int k = 0; k < 8; k++) {
+        if(build->barrier[k] != 0) {
+            printf("MEMORY CORRUPTION! Barrier was overwritten!\n");
+            return;
+        }
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1191,6 +1240,7 @@ void regexSubroutineIdxFree(regex_vm_build_t *build) {
         }
         _regexDealloc(walk, _regexMemContext);
     }
+    build->subroutine_index = NULL;
 }
 
 eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
@@ -1219,7 +1269,7 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
 
     if(entry == NULL) {
         // We're creating a new entry
-        if((pattern == NULL) && (*subroutine == NULL) && ((name == NULL) || (nameLen <= 0))) {
+        if((pattern == NULL) && (subroutine == NULL) && ((name == NULL) || (nameLen <= 0))) {
             // There's nothing here to identify the new entry!
             return eCompileInternalError;
         }
@@ -1354,6 +1404,7 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
             case 'W': // non word character
             case 'B': // explicit byte match
             case 'X': // full unicode glyph (base + markers)
+            case 'R': // Subroutine call
                 result.state = eRegexPatternMetaClass;
                 result.c = *(*pattern + 1);
                 return result;
@@ -2757,7 +2808,7 @@ int regexSubexprLookupEntryCreate(regex_vm_build_t *build, const char **pattern,
 // entry, and adds it to the subroutine index. Returns the subroutine id (>0) on
 // success, 0 on out of memory, and -1 if the name is malformed.
 int regexSubroutineIdxEntryCreate(regex_vm_build_t *build, const char **pattern) {
-    int len, index;
+    int len, index = 0;
 
     for(len = 0; (*pattern)[len] != '>' && (*pattern)[len] != '\0'; len++) {
         if(!parseIsAlnum((*pattern)[len])) {
@@ -2778,6 +2829,34 @@ int regexSubroutineIdxEntryCreate(regex_vm_build_t *build, const char **pattern)
     (*pattern)++;
 
     return index;
+}
+
+// Parses the subroutine name pointed to by pattern, looks up that name within
+// the subroutine index, and returns the subroutine id (>0) on success, 0 if the
+// entry was not found, and -1 if the name is malformed.
+int regexSubroutineIdxCall(regex_vm_build_t *build, const char **pattern) {
+    int len;
+    regex_subroutine_t *subroutine;
+
+    for(len = 0; (*pattern)[len] != '}' && (*pattern)[len] != '\0'; len++) {
+        if(!parseIsAlnum((*pattern)[len])) {
+            return -1;
+        }
+    }
+    if(len == 0) {
+        return -1;
+    }
+
+    if((subroutine = regexSubroutineIdxGetName(build, *pattern, len)) == NULL) {
+        return 0;
+    }
+
+    *pattern += len;
+
+    // Discard the trailing '>' delimiter
+    (*pattern)++;
+
+    return subroutine->id;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -2946,6 +3025,17 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
 
             case eRegexPatternMetaClass:
                 switch(c.c) {
+                    case 'R': // subroutine call
+                        if(!parseCheckNextPatternChar(&pattern, '{')) {
+                            SET_RESULT(eCompileMalformedSubExprName);
+                        }
+                        if((index = regexSubroutineIdxCall(build, &pattern)) <= 0) {
+                            SET_RESULT((index == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName));
+                        }
+                        if(!regexTokenCreate(tokens, eTokenCall, index, NULL, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
                     case 'X': // full unicode glyph (base + markers)
                         // Represented by a micro NFA
                         // TODO
@@ -3521,6 +3611,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
                     }
                 }
                 if(token->flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
+                    checkBarrier(build);
                     if((subindex = regexSubroutineIdxGet(build, token->sub_index)) == NULL) {
                         SET_YARD_RESULT(eCompileInternalError);
                     }
@@ -3561,23 +3652,17 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
                         return eCompileOutOfMem;
                     }
                     regexTokenStackPush(&operators, token);
-                } else if(group_flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
-                    token = NULL;
-                    if(!regexTokenCreate(&token, eTokenConcatenation, 0, NULL, 0, 0)) {
-                        return eCompileOutOfMem;
-                    }
-                    regexTokenStackPush(&operators, token);
-                    token = NULL;
-                    if(!regexTokenCreate(&token, eTokenReturn, 0, NULL, 0, 0)) {
-                        return eCompileOutOfMem;
-                    }
-                    regexOperatorLiteralCreate(&operands, token);
                 }
                 if((status = regexOperatorApply(&operators, OP_ALL, 0, &operands)) != eCompileOk) {
                     goto ShuntingYardFailure;
                 }
                 if(operands->next != NULL) {
                     SET_YARD_RESULT(eCompileInternalError);
+                }
+                if(group_flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
+                    if(!regexOperatorReturnCreate(&operands)) {
+                        return eCompileOutOfMem;
+                    }
                 }
                 *root_stack = operands;
                 return eCompileOk;
@@ -3589,9 +3674,12 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
     }
 
     if(group_flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
+        printf("subroutine fallthrough\n");
+        /*
         if(!regexOperatorReturnCreate(&operands)) {
             SET_YARD_RESULT(eCompileOutOfMem);
         }
+        */
     } else {
         if(sub_expression != REGEX_SHUNTING_YARD_NO_PARENT) {
             SET_YARD_RESULT(eCompileInternalError);
@@ -3874,10 +3962,13 @@ int regexVMProgramAdd(regex_vm_build_t *build, eRegexToken_t opcode, unsigned in
 int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_token_t *token, regex_token_t **next) {
     int idx_a = 0, idx_b = 0;
 
+    printf("VM gen instr: %p\n", token);
+
     if(token == NULL) {
         *next = NULL;
         return 1;
     }
+    regexEmitTokenStr(stdout, token);
     if(token->pc != VM_PC_UNVISITED) {
         *next = NULL;
         return 1;
@@ -3957,14 +4048,18 @@ int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_token_t *token, r
 }
 
 int regexVMProgramGenerate(regex_vm_build_t *build, regex_token_t *token) {
+    printf("VM generate: %p %p\n", build, token);
+
     do {
         for(;token != NULL;) {
             if(!regexVMProgramGenerateInstr(build, token, &token)) {
                 return 0;
             }
         }
+        printf("get next gen path\n");
     } while((token = regexVMGenPathGetNext(build, 0)) != NULL);
 
+    printf("get next gen path sub\n");
     token = regexVMGenPathGetNext(build, 1);
     do {
         do {
@@ -3973,7 +4068,9 @@ int regexVMProgramGenerate(regex_vm_build_t *build, regex_token_t *token) {
                     return 0;
                 }
             }
+            printf("get next gen path (sub)\n");
         } while((token = regexVMGenPathGetNext(build, 0)) != NULL);
+        printf("get next gen path sub\n");
     } while((token = regexVMGenPathGetNext(build, 1)) != NULL);
 
     regexVMPatchJumps(build, &(build->patch_list));
@@ -4225,6 +4322,14 @@ const char *regexGetCompileStatusStr(eRegexCompileStatus_t status) {
     }
 }
 
+void regexGetCompileResult(FILE *fp, regex_compile_ctx_t *ctx) {
+    fprintf(fp, "Result: %s\n", regexGetCompileStatusStr(ctx->status));
+    if(ctx->status != eCompileOk) {
+        fprintf(fp, "Pattern: %s\n", ctx->pattern);
+        fprintf(fp, "(@%-4d)  %*.*s^", ctx->position, ctx->position, ctx->position, "");
+    }
+}
+
 // Return a compiled regex, or an error and position within the pattern
 eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
                                    unsigned int flags) {
@@ -4235,6 +4340,7 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
         return ctx->status;
     }
 
+    printf("RE: compile\n");
     memset(ctx, 0, sizeof(regex_compile_ctx_t));
     ctx->pattern = pattern;
     ctx->status = eCompileOk;
@@ -4248,38 +4354,45 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
     // Parse the regex pattern into a sequence of tokens (operators and operands)
     // The output of this stage is a sequence of lexical tokens in infix form
 
+    printf("RE: tokenize\n");
     if((ctx->status = regexTokenizePattern(ctx->pattern, &(ctx->position),
                                            &(build.tokens), &build)) != eCompileOk) {
         regexTokenDestroy(build.tokens, 1);
+        build.tokens = NULL;
         regexVMBuildDestroy(&build);
         ctx->vm = NULL;
         return ctx->status;
     }
-    regexSubroutineIdxFree(&build);
 
     // Next, convert the infix form of the regular expression to postfix form,
     // and derive an NFA representation. We accomplish this using the shunting
     // yard algorithm. This is then converted into a VM bytecode sequence, for
     // runtime evaluation.
 
+    printf("RE: shunting yard\n");
     if((ctx->status = regexShuntingYard(&build, &(build.tokens))) != eCompileOk) {
         regexVMBuildDestroy(&build);
         ctx->vm = NULL;
         return ctx->status;
     }
 
+    printf("RE: vm\n");
     if(!regexVMProgramGenerate(&build, build.tokens)) {
         regexVMBuildDestroy(&build);
+        regexSubroutineIdxFree(&build);
         ctx->vm = NULL;
         ctx->status = eCompileOutOfMem;
         return ctx->status;
     }
+    regexSubroutineIdxFree(&build);
 
     // Fixup the lookup tables
     build.vm->group_tbl_size = build.groups;
 
     build.vm->size = build.pc;
     ctx->vm = build.vm;
+
+    printf("RE: done\n");
 
     return eCompileOk;
 }
@@ -5024,7 +5137,8 @@ int main(int argc, char **argv) {
 
     if(argc > 1) {
         if(regexCompile(&result, argv[1], 0) != eCompileOk) {
-            printf("Compile failed: %s", regexGetCompileStatusStr(result.status));
+            //printf("Compile failed: %s", regexGetCompileStatusStr(result.status));
+            regexGetCompileResult(stdout, &result);
             return 1;
         }
         if(argc > 2) {
