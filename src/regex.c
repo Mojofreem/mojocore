@@ -80,33 +80,28 @@
         \> match end of word (assertion, non consuming, ASCII only)
         \P inverts unicode category class
         surface subroutine errors during compilation
-        unicode utf8 classes
-            build NFA from class tree
-        create utf8 class table
-        output utf8 class table
         DFA generation rework:
-            eliminate seperate fragment struct (integrate ptrlist into token)
-            refactor ptrlist to reference the parent instead of the out node
-                ensure never cull first instruction jmp to 1:
-                    ie.   0 jmp 1
-                    may be neccessary for char literal split logic (since it
-                    cannot jump to index 0)
-                cull redundant jmps, and jmps to match/return
-                    ie:   0 jmp 1
-                          1 jmp 2   -->   0 jmp 2
-                          2 jmp 4         1 ...
-                          3 ...
-                reduce '?', '+', and '*' quantifiers on char literal
-                    '?'   0 split 1, 2
-                          1 char 'a'    -->  0 char 'a', 1
-                          2 ...              1 ...
-                    '+'   0 char 'a'
-                          1 split 0, 2  -->  1 char 'a', 1
-                          2 ...              2 ...
-                    '*'   0 split 1, 3
-                          1 char 'a'    -->  1 char 'a' invert, 1
-                          2 jump             2 ...
-                          3 ...
+            cull redundant jmps, and jmps to match/return:
+                ie:   0 jmp 1
+                      1 jmp 2   -->   0 jmp 2
+                      2 jmp 4         1 ...
+                      3 ...
+            reduce '?', '+', and '*' quantifiers on char literal:
+                '?'   0 split 1, 2
+                      1 char 'a'    -->  0 char 'a', 1
+                      2 ...              1 ...
+                '+'   0 char 'a'
+                      1 split 0, 2  -->  1 char 'a', 1
+                      2 ...              2 ...
+                '*'   0 split 1, 3
+                      1 char 'a'    -->  1 char 'a' invert, 1
+                      2 jump             2 ...
+                      3 ...
+            reduce alternation '|' with preceeding char literal:
+                '|'   0 split 1, 3
+                      1 char 'a'    --> 0 char 'a' invert, 3
+                      2 jmp 4           1 ...
+                      3 ...
 
     (?P<name>...)  named subexpressions
     (?:...) non capturing subexpressions
@@ -132,7 +127,6 @@
         a capturing expression.
 
     TODO
-        unicode character classes
         unicode compilation toggle - do NOT generate unicode char classes in non
             unicode mode
 
@@ -142,11 +136,11 @@
         refactor unicode char class registration to a single struct type
             current has independent class id and class str values
         Shunting yard creates a valid, yet inefficient, DFA. There are various
-            redundencies, particularly with regards to chained and unneccessary
+            redundancies, particularly with regards to chained and unnecessary
             jumps.
 
 
-Regex VM Bytecode (v5)
+Regex VM Bytecode (v7)
 
     Each operation is encoded into a single 32 bit int value:
 
@@ -233,10 +227,14 @@ All VM programs are prefixed with: TODO
         1 anychar
         2 jmp 1
 
-    At runtime, if a partial match is requested, exceution begins at 0. If a
+    At runtime, if a partial match is requested, execution begins at 0. If a
     full match is requested, execution begins at 3.
 
-Test: a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat abcdefgefgjfoo8167287catfoo
+Test 1: a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat
+        abcdefgefgjfoo8167287catfoo
+
+Test 2: a(?P<foolio>?i\Bcd(?i(?R<chunk>efg[hijk])(?*f.o)*)?)(?R<digits>\d+)c\p{L}+\R{digits}
+        abcdefgjfoofoofoo033195cat72364ghj
 */
 
 /////////////////////////////////////////////////////////////////////////////
@@ -582,10 +580,16 @@ typedef unsigned char uint8_t;
 // char literal, char class, utf8 class
 #define REGEX_TOKEN_FLAG_INVERT     0x1u
 
+typedef enum {
+    eRePtrOutA,
+    eRePtrOutB
+} eRePtrListType_t;
+
 typedef struct regex_token_s regex_token_t;
 typedef struct regex_ptrlist_s regex_ptrlist_t;
 struct regex_ptrlist_s {
-    regex_token_t **out;
+    eRePtrListType_t type;
+    regex_token_t *token;
     regex_ptrlist_t *next;
 };
 
@@ -639,7 +643,6 @@ typedef struct regex_vm_build_s regex_vm_build_t;
 struct regex_vm_build_s {
     regex_vm_t *vm;
     regex_token_t *tokens;
-    unsigned char barrier[8];
     regex_subroutine_t *subroutine_index;
     regex_vm_pc_patch_t *patch_list;
     regex_vm_gen_path_t *gen_list;
@@ -686,7 +689,7 @@ void regexPrintVMCharClass(FILE *fp, regex_vm_t *vm, int class_idx) {
     const unsigned int *bitmap;
 
     if((bitmap = regexVMClassTableEntryGet(vm, class_idx)) == NULL) {
-        printf("index %d was null", class_idx);
+        fprintf(fp, "index %d was null", class_idx);
     } else {
         regexEmitCharClassBitmap(fp, bitmap);
     }
@@ -705,9 +708,9 @@ void regexPrintVMUtf8ClassEntry(FILE *fp, regex_vm_t *vm, int utf8_idx) {
 
     bitmap = regexVMUtf8TableEntryGet(vm, utf8_idx);
     if(bitmap == NULL) {
-        printf("NULL");
+        fprintf(fp, "NULL");
     } else {
-        printf("0x%8.8X%8.8X", bitmap[0], bitmap[1]);
+        fprintf(fp, "0x%8.8X%8.8X", bitmap[0], bitmap[1]);
     }
 }
 
@@ -939,15 +942,6 @@ int regexGetOperatorArity(regex_token_t *token) {
     return _regexTokenDetails[token->tokenType].arity;
 }
 
-void checkBarrier(regex_vm_build_t *build) {
-    for(int k = 0; k < 8; k++) {
-        if(build->barrier[k] != 0) {
-            printf("MEMORY CORRUPTION! Barrier was overwritten!\n");
-            return;
-        }
-    }
-}
-
 /////////////////////////////////////////////////////////////////////////////
 // Unicode char class registration functions
 /////////////////////////////////////////////////////////////////////////////
@@ -1080,14 +1074,15 @@ void regexRegUnicodeCharClassRemove(const char *classId) {
 // Token management functions
 /////////////////////////////////////////////////////////////////////////////
 
-regex_ptrlist_t *regexPtrlistCreate(regex_token_t **state) {
+regex_ptrlist_t *regexPtrlistCreate(regex_token_t *token, eRePtrListType_t type) {
     regex_ptrlist_t *entry;
 
     if((entry = _regexAlloc(sizeof(regex_ptrlist_t), _regexMemContext)) == NULL) {
         return NULL;
     }
     memset(entry, 0, sizeof(regex_ptrlist_t));
-    entry->out = state;
+    entry->token = token;
+    entry->type = type;
     return entry;
 }
 
@@ -1108,7 +1103,11 @@ regex_ptrlist_t *regexPtrlistAppend(regex_ptrlist_t *lista, regex_ptrlist_t *lis
 
 void regexPtrlistPatch(regex_ptrlist_t *list, regex_token_t *token) {
     for(; list != NULL; list = list->next) {
-        *(list->out) = token;
+        if(list->type == eRePtrOutA) {
+            list->token->out_a = token;
+        } else {
+            list->token->out_b = token;
+        }
     }
 }
 
@@ -3180,8 +3179,6 @@ compileFailure:
 // Shunting yard implementation - convert infix to postfix to an NFA
 /////////////////////////////////////////////////////////////////////////////
 
-typedef struct regex_token_s regex_fragment_t;
-
 typedef enum {
     OP_GREATER_OR_EQUAL,
     OP_ALL
@@ -3227,25 +3224,25 @@ int regexStackTypeGreaterOrEqualToToken(regex_token_t *stack, eRegexToken_t toke
 // NFA form regex support
 /////////////////////////////////////////////////////////////////////////////
 
-int regexOperatorLiteralCreate(regex_fragment_t **stack, regex_token_t *token) {
-    if((token->ptrlist = regexPtrlistCreate(&(token->out_a))) == NULL) {
+int regexOperatorLiteralCreate(regex_token_t **stack, regex_token_t *token) {
+    if((token->ptrlist = regexPtrlistCreate(token, eRePtrOutA)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, token);
     return 1;
 }
 
-int regexOperatorSubexprCreate(regex_fragment_t **stack, regex_token_t *token) {
+int regexOperatorSubexprCreate(regex_token_t **stack, regex_token_t *token) {
     token->tokenType = eTokenSave;
-    if((token->ptrlist = regexPtrlistCreate(&(token->out_a))) == NULL) {
+    if((token->ptrlist = regexPtrlistCreate(token, eRePtrOutA)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, token);
     return 1;
 }
 
-int regexOperatorConcatenationCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_fragment_t *e1, *e2;
+int regexOperatorConcatenationCreate(regex_token_t **stack, regex_token_t *token) {
+    regex_token_t *e1, *e2;
 
     regexTokenDestroy(token, 1);
     if(((e2 = regexTokenStackPop(stack)) == NULL) ||
@@ -3260,8 +3257,8 @@ int regexOperatorConcatenationCreate(regex_fragment_t **stack, regex_token_t *to
     return 1;
 }
 
-int regexOperatorAlternationCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_fragment_t *e1, *e2;
+int regexOperatorAlternationCreate(regex_token_t **stack, regex_token_t *token) {
+    regex_token_t *e1, *e2;
     regex_token_t *jmp = NULL;
 
     if(((e2 = regexTokenStackPop(stack)) == NULL) ||
@@ -3273,7 +3270,7 @@ int regexOperatorAlternationCreate(regex_fragment_t **stack, regex_token_t *toke
         return 0;
     }
     regexPtrlistPatch(e1->ptrlist, jmp);
-    if((token->ptrlist = regexPtrlistCreate(&(jmp->out_a))) == NULL) {
+    if((token->ptrlist = regexPtrlistCreate(jmp, eRePtrOutA)) == NULL) {
         return 0;
     }
 
@@ -3287,15 +3284,15 @@ int regexOperatorAlternationCreate(regex_fragment_t **stack, regex_token_t *toke
     return 1;
 }
 
-int regexOperatorZeroOrOneCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_fragment_t *e;
+int regexOperatorZeroOrOneCreate(regex_token_t **stack, regex_token_t *token) {
+    regex_token_t *e;
 
     if((e = regexTokenStackPop(stack)) == NULL) {
         return 0;
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    if((token->ptrlist = regexPtrlistCreate(&(token->out_b))) == NULL) {
+    if((token->ptrlist = regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
         return 0;
     }
     token->ptrlist = regexPtrlistAppend(e->ptrlist, token->ptrlist);
@@ -3305,8 +3302,8 @@ int regexOperatorZeroOrOneCreate(regex_fragment_t **stack, regex_token_t *token)
     return 1;
 }
 
-int regexOperatorZeroOrMoreCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_fragment_t *e;
+int regexOperatorZeroOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
+    regex_token_t *e;
     regex_token_t *jmp = NULL;
 
     if((e = regexTokenStackPop(stack)) == NULL) {
@@ -3314,7 +3311,7 @@ int regexOperatorZeroOrMoreCreate(regex_fragment_t **stack, regex_token_t *token
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    if((token->ptrlist = regexPtrlistCreate(&(token->out_b))) == NULL) {
+    if((token->ptrlist = regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
         return 0;
     }
     if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL, 0, 0)) {
@@ -3327,8 +3324,8 @@ int regexOperatorZeroOrMoreCreate(regex_fragment_t **stack, regex_token_t *token
     return 1;
 }
 
-int regexOperatorOneOrMoreCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_fragment_t *e;
+int regexOperatorOneOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
+    regex_token_t *e;
 
     if((e = regexTokenStackPop(stack)) == NULL) {
         return 0;
@@ -3336,15 +3333,15 @@ int regexOperatorOneOrMoreCreate(regex_fragment_t **stack, regex_token_t *token)
     token->tokenType = eTokenSplit;
     token->out_a = e;
     regexPtrlistPatch(e->ptrlist, token);
-    if((e->ptrlist = regexPtrlistCreate(&(token->out_b))) == NULL) {
+    if((e->ptrlist = regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, e);
     return 1;
 }
 
-int regexOperatorMatchCreate(regex_fragment_t **stack) {
-    regex_fragment_t *e;
+int regexOperatorMatchCreate(regex_token_t **stack) {
+    regex_token_t *e;
     regex_token_t *token = NULL;
 
     if((e = regexTokenStackPop(stack)) == NULL) {
@@ -3359,8 +3356,8 @@ int regexOperatorMatchCreate(regex_fragment_t **stack) {
     return 1;
 }
 
-int regexOperatorReturnCreate(regex_fragment_t **stack) {
-    regex_fragment_t *e;
+int regexOperatorReturnCreate(regex_token_t **stack) {
+    regex_token_t *e;
     regex_token_t *token = NULL;
 
     if((e = regexTokenStackPop(stack)) == NULL) {
@@ -3375,12 +3372,12 @@ int regexOperatorReturnCreate(regex_fragment_t **stack) {
     return 1;
 }
 
-int regexHasSufficientOperands(regex_fragment_t *fragments, int arity) {
+int regexHasSufficientOperands(regex_token_t *fragments, int arity) {
     for(; ((fragments != NULL) && (arity)); arity--, fragments = fragments->next);
     return arity == 0;
 }
 
-eRegexCompileStatus_t regexOperatorApply(regex_token_t **operators, eRegexOpApply apply, eRegexToken_t tokenType, regex_fragment_t **operands) {
+eRegexCompileStatus_t regexOperatorApply(regex_token_t **operators, eRegexOpApply apply, eRegexToken_t tokenType, regex_token_t **operands) {
     regex_token_t *operator;
 
     while((apply == OP_ALL && *operators != NULL) ||
@@ -3432,10 +3429,10 @@ eRegexCompileStatus_t regexOperatorApply(regex_token_t **operators, eRegexOpAppl
 
 #define SET_YARD_RESULT(res)    status = res; goto ShuntingYardFailure;
 
-eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_token_t **tokens, regex_fragment_t **root_stack,
+eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_token_t **tokens, regex_token_t **root_stack,
                                                 int sub_expression, unsigned int group_flags) {
     regex_token_t *token = NULL, *routine, *operators = NULL;
-    regex_fragment_t *operands = NULL, *subexpr;
+    regex_token_t *operands = NULL, *subexpr;
     regex_subroutine_t *subindex;
     eRegexCompileStatus_t status;
     int group_num;
@@ -3515,7 +3512,6 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
                     }
                 }
                 if(token->flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
-                    checkBarrier(build);
                     if((subindex = regexSubroutineIdxGet(build, token->sub_index)) == NULL) {
                         SET_YARD_RESULT(eCompileInternalError);
                     }
@@ -3604,7 +3600,7 @@ ShuntingYardFailure:
 }
 
 eRegexCompileStatus_t regexShuntingYard(regex_vm_build_t *build, regex_token_t **tokens) {
-    regex_fragment_t *stack = NULL;
+    regex_token_t *stack = NULL;
     eRegexCompileStatus_t status;
 
     status = regexShuntingYardFragment(build, tokens, &stack, REGEX_SHUNTING_YARD_NO_PARENT, 0);
@@ -4229,7 +4225,6 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
         return ctx->status;
     }
 
-    printf("RE: compile\n");
     memset(ctx, 0, sizeof(regex_compile_ctx_t));
     ctx->pattern = pattern;
     ctx->status = eCompileOk;
@@ -4243,7 +4238,6 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
     // Parse the regex pattern into a sequence of tokens (operators and operands)
     // The output of this stage is a sequence of lexical tokens in infix form
 
-    printf("RE: tokenize\n");
     if((ctx->status = regexTokenizePattern(ctx->pattern, &(ctx->position),
                                            &(build.tokens), &build)) != eCompileOk) {
         regexTokenDestroy(build.tokens, 1);
@@ -4258,14 +4252,12 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
     // yard algorithm. This is then converted into a VM bytecode sequence, for
     // runtime evaluation.
 
-    printf("RE: shunting yard\n");
     if((ctx->status = regexShuntingYard(&build, &(build.tokens))) != eCompileOk) {
         regexVMBuildDestroy(&build);
         ctx->vm = NULL;
         return ctx->status;
     }
 
-    printf("RE: vm\n");
     if(!regexVMProgramGenerate(&build, build.tokens)) {
         regexVMBuildDestroy(&build);
         regexSubroutineIdxFree(&build);
@@ -4280,8 +4272,6 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
 
     build.vm->size = build.pc;
     ctx->vm = build.vm;
-
-    printf("RE: done\n");
 
     return eCompileOk;
 }
