@@ -9,6 +9,8 @@
 #define MOJO_REGEX_UNICODE
 #define MOJO_REGEX_IMPLEMENTATION
 
+//#define MOJO_REGEX_EXPERIMENTAL_CULL_JMP
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +19,8 @@
     Flags
     --------------------------
     caseinsensitive - TODO
-        Treat the entire pattern as case insensitive.
+        Treat the entire pattern as case insensitive, may be limited to ASCII
+        only, due to program overhead.
     nocapture - TODO
         Subexpressions are not captured. Simplifies compilation, parsing, and
         lowers runtime memory overhead.
@@ -56,6 +59,8 @@
         \p{__} - any unicode property set, when registered with regexRegUnicodeCharClass()
         \B - match a byte (differs from . in that it always matches a single byte, even '\n')
         \R{name} - calls a subroutine (previously defined with (?R<name>...))
+        ^ - start of line (assertion, non consuming)
+        $ - end of line (assertion, non consuming) [see eTokenMatch]
 
     Note on utf8 support:
         clang follows sane expectations and converts \u#### into utf8 encoding
@@ -90,8 +95,6 @@
         \P inverts unicode category class - currently crashes
         \X full unicode letter glyph (may be multiple chars, includes marker glyphs)
             "\P{M}\p{M}*"
-        ^  start of string (assertion, non consuming)
-        $  end of string (assertion, non consuming) [see eTokenMatch]
         \< match start of word (assertion, non consuming, ASCII only)
         \> match end of word (assertion, non consuming, ASCII only)
         (?i...) case insensitive flag
@@ -102,6 +105,10 @@
                       1 jmp 2   -->   0 jmp 2
                       2 jmp 4         1 ...
                       3 ...
+                NOTE: redundant jmp culling implemented, but causes infinite
+                loops for '+' and '*' quantifiers, as jmp, split, call, and
+                return are "no text advance" operators, and the lockstep thread
+                execution spins. Why does this NOT happen without culling?
             reduce '?', '+', and '*' quantifiers on char literal:
                 '?'   0 split 1, 2
                       1 char 'a'    -->  0 char 'a', 1
@@ -122,6 +129,8 @@
             unicode mode
         case insensitive global flag
         no capture global flag
+        make evaluation greedy (thread's should run to exhaustion. need to look
+            into potential no-advance loops)
 
     TODO: Future work (refining, not MVP critical)
         tag meta char class -> char class -> vm path, for better runtime debug
@@ -135,6 +144,12 @@
             char literal w/ no match program counter
             match w/ end of input flag
             utf8 class w/ leading low bytes, inverse flag
+        experimental:
+            byte, anychar w/ no match program counter
+                useful for zero-or-one instruction reduction (2 instrs -> 1 instr)
+            to the absurdist extreme: string literal and char class w/ no match program counter
+                ?,+ reduction from 2 to 1 instrs
+                * reduction from 3 to 1 instrs
 
 Regex VM Bytecode (v7)
 
@@ -158,7 +173,7 @@ Regex VM Bytecode (v7)
         eTokenCall              A       program counter
         eTokenReturn            B
         eTokenByte              C
-        <reserved>              D
+        eTokenAssertion         D       attribute flag
         <reserved>              E
         <reserved>              F
 
@@ -212,6 +227,15 @@ Regex VM Bytecode (v7)
         This instruction explicitly matches the any single byte. This differs
         from both eTokenCharAny and eTokenCharAnyDotAll in that it always
         matches newline, and always matches a single byte.
+
+    Note about eTokenAssertion:
+        This instruction is a non-consuming state assertion. The attribute flag
+        indicates the condition to assert, failing to match if the condition is
+        not met:
+            1 - start of line ('^')
+            2 - end of line ('$')
+            3 - start of word ('\<')
+            4 - end of word ('\>')
 
 All VM programs are prefixed with:
 
@@ -542,13 +566,14 @@ typedef enum {
     eTokenCall,             // 10
     eTokenReturn,
     eTokenByte,
+    eTokenAssertion,
     // Abstractions, reduced down to the above VM opcodes
     eTokenConcatenation,
     eTokenAlternative,
     eTokenZeroOrOne,
     eTokenZeroOrMany,
-    eTokenOneOrMany,
-    eTokenSubExprStart,     // 20
+    eTokenOneOrMany,        // 20
+    eTokenSubExprStart,
     eTokenSubExprEnd,
     eTokenUnknown // <-- this should always be the last token enum
 } eRegexToken_t;
@@ -573,6 +598,25 @@ typedef unsigned int uint32_t;
 
 // char any
 #define REGEX_TOKEN_FLAG_DOTALL     0x1u
+
+// assertions
+#define REGEX_TOKEN_FLAG_START_OF_LINE  0x1u
+#define REGEX_TOKEN_FLAG_END_OF_LINE    0x2u
+#define REGEX_TOKEN_FLAG_START_OF_WORD  0x4u
+#define REGEX_TOKEN_FLAG_END_OF_WORD    0x8u
+
+// VM attribute flags
+// char any
+#define REGEX_VM_FLAG_DOTALL        0x1u
+
+// char literal
+#define REGEX_VM_FLAG_CHAR_INVERSE  0x2000u
+
+// assertions
+#define REGEX_VM_FLAG_START_OF_LINE 0x1u
+#define REGEX_VM_FLAG_END_OF_LINE   0x2u
+#define REGEX_VM_FLAG_START_OF_WORD 0x4u
+#define REGEX_VM_FLAG_END_OF_WORD   0x8u
 
 typedef enum {
     eRePtrOutA,
@@ -749,6 +793,13 @@ void regexPrinter_eTokenSubExprStart(FILE *fp, regex_token_t *token) {
     if(token->flags & REGEX_TOKEN_FLAG_CASEINS) { fputs(", case insensitive", fp); }
 }
 
+void regexPrinter_eTokenAssertion(FILE *fp, regex_token_t *token) {
+    if(token->flags & REGEX_TOKEN_FLAG_START_OF_LINE) { fputs("start of line (^)", fp); }
+    if(token->flags & REGEX_TOKEN_FLAG_END_OF_LINE) { fputs("end of line ($)", fp); }
+    if(token->flags & REGEX_TOKEN_FLAG_START_OF_WORD) { fputs("start of word (\\<)", fp); }
+    if(token->flags & REGEX_TOKEN_FLAG_END_OF_WORD) { fputs("end of word (\\>)", fp); }
+}
+
 // Token VM instruction printers
 
 void regexPrintVM_eTokenCharLiteral(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
@@ -813,6 +864,14 @@ void regexPrintVM_eTokenByte(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsi
     fprintf(fp, "byte");
 }
 
+void regexPrintVM_eTokenAssertion(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
+    fprintf(fp, "assertion ");
+    if(oper_a & REGEX_VM_FLAG_START_OF_LINE) { fputs("(^)", fp); }
+    if(oper_a & REGEX_VM_FLAG_END_OF_LINE) { fputs("($)", fp); }
+    if(oper_a & REGEX_VM_FLAG_START_OF_WORD) { fputs("(\\<)", fp); }
+    if(oper_a & REGEX_VM_FLAG_END_OF_WORD) { fputs("(\\>)", fp); }
+}
+
 void regexPrintVM_eTokenUnknown(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
     fprintf(fp, "UNKNOWN [0x%4.4X] [0x%4.4X]", oper_a & 0x3FFFu, oper_b & 0x3FFFu);
 }
@@ -853,6 +912,7 @@ regex_token_detail_t _regexTokenDetails[] = {
     RE_TOK_DETAIL_PV(eTokenCall, regexTokenDetailCall, ePriorityNone, eReTokTerminal, 0),
     RE_TOK_DETAIL_NV(eTokenReturn, ePriorityNone, eReTokTerminal, 0),
     RE_TOK_DETAIL_NV(eTokenByte, ePriorityNone, eReTokTerminal, 0),
+    RE_TOK_DETAIL_NV(eTokenAssertion, ePriorityNone, eReTokTerminal, 0),
     RE_TOK_DETAIL_N_(eTokenConcatenation, ePriorityMedium, eReTokNotTerminal, 2),
     RE_TOK_DETAIL_N_(eTokenAlternative, ePriorityMedium, eReTokNotTerminal, 2),
     RE_TOK_DETAIL_N_(eTokenZeroOrOne, ePriorityHigh, eReTokPreceeding, 1),
@@ -1306,7 +1366,6 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
     eRegexCompileStatus_t status;
     regex_subroutine_t *entry = NULL;
 
-    printf("1\n");
     // Is there already a subroutine index entry?
     if((sub_id != NULL) && (*sub_id > 0)) {
         if((entry = regexSubroutineIdxGet(build, *sub_id)) == NULL) {
@@ -1320,7 +1379,6 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
         }
     }
 
-    printf("2\n");
     if(entry == NULL) {
         // We're creating a new entry
         if((pattern == NULL) && (subroutine == NULL) && ((name == NULL) || (nameLen <= 0))) {
@@ -1332,7 +1390,6 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
         }
     }
 
-    printf("3\n");
     if((subroutine != NULL) && (entry->tokens == NULL)) {
         if((*subroutine == NULL) && (pattern != NULL)) {
             if((status = regexTokenizePattern(pattern, &pos, subroutine, build)) != eCompileOk) {
@@ -1351,13 +1408,11 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
         }
         entry->name[nameLen] = '\0';
     }
-    printf("4\n");
     if(tokens != NULL) {
         if(!regexTokenCreate(tokens, eTokenCall, entry->id, NULL, 0, 0)) {
             return eCompileOutOfMem;
         }
     }
-    printf("5\n");
     if(sub_id != NULL) {
         *sub_id = entry->id;
     }
@@ -1555,6 +1610,12 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
                 result.c = *(*pattern + 1);
                 return result;
 
+            case '<': // start of word assertion
+            case '>': // end of word assertion
+                result.state = eRegexPatternMetaChar;
+                result.c = *(*pattern + 1);
+                return result;
+
             default:
                 result.state = eRegexPatternInvalid;
                 return result;
@@ -1565,12 +1626,12 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
         case '?':   // zero or one
         case '.':   // character (may be multi byte for UTF8)
         case '*':   // zero or more (kleene)
-        case '^':   // start of string assertion
+        case '^':   // start of line assertion
         case '+':   // one or more
         case '(':   // subexpression start
         case '[':   // character class start
         case ')':   // subexpression end
-        case '$':   // end of string assertion
+        case '$':   // end of line assertion
             result.c = **pattern;
             result.state = eRegexPatternMetaChar;
             return result;
@@ -3094,6 +3155,30 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                         }
                         continue;
 
+                    case '^':
+                        if(!regexTokenCreate(tokens, eTokenAssertion, REGEX_TOKEN_FLAG_START_OF_LINE, 0, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
+                    case '$':
+                        if(!regexTokenCreate(tokens, eTokenAssertion, REGEX_TOKEN_FLAG_END_OF_LINE, 0, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
+                    case '<':
+                        if(!regexTokenCreate(tokens, eTokenAssertion, REGEX_TOKEN_FLAG_START_OF_WORD, 0, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
+                    case '>':
+                        if(!regexTokenCreate(tokens, eTokenAssertion, REGEX_TOKEN_FLAG_END_OF_WORD, 0, 0, 0)) {
+                            SET_RESULT(eCompileOutOfMem);
+                        }
+                        continue;
+
                     default:
                         // Unexpected meta character
                         SET_RESULT(eCompileInternalError);
@@ -3297,7 +3382,11 @@ int regexOperatorAlternationCreate(regex_token_t **stack, regex_token_t *token) 
     if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL, 0, 0)) {
         return 0;
     }
+#ifdef MOJO_REGEX_EXPERIMENTAL_CULL_JMP
+    if(regexPtrlistPatch(&(e1->ptrlist), jmp, 1) == 0) {
+#else // !MOJO_REGEX_EXPERIMENTAL_CULL_JMP
     if(regexPtrlistPatch(&(e1->ptrlist), jmp, 0) == 0) {
+#endif
         // The jmp token was unused
         regexTokenDestroy(jmp, 0);
         token->ptrlist = e1->ptrlist;
@@ -3490,6 +3579,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
             case eTokenUtf8Class:
             case eTokenCharAny:
             case eTokenByte:
+            case eTokenAssertion:
             case eTokenReturn:
             case eTokenMatch:
                 if(!regexOperatorLiteralCreate(&operands, token)) {
@@ -3954,6 +4044,9 @@ int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_token_t *token, r
                 }
             }
             break;
+        case eTokenAssertion:
+            idx_a = token->c;
+            break;
         default:
             break;
     }
@@ -4350,6 +4443,7 @@ struct regex_thread_s {
 typedef struct regex_eval_s regex_eval_t;
 struct regex_eval_s {
     const char *sp;
+    int start_of_line;
     int len;
     int pos;
     regex_thread_t *thread;
@@ -4533,12 +4627,12 @@ regex_eval_t *regexEvalCreate(regex_vm_t *vm, const char *pattern, int len) {
 
     eval->vm = vm;
     eval->sp = pattern;
+    eval->start_of_line = 1;
     if(len == REGEX_STR_NULL_TERMINATED) {
         eval->len = strlen(pattern);
     } else {
         eval->len = len;
     }
-    printf("Evaluating str len %d\n", eval->len);
 
     return eval;
 }
@@ -4618,6 +4712,7 @@ int regexVMNoTextAdvance(unsigned int instr) {
         case eTokenSave:
         case eTokenCall:
         case eTokenReturn:
+        case eTokenAssertion:
             return 1;
         default:
             return 0;
@@ -4633,13 +4728,13 @@ typedef enum {
     eEvalContinue = 2
 } eRegexEvalResult;
 
-eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, int complete) {
+eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, int complete, unsigned char c) {
     const unsigned int *bitmap;
     const char *str;
     int len;
     int k;
     unsigned int instr[3];
-    unsigned char c = *eval->sp;
+    int final = ((eval->pos == eval->len) ? 1 : 0);
 #ifdef MOJO_REGEX_VM_DEBUG
     int first = 1;
 #endif // MOJO_REGEX_VM_DEBUG
@@ -4719,6 +4814,30 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                     return eEvalInternalError;
                 }
                 break;
+            case eTokenAssertion:
+                switch(instr[1]) {
+                    default:
+                        return eEvalInternalError;
+                    case REGEX_VM_FLAG_START_OF_LINE:
+                        if(!eval->start_of_line) {
+                            printf("not start of line? %d\n", eval->start_of_line);
+                            return eEvalNoMatch;
+                        }
+                        thread->pc++;
+                        break;
+                    case REGEX_VM_FLAG_END_OF_LINE:
+                        if((c == '\0') || (c == '\n')) {
+                            thread->pc++;
+                            break;
+                        }
+                        return eEvalNoMatch;
+                    case REGEX_VM_FLAG_START_OF_WORD:
+                    case REGEX_VM_FLAG_END_OF_WORD:
+                        // TODO
+                        thread->pc++;
+                        break;
+                }
+                break;
             default:
                 return eEvalInternalError;
         }
@@ -4732,6 +4851,9 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
         first = 0;
     }
 #endif // MOJO_REGEX_VM_DEBUG
+    if(final) {
+        return eEvalNoMatch;
+    }
     REGEX_VM_INSTR_DECODE(instr, eval->vm, thread->pc);
     switch(instr[0]) {
         case eTokenCharLiteral:
@@ -4777,7 +4899,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
             thread->pc++;
             return eEvalMatch;
         case eTokenCharAny:
-            if((instr[1] != REGEX_TOKEN_FLAG_DOTALL) && (*eval->sp == '\n')) {
+            if((instr[1] != REGEX_TOKEN_FLAG_DOTALL) && (c == '\n')) {
                 return eEvalNoMatch;
             }
             if(1) { // unicode mode
@@ -4815,6 +4937,7 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
     regex_thread_t *thread;
     size_t capture_size;
     size_t compound_size;
+    int final;
     int k;
 
     if(vm->vm_version != REGEX_VM_MACHINE_VERSION) {
@@ -4834,10 +4957,15 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
         return NULL;
     }
 
-    for(; eval->pos < eval->len; eval->sp++, eval->pos++) {
+    for(; eval->pos <= eval->len; eval->sp++, eval->pos++) {
+        final = (eval->pos == eval->len);
 #ifdef MOJO_REGEX_VM_DEBUG
         if(eval->debug != NULL) {
-            fprintf(eval->debug, "[%2d] (%c:%3d)\n", eval->pos, *eval->sp, *eval->sp);
+            if(final) {
+                fputs("End of input", eval->debug);
+            } else {
+                fprintf(eval->debug, "[%2d] (%c:%3d)%s\n", eval->pos, *eval->sp, *eval->sp, ((eval->start_of_line ? " start of line" : "")));
+            }
         }
 #endif // MOJO_REGEX_VM_DEBUG
         //printf("Pos %d (of %d): (%c:%3d)\n", eval->pos, eval->len, *eval->sp, *eval->sp);
@@ -4853,7 +4981,7 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
             }
 #endif // MOJO_REGEX_VM_DEBUG
             eval->thread = thread->next;
-            switch(regexThreadProcess(eval, thread, anchored)) {
+            switch(regexThreadProcess(eval, thread, anchored, (final ? '\0' : *eval->sp))) {
                 default:
                 case eEvalStackOverrun:
                 case eEvalInternalError:
@@ -4885,6 +5013,9 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
                     break;
             }
         }
+        if(final) {
+            eval->start_of_line = (*(eval->sp) == '\n');
+        }
     }
 
     for(thread = eval->thread; thread != NULL; thread = thread->next) {
@@ -4904,6 +5035,9 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
 
 FoundMatch:
 
+    if(final) {
+        eval->sp--;
+    }
     // Expects "thread" to be the success thread
     capture_size = sizeof(char *) * 2 * vm->group_tbl_size;
     compound_size = regexThreadCompoundCalcMatchBufferSize(vm, thread);
@@ -5074,7 +5208,7 @@ int main(int argc, char **argv) {
             regexEmitEscapedStr(stdout, argv[2], (int)strlen(argv[2]));
             printf("]\n");
 #ifdef MOJO_REGEX_VM_DEBUG
-            if((match = regexMatch(result.vm, argv[2], REGEX_STR_NULL_TERMINATED, 0, stdout)) == NULL) {
+            if((match = regexMatch(result.vm, argv[2], REGEX_STR_NULL_TERMINATED, 1, stdout)) == NULL) {
 #else // !MOJO_REGEX_VM_DEBUG
             if((match = regexMatch(result.vm, argv[2], REGEX_STR_NULL_TERMINATED, 0)) == NULL) {
 #endif // MOJO_REGEX_VM_DEBUG

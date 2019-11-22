@@ -21,6 +21,8 @@ Supported operations:
 | `a*`     | zero or many                         |
 | `a+`     | one or many                          |
 | `.`      | any character except newline         |
+| `^`      | start of line assertion (non-consuming) |
+| `$`      | end of line assertion (non-consuming) |
 
 Meta and control characters may be escaped (by prefixing with backslash) to include
  their literal values. Escaping a non standard control character or a non-meta
@@ -368,15 +370,12 @@ regex_vm_t *myparser = &_myparser;
 
 ### Future improvements
 
-* Start of string assertion `^` (_non consuming_)
-* End of string assertion `$` (_non consuming_)
 * Start of word assertion `\<`, that only matches when a word character follows
     a non-word character (_non consuming_)
 * End of word assertion `\>`, that only matches when a word character preceeds a
     non-word character (_non consuming_)
 * Inline case insensitive match modifier `(?i)`
 * Global case insensitive matching flag
-* Unanchored matches (_currently can be done with an explicit `.*` prefix_)
 * Counter repetition (_range_) plurality operator `{n,m}`
 * Convert to a single file header library (_ala Sean Barrett's example_)
 * Pattern normalization:
@@ -387,15 +386,12 @@ regex_vm_t *myparser = &_myparser;
 * Flag: `caseinsensitive` - treat the entire pattern as case insensitive.
 * Flag: `nocapture` - subexpressions are not captured. Simplifies compilation,
     parsing, and lowers runtime memory overhead.
-* Flag: `dotall` - `.` matches ANY character (_default is any EXCEPT newline_)
 * unicode:
-    * Handle utf8 codepoints with the dot metacharacter.
     * Match a full unicode glyph `\X` (_may be multiple chars, and may include
         additional marker glyphs_)
-    * Flag: `unicode` - explicitly handle unicode (_with ascii being the default_).
-        This would simplify patterns that do not need utf8 support.
     * Update unicode db parser to handle arbitrary character groups and
         property sets, prebuild unicode class trees
+    * Handle inverted property sets (`\P`)
 
 ### Regex VM Bytecode (_v2_) \[Needs updating]
 
