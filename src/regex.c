@@ -1090,14 +1090,27 @@ regex_ptrlist_t *regexPtrlistAppend(regex_ptrlist_t *lista, regex_ptrlist_t *lis
     return lista;
 }
 
-void regexPtrlistPatch(regex_ptrlist_t *list, regex_token_t *token) {
-    for(; list != NULL; list = list->next) {
-        if(list->type == eRePtrOutA) {
-            list->token->out_a = token;
-        } else {
-            list->token->out_b = token;
+int regexPtrlistPatch(regex_ptrlist_t **list, regex_token_t *token, int noJmps) {
+    regex_ptrlist_t *jmps = NULL, *next, *walk;
+    int patched = 0;
+
+    for(walk = *list; walk != NULL; walk = next) {
+        next = walk->next;
+        if(noJmps && (walk->token->tokenType = eTokenJmp)) {
+            walk->next = jmps;
+            jmps = walk;
+            continue;
         }
+        if(walk->type == eRePtrOutA) {
+            walk->token->out_a = token;
+        } else {
+            walk->token->out_b = token;
+        }
+        _regexDealloc(walk, _regexMemContext);
+        patched++;
     }
+    *list = jmps;
+    return patched;
 }
 
 void regexPtrListFree(regex_ptrlist_t *list) {
@@ -3264,7 +3277,7 @@ int regexOperatorConcatenationCreate(regex_token_t **stack, regex_token_t *token
        ((e1 = regexTokenStackPop(stack)) == NULL)) {
         return 0;
     }
-    regexPtrlistPatch(e1->ptrlist, e2);
+    regexPtrlistPatch(&(e1->ptrlist), e2, 0);
     e1->ptrlist = e2->ptrlist;
     e2->ptrlist = NULL;
     regexTokenStackPush(stack, e1);
@@ -3284,11 +3297,16 @@ int regexOperatorAlternationCreate(regex_token_t **stack, regex_token_t *token) 
     if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL, 0, 0)) {
         return 0;
     }
-    regexPtrlistPatch(e1->ptrlist, jmp);
-    if((token->ptrlist = regexPtrlistCreate(jmp, eRePtrOutA)) == NULL) {
-        return 0;
+    if(regexPtrlistPatch(&(e1->ptrlist), jmp, 0) == 0) {
+        // The jmp token was unused
+        regexTokenDestroy(jmp, 0);
+        token->ptrlist = e1->ptrlist;
+        e1->ptrlist = NULL;
+    } else {
+        if((token->ptrlist = regexPtrlistCreate(jmp, eRePtrOutA)) == NULL) {
+            return 0;
+        }
     }
-
     token->tokenType = eTokenSplit;
     token->out_a = e1;
     token->out_b = e2;
@@ -3333,7 +3351,7 @@ int regexOperatorZeroOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
         return 0;
     }
     jmp->out_a = token;
-    regexPtrlistPatch(e->ptrlist, jmp);
+    regexPtrlistPatch(&(e->ptrlist), jmp, 0);
     regexTokenStackPush(stack, token);
 
     return 1;
@@ -3347,7 +3365,7 @@ int regexOperatorOneOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    regexPtrlistPatch(e->ptrlist, token);
+    regexPtrlistPatch(&(e->ptrlist), token, 0);
     if((e->ptrlist = regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
         return 0;
     }
@@ -3365,7 +3383,7 @@ int regexOperatorMatchCreate(regex_token_t **stack) {
     if(!regexTokenCreate(&token, eTokenMatch, 0, NULL, 0, 0)) {
         return 0;
     }
-    regexPtrlistPatch(e->ptrlist, token);
+    regexPtrlistPatch(&(e->ptrlist), token, 0);
     regexTokenStackPush(stack, e);
 
     return 1;
@@ -3381,7 +3399,7 @@ int regexOperatorReturnCreate(regex_token_t **stack) {
     if(!regexTokenCreate(&token, eTokenReturn, 0, NULL, 0, 0)) {
         return 0;
     }
-    regexPtrlistPatch(e->ptrlist, token);
+    regexPtrlistPatch(&(e->ptrlist), token, 0);
     regexTokenStackPush(stack, e);
 
     return 1;
@@ -4520,6 +4538,7 @@ regex_eval_t *regexEvalCreate(regex_vm_t *vm, const char *pattern, int len) {
     } else {
         eval->len = len;
     }
+    printf("Evaluating str len %d\n", eval->len);
 
     return eval;
 }
@@ -4664,7 +4683,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                     return eEvalOutOfMem;
                 }
                 thread->pc = instr[2];
-                continue;
+                break;
             case eTokenMatch:
                 if((complete || instr[1]) && eval->pos == eval->len) {
                     return eEvalMatch;
@@ -4675,7 +4694,7 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                 return eEvalNoMatch;
             case eTokenJmp:
                 thread->pc = instr[1];
-                continue;
+                break;
             case eTokenCall:
                 for(k = 0; k < REGEX_THREAD_CALLSTACK_MAX_DEPTH; k++) {
                     if(thread->callstack[k] == -1) {
@@ -4815,12 +4834,13 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
         return NULL;
     }
 
-    for(; eval->pos != eval->len; eval->sp++, eval->pos++) {
+    for(; eval->pos < eval->len; eval->sp++, eval->pos++) {
 #ifdef MOJO_REGEX_VM_DEBUG
         if(eval->debug != NULL) {
             fprintf(eval->debug, "[%2d] (%c:%3d)\n", eval->pos, *eval->sp, *eval->sp);
         }
 #endif // MOJO_REGEX_VM_DEBUG
+        //printf("Pos %d (of %d): (%c:%3d)\n", eval->pos, eval->len, *eval->sp, *eval->sp);
         if(eval->queue == NULL) {
             break;
         }
