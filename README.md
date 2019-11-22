@@ -26,26 +26,31 @@ Meta and control characters may be escaped (by prefixing with backslash) to incl
  their literal values. Escaping a non standard control character or a non-meta
  character is an error. Supported escape values are:
 
-| Escape   | Value                    |
-| -------- | -------------------------|
-| `\a`     | alarm (bell)             |
-| `\b`     | backspace                |
-| `\e`     | escape (0x1B)            |
-| `\f`     | formfeed                 |
-| `\n`     | newline                  |
-| `\r`     | return                   |
-| `\t`     | tab                      |
-| `\v`     | vertical tab             |
-| `\0`     | null char                |
-| `\.`     | period                   |
-| `\(`     | literal open parenthesis |
-| `\[`     | literal open bracket     |
-| `\\|`    | literal pipe             |
-| `\?`     | literal question mark    |
-| `\+`     | literal plus sign        |
-| `\*`     | literal asterisk         |
-| `\x##`   | hex byte                 |
-| `\u####` | unicode char point (_not yet fully supported_) |
+| Escape   | Value                    | Notes            |
+| -------- | ------------------------ | ---------------- |
+| `\a`     | alarm (bell)             |  |
+| `\b`     | backspace                |  |
+| `\e`     | escape (0x1B)            |  |
+| `\f`     | formfeed                 |  |
+| `\n`     | newline                  |  |
+| `\r`     | return                   |  |
+| `\t`     | tab                      |  |
+| `\v`     | vertical tab             |  |
+| `\0`     | null char                |  |
+| `\.`     | period                   |  |
+| `\(`     | literal open parenthesis |  |
+| `\[`     | literal open bracket     |  |
+| `\\|`    | literal pipe             |  |
+| `\?`     | literal question mark    |  |
+| `\+`     | literal plus sign        |  |
+| `\*`     | literal asterisk         |  |
+| `\x##`   | hex byte                 |  |
+| `\u####` | unicode char point       | For codepoints `0` - `0xFFFF`         |
+| `\U######` | Unicode char point     | For codepoints `0x10000` - `0x10FFFF` |
+| `\R{name}` | Subroutine call        | _Non-standard_. Calls a subroutine previously defined by `(?R<name>...)` | 
+| `\B`     | match a single byte      | _Non-standard_. Always matches a single byte, including newline. |
+| `\p{class}` | Match a unicode property set codepoint | Integrated classes are listed below. |
+| `\P{class}` | Match a unicode codepoint _NOT_ in the property set. | _TODO: not yet implemented_. Integrated classes are listed below. |
 
 Meta classes are shortcuts for common character classes. Currently implemented
 meta classes are:
@@ -59,8 +64,23 @@ meta classes are:
 | `\w`   | `[a-zA-Z0-9_]`   |
 | `\W`   | `[^a-zA-Z0-9_]`  |
 
-Subexpressions (groups) are supported. Group capture is available. The current
-implementation captures that longest superset of an subexpression and it's
+Certain unicode property classes are incorporated directly into the library. These
+class definitions were generated from the Unicode DB, using the
+`extract_unicode_props.py` Python script. Unicode property clases use the following
+metacharacters:
+
+| Class  | Property set contents |
+| ------ | --------------------- |
+| `L`    | Letters (_Note: `L` != `Ll` + `Lu`_) |
+| `Ll`   | Lowercase letters     |
+| `Lu`   | Uppercase letters     |
+| `M`    | Combining marks       |
+| `P`    | Punctuation           |
+| `Z`    | Whitespace            |
+| `N`    | Numeric digit         |
+
+Subexpressions (groups) are supported. Group capture is available. By default,
+the implementation captures that longest superset of an subexpression and it's
 plurality modifier (+, *, ?). For example, given the pattern:
 
 * `abc(foo)+def`
@@ -72,12 +92,34 @@ matched pattern_). Thus, given the evaluation string:
 
 the captured value of group 1 is `foofoofoo`.
 
-Named groups are supported using PCRE syntax:
+There are several prefix attributes that may be applied to a subexpression:
 
-* `(?P<name>...)`
+| Meta attr       | Description |
+| --------------- | ---------------
+| `(?P<name>...)` | Name the subexpression, for capture retrieval reference. |
+| `(?:...)`       | Define the subexpression as non-capturing. |
+| `(?*...)`       | Capture compound subexpressions (_see description below_) |
+| `(?R<name>...)` | Create a named subroutine, a sub pattern that can be reused later with `\R{name}`. |
+| `(?i...)`       | case insensitive match - _TODO: not yet implemented._ |
 
-The current implementation is primarily limited to the ASCII character set and
-conventions. Unicode utf8 support is planned.
+Multiple subexpression meta attribute prefixes may be defined, but must be at the
+head of the subexpression. Additional meta's must include their own unique 
+`?` prefix, ie.: `(?:?P<name>...)`. Not all permutations are valid:
+
+* `(?P<name>...)` and `(?:...)` are mutually exclusive (why name something unused?).
+* `(?:...)` and `(?*...)` are mutually exclusive (compound non-captures?).
+* `(?P<name>...)` and `(?R<name>...)` are mutually exclusive. Subexpressions
+        are not generated "in-line", but are called out of order using the call/
+        return instructions. A subroutine may be wrapped in a named subexpression
+        however.
+* `(?R<name>...)` and `(?*...)` are mutually exclusive, as a subroutine is not
+        a capturing expression.
+
+If the subexpression is marked as compound, then, in addition to the normal
+capture semantics mentioned above, each unique match of the base expression is also
+capture. For example, given the pattern `abc(f.o)+def`, and the evaluation string
+`abcfoofiofyodef`, the captured value of the group would be `foofiofyo`, and the
+compound capture values would be `foo`, `fio`, and `fyo`. 
 
 ### API
 
