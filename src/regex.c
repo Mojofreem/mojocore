@@ -225,12 +225,17 @@ All VM programs are prefixed with: TODO
     At runtime, if a partial match is requested, execution begins at 0. If a
     full match is requested, execution begins at 3.
 
+Test 0: a(?P<foolio>\Bcd(?i\w*[hijk](?*f.o)+)?)\d+cat
+        abcdefgefgjfoofwofyo8167287catfoo
+
 Test 1: a(?P<foolio>bcd(?iefg*[hijk]foo)?)[0-9]+cat
         abcdefgefgjfoo8167287catfoo
 
 Test 2: a(?P<foolio>?i\Bcd(?i(?R<chunk>efg[hijk])(?*f.o)*)?)(?R<digits>\d+)c\p{L}+\R{digits}
         abcdefgjfoofoofoo033195cat72364ghj
-*/
+
+
+ */
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -1299,6 +1304,7 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
     eRegexCompileStatus_t status;
     regex_subroutine_t *entry = NULL;
 
+    printf("1\n");
     // Is there already a subroutine index entry?
     if((sub_id != NULL) && (*sub_id > 0)) {
         if((entry = regexSubroutineIdxGet(build, *sub_id)) == NULL) {
@@ -1312,6 +1318,7 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
         }
     }
 
+    printf("2\n");
     if(entry == NULL) {
         // We're creating a new entry
         if((pattern == NULL) && (subroutine == NULL) && ((name == NULL) || (nameLen <= 0))) {
@@ -1323,6 +1330,7 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
         }
     }
 
+    printf("3\n");
     if((subroutine != NULL) && (entry->tokens == NULL)) {
         if((*subroutine == NULL) && (pattern != NULL)) {
             if((status = regexTokenizePattern(pattern, &pos, subroutine, build)) != eCompileOk) {
@@ -1341,11 +1349,13 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
         }
         entry->name[nameLen] = '\0';
     }
+    printf("4\n");
     if(tokens != NULL) {
         if(!regexTokenCreate(tokens, eTokenCall, entry->id, NULL, 0, 0)) {
             return eCompileOutOfMem;
         }
     }
+    printf("5\n");
     if(sub_id != NULL) {
         *sub_id = entry->id;
     }
@@ -1419,6 +1429,7 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
                 return result;
 
             case 'p': // unicode class
+            case 'P': // unicode class (inverted)
                 if(*(*pattern + 2) == '{') {
                     classId[0] = *(*pattern + 3);
                     if((classId[0] == '\0') || (classId[0] == '}')) {
@@ -1438,6 +1449,9 @@ parseChar_t parseGetNextPatternChar(const char **pattern) {
                     } else {
                         result.state = eRegexPatternUnicodeMetaClass;
                         result.c = classId[0] | (classId[1] << 8);
+                        if(*(*pattern + 1) == 'P') {
+                            result.c |= 0x10000;
+                        }
                     }
                     return result;
                 }
@@ -2146,7 +2160,8 @@ int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus_t *st
     // Preset to OoM, change to eCompileOk on success
     *status = eCompileOutOfMem;
 
-    if(regexSubroutineIdxGetPattern(build, pattern) == NULL) {
+    if(((classId != NULL) && (regexSubroutineIdxGetName(build, classId, strlen(classId)) == NULL)) ||
+       ((classId == NULL) && (regexSubroutineIdxGetPattern(build, pattern) == NULL))) {
         if(!regexTokenCreate(&utf8class, eTokenSubExprStart, 0, NULL, REGEX_TOKEN_FLAG_NOCAPTURE, 0)) {
             return 0;
         }
@@ -2244,7 +2259,7 @@ int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus_t *st
         }
     }
 
-    if((*status = regexSubroutineGenerateFromPattern(tokens, &utf8class, build, pattern, NULL, 0, NULL)) != eCompileOk) {
+    if((*status = regexSubroutineGenerateFromPattern(tokens, &utf8class, build, pattern, classId, 3, NULL)) != eCompileOk) {
         return 0;
     }
 
@@ -2625,6 +2640,10 @@ int parseCharClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_build_t
 
     memset(bitmap, 0, 32);
 
+    if((classId != NULL) && (classId[0] == '^')) {
+        invert = 1;
+    }
+
     c = parseGetNextPatternChar(pattern);
     if(parsePatternIsValid(&c)) {
         parsePatternCharAdvance(pattern);
@@ -2763,21 +2782,29 @@ parseClassCompleted:
 
 int parseUnicodeClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_build_t *build,
                                     int unicodeClass, regex_token_t **tokens) {
-    char classId[3];
+    char classId[4];
     const char *classStr;
+    int invert;
     regex_token_t *utf8class;
 
-    classId[0] = (char)((unsigned int)unicodeClass & 0xFFu);
-    classId[1] = (char)(((unsigned int)unicodeClass & 0xFF00u) >> 8u);
-    classId[2] = '\0';
+    classId[0] = ' ';
+    classId[1] = (char)((unsigned int)unicodeClass & 0xFFu);
+    classId[2] = (char)(((unsigned int)unicodeClass & 0xFF00u) >> 8u);
+    classId[3] = '\0';
 
-    if((classStr = regexRegUnicodeCharClassGet(classId)) == NULL) {
+    invert = ((unicodeClass & 0x10000) ? 1 : 0);
+    if(invert) {
+        classId[0] = '^';
+    }
+
+
+    if((classStr = regexRegUnicodeCharClassGet(classId + 1)) == NULL) {
         *status = eCompileUnknownUnicodeClass;
         return 0;
     }
 
-    if(regexSubroutineIdxGetPattern(build, classStr) != NULL) {
-        if((*status = regexSubroutineGenerateFromPattern(tokens, &utf8class, build, classStr, classId, 2, NULL)) != eCompileOk) {
+    if(regexSubroutineIdxGetName(build, classId, 3) != NULL) {
+        if((*status = regexSubroutineGenerateFromPattern(tokens, NULL, build, NULL, classId, 2, NULL)) != eCompileOk) {
             return 0;
         }
         return 1;
@@ -2924,6 +2951,7 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
     int len;
     char *str;
     unsigned int flags;
+    regex_token_t *subroutine;
     eRegexCompileStatus_t status;
     int subexpr = 0;
     int named;
@@ -3085,7 +3113,10 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                         continue;
                     case 'X': // full unicode glyph (base + markers)
                         // Represented by a micro NFA
-                        // TODO
+                        subroutine = NULL;
+                        if((status = regexSubroutineGenerateFromPattern(tokens, &subroutine, build, "\\p{M}\\p{M}*", NULL, 0, NULL)) != eCompileOk) {
+                            SET_RESULT(status);
+                        }
                         continue;
                     case 'B': // explicit byte
                         if(!regexTokenCreate(tokens, eTokenByte, 0, 0, 0, 0)) {
