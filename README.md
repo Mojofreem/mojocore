@@ -82,7 +82,7 @@ metacharacters:
 _Note on utf8 support_:
 > Clang follows sane expectations and converts \u#### into utf8 encoding
   within a char string. gcc illogically converts \u#### into utf16
-  encoding, even within a char string, and does work properly with the
+  encoding, even within a char string, and does not work properly with the
   evaluator. For gcc, you will need to manually encode utf8 characters.
 
 > There is no standard way to support unicode codepoints. Clang handles

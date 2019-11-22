@@ -14,14 +14,11 @@
 #include <string.h>
 
 /*
-    Flags (TODO)
+    Flags
     --------------------------
-    unicode
-        Handle UTF8 encoded glyphs explicitly. Properly treat multibyte chars
-        as a single "character" in single chars, string, and character classes.
-    caseinsensitive
+    caseinsensitive - TODO
         Treat the entire pattern as case insensitive.
-    nocapture
+    nocapture - TODO
         Subexpressions are not captured. Simplifies compilation, parsing, and
         lowers runtime memory overhead.
     dotall
@@ -66,38 +63,6 @@
         encoding, even within a char string, and does work properly with the
         evaluator. For gcc, you will need to manually encode utf8 characters.
 
-    TODO
-        \X full unicode letter glyph (may be multiple chars, includes marker glyphs)
-            "\P{M}\p{M}*"
-        ^  start of string (assertion, non consuming)
-        $  end of string (assertion, non consuming) [see eTokenMatch]
-        \< match start of word (assertion, non consuming, ASCII only)
-        \> match end of word (assertion, non consuming, ASCII only)
-        \P inverts unicode category class
-        surface subroutine errors during compilation
-        DFA generation rework:
-            cull redundant jmps, and jmps to match/return:
-                ie:   0 jmp 1
-                      1 jmp 2   -->   0 jmp 2
-                      2 jmp 4         1 ...
-                      3 ...
-            reduce '?', '+', and '*' quantifiers on char literal:
-                '?'   0 split 1, 2
-                      1 char 'a'    -->  0 char 'a', 1
-                      2 ...              1 ...
-                '+'   0 char 'a'
-                      1 split 0, 2  -->  1 char 'a', 1
-                      2 ...              2 ...
-                '*'   0 split 1, 3
-                      1 char 'a'    -->  1 char 'a' invert, 1
-                      2 jump             2 ...
-                      3 ...
-            reduce alternation '|' with preceeding char literal:
-                '|'   0 split 1, 3
-                      1 char 'a'    --> 0 char 'a' invert, 3
-                      2 jmp 4           1 ...
-                      3 ...
-
     (?P<name>...)  named subexpressions
     (?:...) non capturing subexpressions
     (?*...) compound subexpressions
@@ -122,8 +87,41 @@
         a capturing expression.
 
     TODO
+        \P inverts unicode category class - currently crashes
+        \X full unicode letter glyph (may be multiple chars, includes marker glyphs)
+            "\P{M}\p{M}*"
+        ^  start of string (assertion, non consuming)
+        $  end of string (assertion, non consuming) [see eTokenMatch]
+        \< match start of word (assertion, non consuming, ASCII only)
+        \> match end of word (assertion, non consuming, ASCII only)
+        (?i...) case insensitive flag
+        surface subroutine errors during compilation
+        DFA generation rework:
+            cull redundant jmps, and jmps to match/return:
+                ie:   0 jmp 1
+                      1 jmp 2   -->   0 jmp 2
+                      2 jmp 4         1 ...
+                      3 ...
+            reduce '?', '+', and '*' quantifiers on char literal:
+                '?'   0 split 1, 2
+                      1 char 'a'    -->  0 char 'a', 1
+                      2 ...              1 ...
+                '+'   0 char 'a'
+                      1 split 0, 2  -->  1 char 'a', 1
+                      2 ...              2 ...
+                '*'   0 split 1, 3
+                      1 char 'a'    -->  1 char 'a' invert, 1
+                      2 jump             2 ...
+                      3 ...
+            reduce alternation '|' with preceeding char literal:
+                '|'   0 split 1, 3
+                      1 char 'a'    --> 0 char 'a' invert, 3
+                      2 jmp 4           1 ...
+                      3 ...
         unicode compilation toggle - do NOT generate unicode char classes in non
             unicode mode
+        case insensitive global flag
+        no capture global flag
 
     TODO: Future work (refining, not MVP critical)
         tag meta char class -> char class -> vm path, for better runtime debug
@@ -133,7 +131,10 @@
         Shunting yard creates a valid, yet inefficient, DFA. There are various
             redundancies, particularly with regards to chained and unnecessary
             jumps.
-
+        VM rework
+            char literal w/ no match program counter
+            match w/ end of input flag
+            utf8 class w/ leading low bytes, inverse flag
 
 Regex VM Bytecode (v7)
 
@@ -148,16 +149,16 @@ Regex VM Bytecode (v7)
         eTokenCharLiteral       1       char to match           inverse flag
         eTokenCharClass         2       class idx to match
         eTokenStringLiteral     3       str idx to match
-        eTokenCharAny           4
+        eTokenCharAny           4       dotall flag
         eTokenMatch             5       end of input flag
         eTokenSplit             6       program counter         program counter
         eTokenJmp               7       program counter
         eTokenSave              8       subexpression number    compound flag
         eTokenUtf8Class         9       utf8 idx to match
-        eTokenCharAnyDotAll     A
-        eTokenCall              B       program counter
-        eTokenReturn            C
-        eTokenByte              D
+        eTokenCall              A       program counter
+        eTokenReturn            B
+        eTokenByte              C
+        <reserved>              D
         <reserved>              E
         <reserved>              F
 
@@ -167,11 +168,11 @@ Regex VM Bytecode (v7)
         character specified.
 
     Note about eTokenCharAny:
-        If the DOTALL flag is enabled, the eTokenCharAnyDotAll is generated
-        instead. In ASCII mode, this instruction matches any character _except_
+        In ASCII mode, this instruction matches any character _except_
         newline. In Unicode mode, this instruction matches a single unicode
         codepoint, which MAY match multiple bytes, but again, does NOT match
-        newline.
+        newline. If the REGEX_FLAG_DOT_ALL global flag is enabled, or the
+        Operand A dotall flag is set, the instruction will ALSO match newline.
 
     Note about eTokenMatch:
         If the end of input flag is not set, the pattern matches at this
@@ -193,10 +194,6 @@ Regex VM Bytecode (v7)
         is used. Multibyte codepoint are represented by compound VM
         instructions.
 
-    Note about eTokenCharAnyDotAll:
-        This instruction matches any character, including newline. In unicode
-        mode, this matches a single codepoint, which MAY match multiple bytes.
-
     Note about eTokenCall:
         This instruction allows common repeating sequences to be factored out
         into a subroutine. The evaluation implementation is limited to an
@@ -216,14 +213,14 @@ Regex VM Bytecode (v7)
         from both eTokenCharAny and eTokenCharAnyDotAll in that it always
         matches newline, and always matches a single byte.
 
-All VM programs are prefixed with: TODO
+All VM programs are prefixed with:
 
-        0 split 1 3
-        1 anychar
+        0 split 1, 3
+        1 byte
         2 jmp 1
 
-    At runtime, if a partial match is requested, execution begins at 0. If a
-    full match is requested, execution begins at 3.
+    At runtime, if a an unanchored match is requested, execution begins at 0. If
+    a full match is requested, execution begins at 3.
 
 Test 0: a(?P<foolio>\Bcd(?i\w*[hijk](?*f.o)+)?)\d+cat
         abcdefgefgjfoofwofyo8167287catfoo
@@ -284,10 +281,9 @@ typedef enum {
     eCompileInternalError
 } eRegexCompileStatus_t;
 
-#define REGEX_UNICODE           0x01
-#define REGEX_CASE_INSENSITIVE  0x02
-#define REGEX_NO_CAPTURE        0x04
-#define REGEX_DOTALL            0x08
+#define REGEX_CASE_INSENSITIVE  0x01
+#define REGEX_NO_CAPTURE        0x02
+#define REGEX_DOTALL            0x04
 
 #define REGEX_STR_NULL_TERMINATED   -1
 
@@ -543,8 +539,7 @@ typedef enum {
     eTokenJmp,
     eTokenSave,
     eTokenUtf8Class,
-    eTokenCharAnyDotAll,    // 10
-    eTokenCall,
+    eTokenCall,             // 10
     eTokenReturn,
     eTokenByte,
     // Abstractions, reduced down to the above VM opcodes
@@ -552,8 +547,8 @@ typedef enum {
     eTokenAlternative,
     eTokenZeroOrOne,
     eTokenZeroOrMany,
-    eTokenOneOrMany,        // 20
-    eTokenSubExprStart,
+    eTokenOneOrMany,
+    eTokenSubExprStart,     // 20
     eTokenSubExprEnd,
     eTokenUnknown // <-- this should always be the last token enum
 } eRegexToken_t;
@@ -563,10 +558,6 @@ typedef enum {
 #ifndef uint32_t
 typedef unsigned int uint32_t;
 #endif // uint32_t
-
-#ifndef uint8_t
-typedef unsigned char uint8_t;
-#endif // uint8_t
 
 // Token attribute flags ///////////////////////////
 // Subexpression flags
@@ -579,6 +570,9 @@ typedef unsigned char uint8_t;
 
 // char literal, char class, utf8 class
 #define REGEX_TOKEN_FLAG_INVERT     0x1u
+
+// char any
+#define REGEX_TOKEN_FLAG_DOTALL     0x1u
 
 typedef enum {
     eRePtrOutA,
@@ -775,7 +769,7 @@ void regexPrintVM_eTokenCharClass(FILE *fp, regex_vm_t *vm, unsigned int oper_a,
 }
 
 void regexPrintVM_eTokenCharAny(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
-    fprintf(fp, "anychar");
+    fprintf(fp, "anychar%s", ((oper_a & REGEX_TOKEN_FLAG_DOTALL) ? " (dotall)" : ""));
 }
 
 void regexPrintVM_eTokenSave(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
@@ -805,10 +799,6 @@ void regexPrintVM_eTokenUtf8Class(FILE *fp, regex_vm_t *vm, unsigned int oper_a,
     fprintf(fp, "utf8 (%d)[", oper_a);
     regexPrintVMUtf8ClassEntry(fp, vm, (int)oper_a);
     fputc(']', fp);
-}
-
-void regexPrintVM_eTokenCharAnyDotAll(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
-    fprintf(fp, "anybyte");
 }
 
 void regexPrintVM_eTokenCall(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
@@ -860,7 +850,6 @@ regex_token_detail_t _regexTokenDetails[] = {
     RE_TOK_DETAIL_NV(eTokenJmp, ePriorityNone, eReTokNotTerminal, 0),
     RE_TOK_DETAIL_NV(eTokenSave, ePriorityNone, eReTokNotTerminal, 0),
     RE_TOK_DETAIL_PV(eTokenUtf8Class, regexTokenDetailUtf8Class, ePriorityNone, eReTokTerminal, 0),
-    RE_TOK_DETAIL_NV(eTokenCharAnyDotAll, ePriorityNone, eReTokNotTerminal, 0),
     RE_TOK_DETAIL_PV(eTokenCall, regexTokenDetailCall, ePriorityNone, eReTokTerminal, 0),
     RE_TOK_DETAIL_NV(eTokenReturn, ePriorityNone, eReTokTerminal, 0),
     RE_TOK_DETAIL_NV(eTokenByte, ePriorityNone, eReTokTerminal, 0),
@@ -2983,7 +2972,7 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                 switch(c.c) {
                     case '.':
                         // Operand, the meta "ANY" char
-                        if(!regexTokenCreate(tokens, eTokenCharAny, 0, 0, 0, 0)) {
+                        if(!regexTokenCreate(tokens, eTokenCharAny, 0, 0, ((build->flags & REGEX_DOTALL) ? REGEX_TOKEN_FLAG_DOTALL : 0), 0)) {
                             SET_RESULT(eCompileOutOfMem);
                         }
                         continue;
@@ -3964,7 +3953,19 @@ int regexVMProgramGenerateInstr(regex_vm_build_t *build, regex_token_t *token, r
     return 1;
 }
 
+int regexVMProgramUnanchoredPrefix(regex_vm_build_t *build) {
+    if((!regexVMProgramAdd(build, eTokenSplit, 1, 3)) ||
+       (!regexVMProgramAdd(build, eTokenByte, 0, 0)) ||
+       (!regexVMProgramAdd(build, eTokenJmp, 0, 0))) {
+        return 0;
+    }
+    return 1;
+}
+
 int regexVMProgramGenerate(regex_vm_build_t *build, regex_token_t *token) {
+    if(!regexVMProgramUnanchoredPrefix(build)) {
+        return 0;
+    }
     do {
         for(;token != NULL;) {
             if(!regexVMProgramGenerateInstr(build, token, &token)) {
@@ -4757,11 +4758,9 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
             thread->pc++;
             return eEvalMatch;
         case eTokenCharAny:
-            if(*eval->sp == '\n') {
+            if((instr[1] != REGEX_TOKEN_FLAG_DOTALL) && (*eval->sp == '\n')) {
                 return eEvalNoMatch;
             }
-            // intentional fall through
-        case eTokenCharAnyDotAll:
             if(1) { // unicode mode
                 if(thread->pos == -1) {
                     thread->pos = parseUtf8EncodedHighByte(c);
@@ -4811,7 +4810,7 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
     eval->debug = debug;
 #endif // MOJO_REGEX_VM_DEBUG
 
-    if(!regexThreadCreate(eval, NULL, 0, 1)) {
+    if(!regexThreadCreate(eval, NULL, (anchored ? 3 : 0), 1)) {
         regexEvalFree(eval);
         return NULL;
     }
