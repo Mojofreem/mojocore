@@ -66,11 +66,6 @@
         encoding, even within a char string, and does work properly with the
         evaluator. For gcc, you will need to manually encode utf8 characters.
 
-    CURRENT:
-        utf8 classes are incomplete. DFA is buildable, but some lingering issues
-        in the subroutine mechanism need further work. Additionally, the shunting
-        yard output has many redundant jump instructions.
-        
     TODO
         \X full unicode letter glyph (may be multiple chars, includes marker glyphs)
             "\P{M}\p{M}*"

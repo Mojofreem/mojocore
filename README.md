@@ -66,7 +66,7 @@ meta classes are:
 
 Certain unicode property classes are incorporated directly into the library. These
 class definitions were generated from the Unicode DB, using the
-`extract_unicode_props.py` Python script. Unicode property clases use the following
+`extract_unicode_props.py` Python script. Unicode property classes use the following
 metacharacters:
 
 | Class  | Property set contents |
@@ -79,9 +79,21 @@ metacharacters:
 | `Z`    | Whitespace            |
 | `N`    | Numeric digit         |
 
+_Note on utf8 support_:
+> Clang follows sane expectations and converts \u#### into utf8 encoding
+  within a char string. gcc illogically converts \u#### into utf16
+  encoding, even within a char string, and does work properly with the
+  evaluator. For gcc, you will need to manually encode utf8 characters.
+
+> There is no standard way to support unicode codepoints. Clang handles
+  \u#### conversion to utf8, but values above 0xFFFF are questionable.
+  To that end, this implementation uses the, decidedly non-standard, \U10####
+  notation. Note the capital U, and 6 hex digits.
+
+
 Subexpressions (groups) are supported. Group capture is available. By default,
 the implementation captures that longest superset of an subexpression and it's
-plurality modifier (+, *, ?). For example, given the pattern:
+plurality modifier (`+`, `*`, `?`). For example, given the pattern:
 
 * `abc(foo)+def`
 
@@ -356,14 +368,6 @@ regex_vm_t *myparser = &_myparser;
 
 ### Future improvements
 
-* Support non-capturing subexpressions, `(?:...)`.
-* Support compound subexpressions, `(?*...)`. This would augment the existing
-    group capture with explicit capture of each repetition of a subexpression.
-* Complete `\0` support: currently can be included in the pattern, but the
-    matcher treats input as a null terminated string (_so the `\0` can never
-    actually match_)
-* Explicitly match a single byte (`\B`?) (_differs from `.`, in that the `.`
-    MAY match multibyte (utf8), and MAY NOT match `\n`_)
 * Start of string assertion `^` (_non consuming_)
 * End of string assertion `$` (_non consuming_)
 * Start of word assertion `\<`, that only matches when a word character follows
@@ -375,7 +379,6 @@ regex_vm_t *myparser = &_myparser;
 * Unanchored matches (_currently can be done with an explicit `.*` prefix_)
 * Counter repetition (_range_) plurality operator `{n,m}`
 * Convert to a single file header library (_ala Sean Barrett's example_)
-* Optionally evaluate the NFA tree directly, and skip the VM generation
 * Pattern normalization:
     * singleton char classes reduced to a char literal (_ie., `[a]` -> `a`_)
     * sequence of char literals reduced to a string literal
@@ -389,17 +392,12 @@ regex_vm_t *myparser = &_myparser;
     * Handle utf8 codepoints with the dot metacharacter.
     * Match a full unicode glyph `\X` (_may be multiple chars, and may include
         additional marker glyphs_)
-    * Character classes that handle multibyte utf8 characters
-    * utf8 glyph parsing (_derive from unicode database character classes_)
     * Flag: `unicode` - explicitly handle unicode (_with ascii being the default_).
         This would simplify patterns that do not need utf8 support.
-    * Properly handle unicode chars (_we decode the escape value, but the lexer
-        does not properly deal with the multiple bytes_)
-    * Multipass char class parsing, to separate ascii and unicode handling
     * Update unicode db parser to handle arbitrary character groups and
         property sets, prebuild unicode class trees
 
-### Regex VM Bytecode (_v2_)
+### Regex VM Bytecode (_v2_) \[Needs updating]
 
 #### Pattern program
 
