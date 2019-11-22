@@ -3228,24 +3228,18 @@ int regexStackTypeGreaterOrEqualToToken(regex_token_t *stack, eRegexToken_t toke
 /////////////////////////////////////////////////////////////////////////////
 
 int regexOperatorLiteralCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_ptrlist_t *list;
-
-    if((list = regexPtrlistCreate(&(token->out_a))) == NULL) {
+    if((token->ptrlist = regexPtrlistCreate(&(token->out_a))) == NULL) {
         return 0;
     }
-    token->ptrlist = list;
     regexTokenStackPush(stack, token);
     return 1;
 }
 
 int regexOperatorSubexprCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_ptrlist_t *list;
-
     token->tokenType = eTokenSave;
-    if((list = regexPtrlistCreate(&(token->out_a))) == NULL) {
+    if((token->ptrlist = regexPtrlistCreate(&(token->out_a))) == NULL) {
         return 0;
     }
-    token->ptrlist = list;
     regexTokenStackPush(stack, token);
     return 1;
 }
@@ -3268,7 +3262,6 @@ int regexOperatorConcatenationCreate(regex_fragment_t **stack, regex_token_t *to
 
 int regexOperatorAlternationCreate(regex_fragment_t **stack, regex_token_t *token) {
     regex_fragment_t *e1, *e2;
-    regex_ptrlist_t *list;
     regex_token_t *jmp = NULL;
 
     if(((e2 = regexTokenStackPop(stack)) == NULL) ||
@@ -3280,14 +3273,14 @@ int regexOperatorAlternationCreate(regex_fragment_t **stack, regex_token_t *toke
         return 0;
     }
     regexPtrlistPatch(e1->ptrlist, jmp);
-    if((list = regexPtrlistCreate(&(jmp->out_a))) == NULL) {
+    if((token->ptrlist = regexPtrlistCreate(&(jmp->out_a))) == NULL) {
         return 0;
     }
 
     token->tokenType = eTokenSplit;
     token->out_a = e1;
     token->out_b = e2;
-    token->ptrlist = regexPtrlistAppend(list, e2->ptrlist);
+    token->ptrlist = regexPtrlistAppend(token->ptrlist, e2->ptrlist);
     e2->ptrlist = NULL;
     regexTokenStackPush(stack, token);
 
@@ -3296,17 +3289,16 @@ int regexOperatorAlternationCreate(regex_fragment_t **stack, regex_token_t *toke
 
 int regexOperatorZeroOrOneCreate(regex_fragment_t **stack, regex_token_t *token) {
     regex_fragment_t *e;
-    regex_ptrlist_t *list;
 
     if((e = regexTokenStackPop(stack)) == NULL) {
         return 0;
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    if((list = regexPtrlistCreate(&(token->out_b))) == NULL) {
+    if((token->ptrlist = regexPtrlistCreate(&(token->out_b))) == NULL) {
         return 0;
     }
-    token->ptrlist = regexPtrlistAppend(e->ptrlist, list);
+    token->ptrlist = regexPtrlistAppend(e->ptrlist, token->ptrlist);
     e->ptrlist = NULL;
     regexTokenStackPush(stack, token);
 
@@ -3314,7 +3306,6 @@ int regexOperatorZeroOrOneCreate(regex_fragment_t **stack, regex_token_t *token)
 }
 
 int regexOperatorZeroOrMoreCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_ptrlist_t *list;
     regex_fragment_t *e;
     regex_token_t *jmp = NULL;
 
@@ -3323,7 +3314,7 @@ int regexOperatorZeroOrMoreCreate(regex_fragment_t **stack, regex_token_t *token
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    if((list = regexPtrlistCreate(&(token->out_b))) == NULL) {
+    if((token->ptrlist = regexPtrlistCreate(&(token->out_b))) == NULL) {
         return 0;
     }
     if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL, 0, 0)) {
@@ -3331,14 +3322,12 @@ int regexOperatorZeroOrMoreCreate(regex_fragment_t **stack, regex_token_t *token
     }
     jmp->out_a = token;
     regexPtrlistPatch(e->ptrlist, jmp);
-    token->ptrlist = list;
     regexTokenStackPush(stack, token);
 
     return 1;
 }
 
 int regexOperatorOneOrMoreCreate(regex_fragment_t **stack, regex_token_t *token) {
-    regex_ptrlist_t *list;
     regex_fragment_t *e;
 
     if((e = regexTokenStackPop(stack)) == NULL) {
@@ -3347,10 +3336,9 @@ int regexOperatorOneOrMoreCreate(regex_fragment_t **stack, regex_token_t *token)
     token->tokenType = eTokenSplit;
     token->out_a = e;
     regexPtrlistPatch(e->ptrlist, token);
-    if((list = regexPtrlistCreate(&(token->out_b))) == NULL) {
+    if((e->ptrlist = regexPtrlistCreate(&(token->out_b))) == NULL) {
         return 0;
     }
-    e->ptrlist = list;
     regexTokenStackPush(stack, e);
     return 1;
 }
