@@ -316,6 +316,8 @@ struct regex_compile_ctx_s {
     eRegexCompileStatus_t status;
     const char *pattern;
     int position;
+    const char *subpattern;
+    int sub_position;
     regex_vm_t *vm;
 };
 
@@ -1898,6 +1900,70 @@ int regexGetEscapedStrLen(const char *str, int len) {
         }
     }
     return out;
+}
+
+int regexGetPatternCharLen(const char *pattern) {
+    int codepoint;
+
+    // Check for utf8 encoding
+    if((codepoint = parseUtf8DecodeSequence(pattern)) != -1) {
+        if(codepoint > 0xFFFF) {
+            return 8; // \U######
+        } else if(codepoint > 2047) {
+            return 6; // \u####
+        } else if(codepoint > 127) {
+            return 6; // \u####
+        }
+        if(codepoint > 127) {
+            return 1;
+        }
+    }
+    switch(*pattern) {
+        case '\0':
+        case '\a':
+        case '\b':
+        case '\x1b':
+        case '\f':
+        case '\n':
+        case '\r':
+        case '\t':
+        case '\v':
+            return 2;
+
+        default:
+            if((*pattern >= ' ') && (*pattern <= 127)) {
+                return 1;
+            }
+            return 4; // \x##
+    }
+}
+
+int regexGetOffsetForEscapedStrLenAtPos(const char *str, int len, int pos) {
+    int k, out = 0, offset = 0, size = 0;
+    const char *ptr = str;
+
+    for(k = 0; (k <= pos) && (k < len); k++) {
+        out = regexGetPatternCharLen(str);
+        size += out;
+        str += out;
+    }
+    for(offset = 0; size > len;) {
+        out = regexGetPatternCharLen(ptr);
+        size -= out;
+        offset += out;
+    }
+    return offset;
+}
+
+int regexCalcEscapedStrLenAtPosWithOffset(const char *str, int len, int pos, int offset) {
+    int k, out = 0, size = 0;
+
+    for(k = offset; (k <= pos) && (k < len); k++) {
+        out = regexGetPatternCharLen(str);
+        size += out;
+        str += out;
+    }
+    return size;
 }
 
 void regexEmitEscapedStr(FILE *fp, const char *str, int len) {
@@ -4345,11 +4411,74 @@ const char *regexGetCompileStatusStr(eRegexCompileStatus_t status) {
     }
 }
 
+int regexGetTensDigit(int val) {
+    for(; val >= 100; val /= 100);
+    return val / 10;
+}
+
+int regexGetHundredsDigit(int val) {
+    for(; val >= 1000; val /= 1000);
+    return val / 100;
+}
+
+void regexEmitPatternDetail(FILE *fp, const char *label, const char *pattern, size_t patlen, int pos, int linelen) {
+    int segment, lead, offset = 0, k, target;
+    int c;
+
+    if(label == NULL) {
+        label = "Pattern";
+    }
+    lead = strlen(label) + 2;
+    linelen -= lead + 1;
+    if(linelen <= 0) {
+        return;
+    }
+
+    if(linelen < patlen) {
+        target = pos + (linelen / 4);
+        if(target > patlen) {
+            target = patlen;
+        }
+        offset = regexGetOffsetForEscapedStrLenAtPos(pattern, patlen, target);
+        segment = regexCalcEscapedStrLenAtPosWithOffset(pattern, patlen, target, offset);
+    } else {
+        target = pos;
+        offset = 0;
+        segment = patlen;
+    }
+
+    if(pos >= 100) {
+        fprintf(fp, "%*.*s", lead, lead, "");
+        for(k = offset; k <= target; k++) {
+            fputc((!(k % 100) ? regexGetTensDigit(k) + '0' : ' '), fp);
+        }
+        fputc('\n', fp);
+    }
+    fprintf(fp, "%*.*s", lead, lead, "");
+    for(k = offset; k <= target; k++) {
+        fputc((!(k % 10) ? regexGetTensDigit(k) + '0' : ' '), fp);
+    }
+    fprintf(fp, "\n%*.*s", lead, lead, "");
+    for(k = offset; k <= target; k++) {
+        fputc((k % 10) + '0', fp);
+    }
+    fputc('\n', fp);
+
+    fprintf(fp, "%s: ", label);
+    regexEmitEscapedStr(fp, pattern + offset, segment);
+    fputc('\n', fp);
+
+    fprintf(fp, "(@%-*d)  %*.*s^\n", lead - 5, pos, pos - offset, pos - offset, "");
+}
+
 void regexGetCompileResult(FILE *fp, regex_compile_ctx_t *ctx) {
     fprintf(fp, "Result: %s\n", regexGetCompileStatusStr(ctx->status));
     if(ctx->status != eCompileOk) {
-        fprintf(fp, "Pattern: %s\n", ctx->pattern);
-        fprintf(fp, "(@%-4d)  %*.*s^", ctx->position, ctx->position, ctx->position, "");
+        regexEmitPatternDetail(fp, "Pattern", ctx->pattern, strlen(ctx->pattern), ctx->position, 78);
+
+        if(ctx->subpattern != NULL) {
+            regexEmitPatternDetail(fp, "Subpat ", ctx->subpattern, strlen(ctx->subpattern), ctx->sub_position, 78);
+        }
     }
 }
 
@@ -5199,6 +5328,7 @@ int main(int argc, char **argv) {
             regexGetCompileResult(stdout, &result);
             return 1;
         }
+        regexGetCompileResult(stdout, &result);
         if(argc > 2) {
             regexVMPrintProgram(stdout, result.vm);
             printf("-------------------------\n");
