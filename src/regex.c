@@ -1676,6 +1676,10 @@ int parseIsAlnum(char c) {
             ((c >= '0') && (c <= '9')));        // 0 - 9
 }
 
+int parseIsIdChar(char c) {
+    return (parseIsAlnum(c) || (c == '_') || (c == '-'));
+}
+
 int parseCheckNextPatternChar(const char **pattern, char c) {
     parseChar_t pc;
 
@@ -1688,6 +1692,48 @@ int parseCheckNextPatternChar(const char **pattern, char c) {
     }
     parsePatternCharAdvance(pattern);
     return 1;
+}
+
+typedef enum {
+    eRegexPatternIdOk,
+    eRegexPatternIdMalformed,
+    eRegexPatternIdMissing,
+    eRegexPatternIdOutOfMem
+} eRegexPatternId_t;
+
+eRegexPatternId_t parseCheckIdentifier(const char **pattern, int start, int end, char **id) {
+    int k;
+
+    if(!parseCheckNextPatternChar(pattern, start)) {
+        *id = NULL;
+        return eRegexPatternIdMissing;
+    }
+    for(k = 0; parseIsIdChar((*pattern)[k]) && ((*pattern)[k] != end); k++);
+    if((k == 0) || ((*pattern)[k] != end)) {
+        *id = NULL;
+        *pattern += k;
+        return eRegexPatternIdMalformed;
+    }
+    if((*id = _regexAlloc(k + 1, _regexMemContext)) == NULL) {
+        return eRegexPatternIdOutOfMem;
+    }
+    memcpy(*id, *pattern, k);
+    (*id)[k] = '\0';
+    *pattern += k + 1;
+    return eRegexPatternIdOk;
+}
+
+// It is assumed that an identifier, if present, was previously validated by a
+// call to parseCheckIdentifier.
+void parseAdvanceIdentifier(const char **pattern, int start, int end) {
+    int k;
+
+    if(!parseCheckNextPatternChar(pattern, start)) {
+        return;
+    }
+    parsePatternCharAdvance(pattern);
+    for(k = 0; parseIsIdChar((*pattern)[k]) && ((*pattern)[k] != end); k++);
+    *pattern += k;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1936,34 +1982,6 @@ int regexGetPatternCharLen(const char *pattern) {
             }
             return 4; // \x##
     }
-}
-
-int regexGetOffsetForEscapedStrLenAtPos(const char *str, int len, int pos) {
-    int k, out = 0, offset = 0, size = 0;
-    const char *ptr = str;
-
-    for(k = 0; (k <= pos) && (k < len); k++) {
-        out = regexGetPatternCharLen(str);
-        size += out;
-        str += out;
-    }
-    for(offset = 0; size > len;) {
-        out = regexGetPatternCharLen(ptr);
-        size -= out;
-        offset += out;
-    }
-    return offset;
-}
-
-int regexCalcEscapedStrLenAtPosWithOffset(const char *str, int len, int pos, int offset) {
-    int k, out = 0, size = 0;
-
-    for(k = offset; (k <= pos) && (k < len); k++) {
-        out = regexGetPatternCharLen(str);
-        size += out;
-        str += out;
-    }
-    return size;
 }
 
 void regexEmitEscapedStr(FILE *fp, const char *str, int len) {
@@ -3085,6 +3103,7 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
     int subexpr = 0;
     int named;
     int index;
+    eRegexPatternId_t id_status;
 
     // Parse the regex pattern into a sequence of tokens (operators and operands)
     // The output of this stage is a sequence of lexical tokens in infix form
@@ -3166,12 +3185,25 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                                 if(named || (flags & (REGEX_TOKEN_FLAG_SUBROUTINE | REGEX_TOKEN_FLAG_NOCAPTURE))) {
                                     SET_RESULT(eCompileConflictingAttrs);
                                 }
+#if 1
+                                if((id_status = parseCheckIdentifier(&pattern, '<', '>', &str)) != eRegexPatternIdOk) {
+                                    if(id_status == eRegexPatternIdOutOfMem) {
+                                        SET_RESULT(eCompileOutOfMem);
+                                    } else {
+                                        SET_RESULT(eCompileMalformedSubExprName);
+                                    }
+                                }
+                                if(!regexVMGroupTableEntryAdd(build, str, strlen(str), subexpr)) {
+                                    SET_RESULT(eCompileOutOfMem);
+                                }
+#else
                                 if(!parseCheckNextPatternChar(&pattern, '<')) {
                                     SET_RESULT(eCompileMalformedSubExprName);
                                 }
                                 if((response = regexSubexprLookupEntryCreate(build, &pattern, subexpr)) != 1) {
                                     SET_RESULT((response == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName));
                                 }
+#endif
                                 named = 1;
                             } else if(parseCheckNextPatternChar(&pattern, ':')) {
                                 // Non-capturing subexpression
@@ -3202,9 +3234,15 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                             }
                         }
                         if(!named) {
+#if 1
+                            if(!regexVMGroupTableEntryAdd(build, NULL, 0, subexpr)) {
+                                SET_RESULT(eCompileOutOfMem);
+                            }
+#else
                             if((response = regexSubexprLookupEntryCreate(build, NULL, subexpr)) != 1) {
                                 SET_RESULT((response == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName));
                             }
+#endif
                         }
                         if(!(flags & (REGEX_TOKEN_FLAG_NOCAPTURE | REGEX_TOKEN_FLAG_SUBROUTINE))) {
                             build->groups++;
@@ -4421,9 +4459,23 @@ int regexGetHundredsDigit(int val) {
     return val / 100;
 }
 
+int regexGetPatternDetailOffset(const char *pattern, int linelen, int pos) {
+    int k, offset = 0, plen = 0, out;
+
+    for(k = 0; (k < pos) && (pattern[k] != '\0'); k++) {
+        out = regexGetPatternCharLen(pattern + k);
+        plen += out;
+        while(plen > linelen) {
+            out = regexGetPatternCharLen(pattern + offset);
+            plen -= out;
+            offset++;
+        }
+    }
+    return offset;
+}
+
 void regexEmitPatternDetail(FILE *fp, const char *label, const char *pattern, size_t patlen, int pos, int linelen) {
-    int segment, lead, offset = 0, k, target;
-    int c;
+    int lead, offset = 0, k, end;
 
     if(label == NULL) {
         label = "Pattern";
@@ -4434,38 +4486,31 @@ void regexEmitPatternDetail(FILE *fp, const char *label, const char *pattern, si
         return;
     }
 
-    if(linelen < patlen) {
-        target = pos + (linelen / 4);
-        if(target > patlen) {
-            target = patlen;
-        }
-        offset = regexGetOffsetForEscapedStrLenAtPos(pattern, patlen, target);
-        segment = regexCalcEscapedStrLenAtPosWithOffset(pattern, patlen, target, offset);
-    } else {
-        target = pos;
-        offset = 0;
-        segment = patlen;
+    offset = regexGetPatternDetailOffset(pattern, linelen, pos);
+    end = strlen(pattern) - offset;
+    if(end > (linelen + 1)) {
+        end = linelen + 1;
     }
 
     if(pos >= 100) {
         fprintf(fp, "%*.*s", lead, lead, "");
-        for(k = offset; k <= target; k++) {
+        for(k = offset; k < end; k++) {
             fputc((!(k % 100) ? regexGetTensDigit(k) + '0' : ' '), fp);
         }
         fputc('\n', fp);
     }
     fprintf(fp, "%*.*s", lead, lead, "");
-    for(k = offset; k <= target; k++) {
+    for(k = offset; k < end; k++) {
         fputc((!(k % 10) ? regexGetTensDigit(k) + '0' : ' '), fp);
     }
     fprintf(fp, "\n%*.*s", lead, lead, "");
-    for(k = offset; k <= target; k++) {
+    for(k = offset; k < end; k++) {
         fputc((k % 10) + '0', fp);
     }
     fputc('\n', fp);
 
     fprintf(fp, "%s: ", label);
-    regexEmitEscapedStr(fp, pattern + offset, segment);
+    regexEmitEscapedStr(fp, pattern + offset, end);
     fputc('\n', fp);
 
     fprintf(fp, "(@%-*d)  %*.*s^\n", lead - 5, pos, pos - offset, pos - offset, "");
