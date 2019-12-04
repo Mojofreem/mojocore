@@ -1112,10 +1112,11 @@ const char *regexRegUnicodeCharClassGet(const char *classId, int len) {
     regex_unicode_charclass_entry_t *entry;
 
     if(len <= 0) {
-        len = strlen(classId);
+        len = (int)strlen(classId);
     }
+
     for(entry = _regex_unicode_charclass_registry; entry != NULL; entry = entry->next) {
-        if(!strncmp(classId, entry->id, strlen(classId))) {
+        if(!strncmp(classId, entry->id, len)) {
             return entry->class_str;
         }
     }
@@ -1504,6 +1505,8 @@ int parsePatternIsValid(parseChar_t *pc) {
 }
 
 void parsePatternCharAdvance(const char **pattern) {
+    int k;
+
     if(**pattern == '\\') {
         if((*(*pattern + 1) == 'x') && (*(*pattern + 2) != '\0') && (*(*pattern + 3) != '\0')) {
             *pattern += 4; // \x##
@@ -1515,11 +1518,8 @@ void parsePatternCharAdvance(const char **pattern) {
                   (*(*pattern + 7) != '\0')) {
             *pattern += 8; // \U######
         } else if((*(*pattern + 1) == 'p') && (*(*pattern + 2) == '{')) {
-            if(*(*pattern + 4) == '}') {
-                *pattern += 5; // \p{_}
-            } else if(*(*pattern + 5) == '}') {
-                *pattern += 6; // \p{__}
-            }
+            for(k = 3; (*(*pattern + k) != '\0') && (*(*pattern + k) != '}'); k++);
+            *pattern += k + 1;
         } else if((*(*pattern + 1) != '\0')) {
             *pattern += 2;
         }
@@ -1564,20 +1564,19 @@ eRegexPatternId_t parseCheckIdentifier(const char **pattern, int start, int end,
     int k;
 
     if(!parseCheckNextPatternChar(pattern, start)) {
-        *id = NULL;
         return eRegexPatternIdMissing;
     }
-    printf("found start\n");
     for(k = 0; parseIsIdChar((*pattern)[k]) && ((*pattern)[k] != end); k++);
     if((k == 0) || ((*pattern)[k] != end)) {
-        printf("premature\n");
-        *id = NULL;
         *pattern += k;
         return eRegexPatternIdMalformed;
     }
-    printf("found id\n");
-    *id = *pattern;
-    *len = k;
+    if(id != NULL) {
+        *id = *pattern;
+    }
+    if(len != NULL) {
+        *len = k;
+    }
     *pattern += k + 1;
     return eRegexPatternIdOk;
 }
@@ -1588,6 +1587,7 @@ parseChar_t parseGetNextPatternChar(const char **pattern, const char **id, int *
         .state = eRegexPatternInvalid
     };
     int k;
+    const char *ptr;
     char classId[3];
 
     if(**pattern == '\0') {
@@ -1603,49 +1603,30 @@ parseChar_t parseGetNextPatternChar(const char **pattern, const char **id, int *
 
             case 'p': // unicode class
             case 'P': // unicode class (inverted)
-                printf("uni class\n");
-                (*pattern) += 3;
+                k = *(*pattern + 1);
                 if(id != NULL) {
                     *id = (*pattern) + 3;
                 }
-                printf("get id\n");
-                if(parseCheckIdentifier(pattern, '{', '}', id, len) != eRegexPatternIdOk) {
+                ptr = (*pattern) + 2;
+                if(parseCheckIdentifier(&ptr, '{', '}', id, len) != eRegexPatternIdOk) {
                     result.state = eRegexPatternInvalidEscape;
                     return result;
                 }
-                printf("Got [%*.*s]\n", *len, *len, *id);
-                result.c = *(*pattern + 1);
+                //result.c = k;
                 result.state = eRegexPatternUnicodeMetaClass;
-                printf("all good\n");
-                return result;
-#if 0
-                if(*(*pattern + 2) == '{') {
-                    classId[0] = *(*pattern + 3);
-                    if((classId[0] == '\0') || (classId[0] == '}')) {
-                        return result;
-                    }
-                    classId[1] = *(*pattern + 4);
-                    if(!((classId[1] == '}') || (*(*pattern + 5) == '}'))) {
-                        return result;
-                    }
-                    if(classId[1] == '}') {
-                        classId[1] = '\0';
+
+                if(id != NULL) {
+                    printf("Class ID [%*.*s]\n", *len, *len, *id);
+                    if(*len == 1) {
+                        result.c = (*id)[0];
                     } else {
-                        classId[2] = '\0';
+                        result.c = (*id)[0] | ((*id)[1] << 8);
                     }
-                    if(regexRegUnicodeCharClassGet(classId) == NULL) {
-                        result.state = eRegexPatternInvalidEscape;
-                    } else {
-                        result.state = eRegexPatternUnicodeMetaClass;
-                        result.c = classId[0] | (classId[1] << 8);
-                        if(*(*pattern + 1) == 'P') {
-                            result.c |= 0x10000;
-                        }
+                    if(k == 'P') {
+                        result.c |= 0x10000;
                     }
-                    return result;
                 }
                 return result;
-#endif
 
             case 'd': // digit
             case 'D': // non digit
@@ -2347,7 +2328,11 @@ int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus_t *st
     // Preset to OoM, change to eCompileOk on success
     *status = eCompileOutOfMem;
 
+#ifdef EXP_ID_PARSE
     if(((classId != NULL) && (regexSubroutineIdxGetName(build, classId, len) == NULL)) ||
+#else
+    if(((classId != NULL) && (regexSubroutineIdxGetName(build, classId, strlen(classId)) == NULL)) ||
+#endif
        ((classId == NULL) && (regexSubroutineIdxGetPattern(build, pattern) == NULL))) {
         if(!regexTokenCreate(&utf8class, eTokenSubExprStart, 0, NULL, REGEX_TOKEN_FLAG_NOCAPTURE, 0)) {
             return 0;
@@ -2824,6 +2809,12 @@ int parseCharClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_build_t
     int k;
     utf8_charclass_tree_t *utf8tree = NULL;
 
+#ifndef EXP_ID_PARSE
+    if((classId != NULL) && (classId[0] == '^')) {
+        invert = 1;
+    }
+#endif
+
     memset(bitmap, 0, 32);
 
     c = parseGetNextPatternChar(pattern, NULL, NULL);
@@ -2962,6 +2953,7 @@ parseClassCompleted:
     return 1;
 }
 
+#ifdef EXP_ID_PARSE
 int parseUnicodeClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_build_t *build,
                                     const char *unicodeClass, int len, int invert,
                                     regex_token_t **tokens) {
@@ -2980,6 +2972,37 @@ int parseUnicodeClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_buil
     }
     return parseCharClassAndCreateToken(status, build, &classStr, unicodeClass, len, 0, tokens, invert);
 }
+#else
+int parseUnicodeClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_build_t *build,
+                                    int unicodeClass, regex_token_t **tokens) {
+    char classId[4];
+    int invert;
+    const char *classStr;
+
+    classId[0] = ' ';
+    classId[1] = (char)((unsigned int)unicodeClass & 0xFFu);
+    classId[2] = (char)(((unsigned int)unicodeClass & 0xFF00u) >> 8u);
+    classId[3] = '\0';
+
+    invert = ((unicodeClass & 0x10000) ? 1 : 0);
+    if(invert) {
+        classId[0] = '^';
+    }
+
+    if((classStr = regexRegUnicodeCharClassGet(classId + 1, strlen(classId + 1))) == NULL) {
+        *status = eCompileUnknownUnicodeClass;
+        return 0;
+    }
+
+    if(regexSubroutineIdxGetName(build, classId, 3) != NULL) {
+        if((*status = regexSubroutineGenerateFromPattern(tokens, NULL, build, NULL, classId, 2, NULL)) != eCompileOk) {
+            return 0;
+        }
+        return 1;
+    }
+    return parseCharClassAndCreateToken(status, build, &classStr, classId, 0, 0, tokens, invert);
+}
+#endif
 
 void regexEmitCharClassBitmap(FILE *fp, const unsigned int *bitmap) {
     int k;
@@ -3358,6 +3381,7 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                 continue;
 
             case eRegexPatternUnicodeMetaClass:
+#ifdef EXP_ID_PARSE
                 printf("looking for class...\n");
                 if(regexRegUnicodeCharClassGet(str, len) == NULL) {
                     SET_RESULT(eCompileUnknownUnicodeClass);
@@ -3367,6 +3391,11 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                     SET_RESULT(status);
                 }
                 printf("and onward...\n");
+#else
+                if(!parseUnicodeClassAndCreateToken(&status, build, c.c, tokens)) {
+                    SET_RESULT(status);
+                }
+#endif
                 continue;
 
             case eRegexPatternChar:
