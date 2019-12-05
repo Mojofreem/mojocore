@@ -362,6 +362,30 @@ Subroutine generation issue test:
 
  ^a(?P<foolio>?i\Bcd(?i(?R<chunk>e\p{test}g[hijk])(?*f.o)*)?)(?R<digits>\d+)cat\R{digits}(?:.*)$ abcdefgjfoofoofoo033195cat72364ghj
 
+pattern -> token stream (infix) [pattern parsing]
+api -> token stream (infix) [api]
+token stream (infix) -> token stream (postfix) [shunting yard]
+token stream (postfix) -> NFA graph [shunting yard]
+NFA graph -> VM bytecode [vm generate]
+
+token streams
+    fragmentary
+        can be composed together
+        intermediary, always resolves to primary or subroutine
+    primary
+        all branches end in a match
+    subroutine
+        all branches end in a return
+
+api
+    build context
+        all temporary variables, buffers, and pools
+        any global state should be transitioned here
+        used during compilation only, evaluation should be independent
+            * may optionally be available during evaluation, for enhanced
+              diagnostics
+
+
 */
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1155,7 +1179,8 @@ mojo_unicode_class_t _uax_db_default_import_table[] = {
 
 mojo_unicode_class_t _subroutine_test = {
     NULL, "test",
-    "A-Za-z\\u0123-\\u0138\\uA000-\\uA0FF",
+    "\\uA000-\\uA0FF",
+    //"A-Za-z\\u0123-\\u0138\\uA000-\\uA0FF",
     NULL
 };
 
