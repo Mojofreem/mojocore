@@ -378,17 +378,19 @@ def generate_source(categories, scripts, properties, script_names, header, sourc
 #ifndef _MOJOCORE_UAX_DB_DEFINITIONS_
 #define _MOJOCORE_UAX_DB_DEFINITIONS_
 
+#ifndef mojo_unicode_class_t
+typedef struct mojo_unicode_class_s mojo_unicode_class_t;
+#endif // mojo_unicode_class_t
+
 #ifndef mojo_unicode_class_s
 struct mojo_unicode_class_s {
     const char *abbreviation;
     const char *property;
     const char *class_string;
+    mojo_unicode_class_t *next;
 };
 #endif // mojo_unicode_class_s        
 
-#ifndef mojo_unicode_class_t
-typedef struct mojo_unicode_class_s mojo_unicode_class_t;
-#endif // mojo_unicode_class_t
 ''', file=fp)
                 for group in groups:
                     print('extern const char _uax_db_{}[];'.format(group[1]), file=fp)
@@ -397,11 +399,11 @@ typedef struct mojo_unicode_class_s mojo_unicode_class_t;
 
                 for group in groups:
                     surround = '' if group[0] is None else '"'
-                    print('    {{{}{}{}, "{}", _uax_db_{}}},'.format(surround,
+                    print('    {{{}{}{}, "{}", _uax_db_{}, NULL}},'.format(surround,
                                                                      group[0] if group[0] is not None else 'NULL',
                                                                      surround, group[1], group[1]), file=fp)
 
-                print('    {NULL, NULL, NULL}', file=fp)
+                print('    {NULL, NULL, NULL, NULL}', file=fp)
 
                 print('};\n\n#endif // _MOJOCORE_UAX_DB_DEFINITIONS_', file=fp)
         except Exception as ex:

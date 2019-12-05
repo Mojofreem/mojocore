@@ -48,7 +48,7 @@ Meta and control characters may be escaped (by prefixing with backslash) to incl
 | `\*`     | literal asterisk         |  |
 | `\x##`   | hex byte                 |  |
 | `\u####` | unicode char point       | For codepoints `0` - `0xFFFF`         |
-| `\U######` | Unicode char point     | For codepoints `0x10000` - `0x10FFFF` |
+| `\u{######}` | Unicode char point     | For codepoints `0x10000` - `0x10FFFF` |
 | `\R{name}` | Subroutine call        | _Non-standard_. Calls a subroutine previously defined by `(?R<name>...)` | 
 | `\B`     | match a single byte      | _Non-standard_. Always matches a single byte, including newline. |
 | `\p{class}` | Match a unicode property set codepoint | Integrated classes are listed below. |
@@ -89,9 +89,8 @@ _Note on utf8 support_:
 
 > There is no standard way to support unicode codepoints. Clang handles
   \u#### conversion to utf8, but values above 0xFFFF are questionable.
-  To that end, this implementation uses the, decidedly non-standard, \U10####
-  notation. Note the capital U, and 6 hex digits.
-
+  To that end, this implementation uses the \u{######} notation for values
+  exceeding 4 hexidecimal digits.
 
 Subexpressions (groups) are supported. Group capture is available. By default,
 the implementation captures that longest superset of an subexpression and it's
