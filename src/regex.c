@@ -1856,8 +1856,17 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, const char **i
             case 'W': // non word character
             case 'B': // explicit byte match
             case 'X': // full unicode glyph (base + markers)
-            case 'R': // Subroutine call
                 result.state = eRegexPatternMetaClass;
+                result.c = *(*pattern + 1);
+                return result;
+
+            case 'R': // Subroutine call
+                if(_parseCheckIdentifier(*pattern + 2, '{', '}', id, &size) != eRegexPatternIdOk) {
+                    result.state = eRegexPatternInvalidEscape;
+                    return result;
+                }
+                result.state = eRegexPatternMetaClass;
+                result.len = size + 4; // \R{size}
                 result.c = *(*pattern + 1);
                 return result;
 
@@ -3492,21 +3501,9 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
             case eRegexPatternMetaClass:
                 switch(c.c) {
                     case 'R': // subroutine call
-#if 1
-                        if((id_status = parseCheckIdentifier(&pattern, '{', '}', &str, &len)) != eRegexPatternIdOk) {
-                            SET_RESULT(eCompileMalformedSubExprName);
-                        }
                         if((index = regexSubroutineIdxGetIndex(build, str, len)) <= 0) {
                             SET_RESULT(eCompileUnknownSubroutine);
                         }
-#else
-                        if(!parseCheckNextPatternChar(&pattern, '{')) {
-                            SET_RESULT(eCompileMalformedSubExprName);
-                        }
-                        if((index = regexSubroutineIdxCall(build, &pattern)) <= 0) {
-                            SET_RESULT((index == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName));
-                        }
-#endif
                         if(!regexTokenCreate(tokens, eTokenCall, index, NULL, 0, 0)) {
                             SET_RESULT(eCompileOutOfMem);
                         }
