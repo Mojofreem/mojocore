@@ -412,18 +412,10 @@ typedef void *(*regexMemAllocator_t)(size_t size, void *ctx);
 typedef void (*regexMemDeallocator_t)(void *ptr, void *ctx);
 typedef void *(*regexMemReallocator_t)(void *ptr, size_t old_size, size_t new_size, void *ctx);
 
-typedef struct regex_mem_allocator_s regex_mem_allocator_t;
-struct regex_mem_allocator_s {
-    regexMemAllocator_t alloc;
-    regexMemDeallocator_t dealloc;
-    regexMemReallocator_t re_alloc;
-    void *context;
-};
-
-regex_mem_allocator_t regexGetMemoryAllocConfig(regexMemAllocator_t alloc,
-                                                regexMemDeallocator_t dealloc,
-                                                regexMemReallocator_t re_alloc,
-                                                void *context);
+void regexSetMemoryAllocators(regexMemAllocator_t alloc,
+                              regexMemDeallocator_t dealloc,
+                              regexMemReallocator_t re_alloc,
+                              void *context);
 
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
@@ -462,7 +454,7 @@ struct regex_compile_ctx_s {
 
 const char *regexGetCompileStatusStr(eRegexCompileStatus_t status);
 eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
-                                   unsigned int flags, regex_mem_allocator_t *allocator);
+                                   unsigned int flags);
 
 void regexVMPrintProgram(FILE *fp, regex_vm_t *vm);
 
@@ -532,53 +524,147 @@ static void *_regexDefMemReallocator(void *ptr, size_t old_size, size_t new_size
     return ptr;
 }
 
-#if 1
 regexMemAllocator_t _regexAlloc = _regexDefMemAllocator;
 regexMemDeallocator_t _regexDealloc = _regexDefMemDeallocator;
 regexMemReallocator_t _regexRealloc = _regexDefMemReallocator;
 void *_regexMemContext = NULL;
-#endif
 
-regex_mem_allocator_t regexGetMemoryAllocConfig(regexMemAllocator_t alloc,
-                                                regexMemDeallocator_t dealloc,
-                                                regexMemReallocator_t re_alloc,
-                                                void *context) {
-    regex_mem_allocator_t allocator;
-
-    allocator.alloc = alloc;
-    allocator.dealloc = dealloc;
-    allocator.re_alloc = re_alloc;
-    allocator.context = context;
-    return allocator;
-}
-
-regex_mem_allocator_t regexGetDefMemoryAllocConfig(void) {
-    return regexGetMemoryAllocConfig(_regexDefMemAllocator,
-                                     _regexDefMemDeallocator,
-                                     _regexDefMemReallocator,
-                                     NULL);
+void regexSetMemoryAllocators(regexMemAllocator_t alloc,
+                              regexMemDeallocator_t dealloc,
+                              regexMemReallocator_t re_alloc,
+                              void *context) {
+    _regexAlloc = alloc;
+    _regexDealloc = dealloc;
+    _regexRealloc = re_alloc;
+    _regexMemContext = context;
 }
 
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
-// If len == -1, copies the string up to the null terminator '\0'
-char *_regexStrdup(const char *str, size_t len) {
-    char *ptr;
+#define RE_STR_NULL_TERM -1
 
-    if(len == -1) {
-        len = strlen(str) + 1;
+// If len == -1, copies the string up to the null terminator '\0'
+static unsigned char *_regexStrdup(const unsigned char *str, size_t len) {
+    unsigned char *ptr;
+
+    if(len == RE_STR_NULL_TERM) {
+        len = strlen((char *)str) + 1;
     }
 
-    if((ptr = _regexAlloc(len, _regexMemContext)) == NULL) {
+    if((ptr = _regexAlloc(len + 1, _regexMemContext)) == NULL) {
         return NULL;
     }
     memcpy(ptr, str, len);
+    ptr[len] = '\0';
     return ptr;
+}
+
+// If len == RE_STR_NULL_TERM (-1), assumes that both strings are null terminated
+// Note: comparison is done with memcmp, to ensure we can handle embedded nulls
+static int _regexStrncmp(const unsigned char *str_a, const unsigned char *str_b, size_t len) {
+    if((str_a == NULL) || (str_b == NULL)) {
+        return str_a != str_b;
+    }
+    if(len == RE_STR_NULL_TERM) {
+        return memcmp(str_a, str_b, strlen((char *)str_a));
+    }
+    return memcmp(str_a, str_b, len);
 }
 
 /////////////////////////////////////////////////////////////////////////////
 // String table management and data reproduction
 /////////////////////////////////////////////////////////////////////////////
+
+typedef struct regex_str_entry_s regex_str_entry_t;
+struct regex_str_entry_s {
+    unsigned char *str;
+    int len;
+    regex_str_entry_t *next;
+};
+
+typedef struct regex_str_table_s regex_str_table_t;
+struct regex_str_table_s {
+    regex_str_entry_t *entries;
+    int size;
+};
+
+// Ensure that only a single entry for the data exists. When adding, if the
+// data already exists in the table, then do not add a new entry.
+#define RE_STR_TABLE_DEDUPE      0x01u
+
+// Retain the data provided to the table. The table retains ownership of the
+// pointer, and will free it upon removal.
+#define RE_STR_TABLE_RETAIN_PTR    0x02u
+
+static int _regexStrTableEntryAdd(regex_str_table_t *table, size_t entry_size,
+                                  unsigned char *entry_data, unsigned int flags,
+                                  int *deduped) {
+    regex_str_entry_t *entry, *walk;
+    int index;
+
+    if(entry_size == RE_STR_NULL_TERM) {
+        entry_size = ((entry_data != NULL) ? strlen((char *)entry_data) : 0);
+    }
+    if(flags & RE_STR_TABLE_DEDUPE) {
+        for(index = 0, entry = table->entries; entry != NULL; entry = entry->next, index++) {
+            if((entry->len == entry_size) && (!_regexStrncmp(entry_data, entry->str, entry_size))) {
+                break;
+            }
+        }
+        if(entry != NULL) {
+            if(deduped != NULL) {
+                *deduped = 1;
+            }
+            return index;
+        }
+    }
+    if((entry = _regexAlloc(sizeof(regex_str_entry_t), _regexMemContext)) == NULL) {
+        return -1;
+    }
+    entry->len = entry_size;
+    if((flags & RE_STR_TABLE_RETAIN_PTR) || (entry_data == NULL)) {
+        entry->str = entry_data;
+    } else {
+        if((entry->str = _regexStrdup(entry_data, entry_size)) == NULL) {
+            return -1;
+        }
+    }
+    if(table->entries == NULL) {
+        table->entries = entry;
+    } else {
+        for(walk = table->entries; walk->next != NULL; walk = walk->next);
+        walk->next = entry;
+    }
+    table->size++;
+    return table->size - 1;
+}
+
+static const unsigned char *_regexStrTableEntryGet(regex_str_table_t *table, int index, int *len) {
+    regex_str_entry_t *walk;
+
+    if((index < 0) || (index >= table->size)) {
+        return NULL;
+    }
+    for(walk = table->entries; index > 0; walk = walk->next, index--);
+    if(len != NULL) {
+        *len = walk->len;
+    }
+    return walk->str;
+}
+
+static void _regexStrTableFreeAll(regex_str_table_t *table) {
+    regex_str_entry_t *walk, *next;
+
+    for(walk = table->entries; walk != NULL; walk = next) {
+        next = walk->next;
+        if(walk->str != NULL) {
+            _regexDealloc(walk->str, _regexMemContext);
+        }
+        _regexDealloc(walk, _regexMemContext);
+    }
+    table->entries = NULL;
+    table->size = 0;
+}
 
 // Ensure that only a single entry for the data exists. When adding, if the
 // data already exists in the table, then do not add a new entry.
@@ -647,7 +733,7 @@ int regexStrTableEntryAdd(char ***table, int *table_size, size_t entry_size,
     if((flags & REGEX_TABLE_KEEP_PTR) || (entry_data == NULL)) {
         (*table)[index] = (char *)entry_data;
     } else {
-        if(((*table)[index] = _regexStrdup(entry_data,
+        if(((*table)[index] = (char *)_regexStrdup((unsigned char *)entry_data,
                                            entry_size - ((flags & REGEX_TABLE_NULL_TERMINATE) ? 1 : 0))) == NULL) {
             return -1;
         }
@@ -1179,7 +1265,7 @@ mojo_unicode_class_t _uax_db_default_import_table[] = {
 
 mojo_unicode_class_t _subroutine_test = {
     NULL, "test",
-    "\\uA000-\\uA0FF",
+    "A-Za-z\\uA000-\\uA0FF",
     //"A-Za-z\\u0123-\\u0138\\uA000-\\uA0FF",
     NULL
 };
@@ -1564,7 +1650,7 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
         calcCrc32(pattern, strlen(pattern), &(entry->crc));
     }
     if((name != NULL) && (entry->name == NULL) && (nameLen >= 0)) {
-        if((entry->name = _regexStrdup(name, nameLen + 1)) == NULL) {
+        if((entry->name = (char *)_regexStrdup((unsigned char *)name, nameLen + 1)) == NULL) {
             return 0;
         }
         entry->name[nameLen] = '\0';
@@ -1584,13 +1670,21 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
 // Character parsing, assists with escaped chars
 /////////////////////////////////////////////////////////////////////////////
 
-int parseIsHexdigit(char c) {
-    return (((c >= 'a') && (c <= 'f')) ||       // a - f
-            ((c >= 'A') && (c <= 'F')) ||       // A - F
-            ((c >= '0') && (c <= '9')));        // 0 - 9
+static int _parseIsHexDigit(char c) {
+    return (((c >= 'a') && (c <= 'f')) ||   // a - f
+            ((c >= 'A') && (c <= 'F')) ||   // A - F
+            ((c >= '0') && (c <= '9')));    // 0 - 9
 }
 
-int parseGetHexValue(char c) {
+static int _parseIsIdChar(char c) {
+    return (((c >= 'a') && (c <= 'z')) ||   // a - z
+            ((c >= 'A') && (c <= 'Z')) ||   // A - Z
+            ((c >= '0') && (c <= '9')) ||   // 0 - 9
+            (c == '_') || (c == '-'));      // _, -
+
+}
+
+static int _parseHexValueGet(char c) {
     if ((c >= 'a') && (c <= 'f')) {
         return c - 'a' + 10;
     } else if((c >= 'A') && (c <= 'F')) {
@@ -1601,52 +1695,51 @@ int parseGetHexValue(char c) {
     return 0; // This should never be reached if c is a hex digit
 }
 
+static int _parseHexValueStr(const char *str, int len, unsigned int *value) {
+    unsigned int val = 0;
+    int cnt;
+
+    for(cnt = 0; len && _parseIsHexDigit(*str); len--, str++, cnt++) {
+        val *= 16;
+        val += _parseHexValueGet(*str);
+    }
+    *value = val;
+    return !len;
+}
+
 typedef enum {
-    eRegexPatternEnd = 0,
-    eRegexPatternChar,
-    eRegexPatternUnicode,
-    eRegexPatternInvalid,
-    eRegexPatternInvalidEscape,
-    eRegexPatternMetaChar,
-    eRegexPatternMetaClass,
-    eRegexPatternUnicodeMetaClass,
-    eRegexPatternEscapedChar
+    eRegexPatternEnd = 0,           // Reached the end of the pattern string '\0'
+    eRegexPatternChar,              // A valid pattern character (0-256)
+    eRegexPatternUnicode,           // A unicode utf8 escaped character
+    eRegexPatternInvalid,           // An unknown escape value
+    eRegexPatternInvalidEscape,     // An invalid escape value (malformed)
+    eRegexPatternMetaChar,          // A metacharacter
+    eRegexPatternMetaClass,         // A meta-class (ie., \d, \s, \w)
+    eRegexPatternUnicodeMetaClass,  // A utf8 meta-class (ie., \p{...})
+    eRegexPatternEscapedChar        // An escaped character (literal metachar, C escapes)
 } eRegexPatternCharState_t;
 
 typedef struct parseChar_s parseChar_t;
 struct parseChar_s {
-    eRegexPatternCharState_t state;
-    int c;
+    eRegexPatternCharState_t state; // identity of the parsed value
+    int len;    // length of the parse value (for position advance)
+    int c;  // parsed character value
 };
 
-int parsePatternIsValid(parseChar_t *pc) {
-    if((pc->state == eRegexPatternEnd) || (pc->state == eRegexPatternInvalid) ||
-       (pc->state == eRegexPatternInvalidEscape)) {
-        return 0;
+static int _parsePatternIsValid(parseChar_t *pc) {
+    switch(pc->state) {
+        case eRegexPatternEnd:
+        case eRegexPatternInvalid:
+        case eRegexPatternInvalidEscape:
+            return 0;
+        default:
+            return 1;
     }
-    return 1;
 }
 
-void parsePatternCharAdvance(const char **pattern) {
-    int k;
-
-    if(**pattern == '\\') {
-        if((*(*pattern + 1) == 'x') && (*(*pattern + 2) != '\0') && (*(*pattern + 3) != '\0')) {
-            *pattern += 4; // \x##
-        } else if((*(*pattern + 1) == 'u') && (*(*pattern + 2) != '\0') && (*(*pattern + 2) != '{') &&
-                  (*(*pattern + 3) != '\0') && (*(*pattern + 4) != '\0') && (*(*pattern + 5) != '\0')) {
-            *pattern += 6; // \u####
-        } else if((*(*pattern + 1) == 'u') && (*(*pattern + 2) != '{')) {
-            for(k = 3; (*(*pattern + k) != '\0') && (*(*pattern + k) != '}'); k++);
-            *pattern += k + 1; // \u{#...}
-        } else if((*(*pattern + 1) == 'p') && (*(*pattern + 2) == '{')) {
-            for(k = 3; (*(*pattern + k) != '\0') && (*(*pattern + k) != '}'); k++);
-            *pattern += k + 1;
-        } else if((*(*pattern + 1) != '\0')) {
-            *pattern += 2;
-        }
-    } else if(**pattern != '\0'){
-        (*pattern)++;
+static void _parsePatternCharAdvance(const char **pattern, parseChar_t *pc) {
+    if(_parsePatternIsValid(pc)) {
+        (*pattern) += pc->len;
     }
 }
 
@@ -1656,23 +1749,19 @@ int parseIsAlnum(char c) {
             ((c >= '0') && (c <= '9')));        // 0 - 9
 }
 
-int parseIsIdChar(char c) {
-    return (parseIsAlnum(c) || (c == '_') || (c == '-'));
-}
+static parseChar_t _parseGetNextPatternChar(const char **pattern, const char **id, int *len);
 
-parseChar_t parseGetNextPatternChar(const char **pattern, const char **id, int *len);
-
-int parseCheckNextPatternChar(const char **pattern, char c) {
+static int _parseCheckNextPatternChar(const char **pattern, char c) {
     parseChar_t pc;
 
-    pc = parseGetNextPatternChar(pattern, NULL, NULL);
-    if(!parsePatternIsValid(&pc)) {
+    pc = _parseGetNextPatternChar(pattern, NULL, NULL);
+    if(!_parsePatternIsValid(&pc)) {
         return 0;
     }
     if((pc.c == '\0') || (pc.c != c)) {
         return 0;
     }
-    parsePatternCharAdvance(pattern);
+    _parsePatternCharAdvance(pattern, &pc);
     return 1;
 }
 
@@ -1682,13 +1771,33 @@ typedef enum {
     eRegexPatternIdMissing
 } eRegexPatternId_t;
 
+static eRegexPatternId_t _parseCheckIdentifier(const char *pattern, int start, int end, const char **id, int *len) {
+    int k;
+    const char *ptr = pattern;
+
+    if(!_parseCheckNextPatternChar(&ptr, (char)start)) {
+        return eRegexPatternIdMissing;
+    }
+    for(k = 0; _parseIsIdChar(ptr[k]) && (ptr[k] != end); k++);
+    if((k == 0) || (ptr[k] != end)) {
+        return eRegexPatternIdMalformed;
+    }
+    if(id != NULL) {
+        *id = ptr;
+    }
+    if(len != NULL) {
+        *len = k;
+    }
+    return eRegexPatternIdOk;
+}
+
 eRegexPatternId_t parseCheckIdentifier(const char **pattern, int start, int end, const char **id, int *len) {
     int k;
 
-    if(!parseCheckNextPatternChar(pattern, start)) {
+    if(!_parseCheckNextPatternChar(pattern, start)) {
         return eRegexPatternIdMissing;
     }
-    for(k = 0; parseIsIdChar((*pattern)[k]) && ((*pattern)[k] != end); k++);
+    for(k = 0; _parseIsIdChar((*pattern)[k]) && ((*pattern)[k] != end); k++);
     if((k == 0) || ((*pattern)[k] != end)) {
         *pattern += k;
         return eRegexPatternIdMalformed;
@@ -1703,14 +1812,14 @@ eRegexPatternId_t parseCheckIdentifier(const char **pattern, int start, int end,
     return eRegexPatternIdOk;
 }
 
-parseChar_t parseGetNextPatternChar(const char **pattern, const char **id, int *len) {
+static parseChar_t _parseGetNextPatternChar(const char **pattern, const char **id, int *len) {
     parseChar_t result = {
         .c = 0,
-        .state = eRegexPatternInvalid
+        .state = eRegexPatternInvalid,
+        .len = 1
     };
-    int k;
-    int digits;
-    int wrapped;
+    eRegexPatternId_t id_status;
+    int size;
     const char *ptr;
 
     if(**pattern == '\0') {
@@ -1719,6 +1828,7 @@ parseChar_t parseGetNextPatternChar(const char **pattern, const char **id, int *
     }
 
     if(**pattern == '\\') {
+        result.len = 2;
         switch(*(*pattern + 1)) {
             case '\0': // End of pattern string
                 result.state = eRegexPatternInvalid;
@@ -1726,16 +1836,15 @@ parseChar_t parseGetNextPatternChar(const char **pattern, const char **id, int *
 
             case 'p': // unicode class
             case 'P': // unicode class (inverted)
-                k = *(*pattern + 1);
-                if(id != NULL) {
-                    *id = (*pattern) + 3;
-                }
-                ptr = (*pattern) + 2;
-                if(parseCheckIdentifier(&ptr, '{', '}', id, len) != eRegexPatternIdOk) {
+                if(_parseCheckIdentifier(*pattern + 2, '{', '}', id, &size) != eRegexPatternIdOk) {
                     result.state = eRegexPatternInvalidEscape;
                     return result;
                 }
-                result.c = k;
+                if(len != NULL) {
+                    *len = size;
+                }
+                result.len = size + 4; // \p{size}
+                result.c = *(*pattern + 1);
                 result.state = eRegexPatternUnicodeMetaClass;
                 return result;
 
@@ -1784,45 +1893,32 @@ parseChar_t parseGetNextPatternChar(const char **pattern, const char **id, int *
                 return result;
 
             case 'u': // unicode codepoint (0 - 0x10FFFF)
-                if(*(*pattern + 2) == '{') {
-                    wrapped = 1;
-                    k = 3;
-                    digits = 6;
-                } else {
-                    wrapped = 0;
-                    k = 2;
-                    digits = 4;
-                }
-                for(result.c = 0; digits > 0; k++, digits--) {
-                    result.c *= 16;
-                    if(parseIsHexdigit(*(*pattern + k))) {
-                        result.c += parseGetHexValue(*(*pattern + k));
-                    } else if(*(*pattern + k) == '}') {
-                        if(wrapped && (digits != 6)) {
-                            break;
-                        }
-                        return result;
-                    } else {
+                if((id_status = _parseCheckIdentifier(*pattern + 2, '{', '}', &ptr, &size)) == eRegexPatternIdMalformed) {
+                    result.state = eRegexPatternInvalidEscape;
+                    return result;
+                } else if(id_status == eRegexPatternIdMissing) {
+                    if(!_parseHexValueStr(*pattern + 2, 4, (unsigned int *)(&result.c))) {
+                        result.state = eRegexPatternInvalidEscape;
                         return result;
                     }
-                }
-                if(wrapped && (*(*pattern + k) != '}')) {
-                    return result;
+                    result.len = 6;
+                } else {
+                    if(!_parseHexValueStr(ptr, size, (unsigned int *)(&result.c))) {
+                        result.state = eRegexPatternInvalidEscape;
+                        return result;
+                    }
+                    result.len = size + 4;
                 }
                 result.state = eRegexPatternUnicode;
                 return result;
 
             case 'x': // hexidecimal encoded byte
-                for(k = 0, result.c = 0; k < 2; k++) {
-                    (*pattern)++;
-                    result.c *= 16;
-                    if(parseIsHexdigit(**pattern)) {
-                        result.c += parseGetHexValue(**pattern);
-                    } else {
-                        return result;
-                    }
+                if(!_parseHexValueStr(*pattern + 2, 2, (unsigned int *)(&result.c))) {
+                    result.state = eRegexPatternInvalidEscape;
+                } else {
+                    result.len = 4;
+                    result.state = eRegexPatternEscapedChar;
                 }
-                result.state = eRegexPatternEscapedChar;
                 return result;
 
             case '\\':  // literal backslash
@@ -1967,7 +2063,7 @@ int parseUtf8DecodeSequence(const char *str) {
     return -1;
 }
 
-// parseGetPatternStrLen determines the length in characters AND bytes to
+// _parseGetPatternStrLen determines the length in characters AND bytes to
 // represent a string in the pattern. The low word is the character count, and
 // the high word is the number of additional bytes needed to accommodate any
 // utf8 encoded characters within the string.
@@ -1975,14 +2071,14 @@ int parseUtf8DecodeSequence(const char *str) {
 #define PARSE_DEC_UTF8_COUNT(count)         (((unsigned int)count >> 16u) && 0xFFu)
 #define PARSE_DEC_CHAR_COUNT(count)         ((unsigned int)count & 0xFFFFFFu)
 
-int parseGetPatternStrLen(const char **pattern) {
+static int _parseGetPatternStrLen(const char **pattern) {
     const char *ptr = *pattern;
     unsigned int count = 0;
     unsigned int utf8 = 0; // additional bytes needed to accommodate utf8 chars in the str
     parseChar_t c;
 
     for(;;) {
-        c = parseGetNextPatternChar(&ptr, NULL, NULL);
+        c = _parseGetNextPatternChar(&ptr, NULL, NULL);
         switch(c.state) {
             case eRegexPatternEnd:
             case eRegexPatternMetaChar:
@@ -2005,11 +2101,11 @@ int parseGetPatternStrLen(const char **pattern) {
                 return -1;
 
         }
-        parsePatternCharAdvance(&ptr);
+        _parsePatternCharAdvance(&ptr, &c);
     }
 }
 
-// Allocates len + 1 bytes and decodes a string from pattern into the buffer.
+// Allocates size + 1 bytes and decodes a string from pattern into the buffer.
 // Note: this function expects the len to have been pre-validated, and does NOT
 // recognize the null character, to allow it to be used as an actual value
 // within the string.
@@ -2024,8 +2120,8 @@ char *parseGetPatternStr(const char **pattern, int len, int size) {
     ptr = str;
 
     for(; len; len--) {
-        c = parseGetNextPatternChar(pattern, NULL, NULL);
-        parsePatternCharAdvance(pattern);
+        c = _parseGetNextPatternChar(pattern, NULL, NULL);
+        _parsePatternCharAdvance(pattern, &c);
         if(c.state == eRegexPatternUnicode) {
             for(k = parseUtf8EncodingByteLen(c.c); k; k--) {
                 *ptr = (char)(((unsigned int)c.c >> (unsigned int)((k - 1) * 8)) & 0xFFu);
@@ -2927,9 +3023,9 @@ int parseCharClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_build_t
 
     memset(bitmap, 0, 32);
 
-    c = parseGetNextPatternChar(pattern, NULL, NULL);
-    if(parsePatternIsValid(&c)) {
-        parsePatternCharAdvance(pattern);
+    c = _parseGetNextPatternChar(pattern, NULL, NULL);
+    if(_parsePatternIsValid(&c)) {
+        _parsePatternCharAdvance(pattern, &c);
     }
     if(c.state == eRegexPatternEnd) {
         *status = eCompileCharClassIncomplete;
@@ -2938,9 +3034,9 @@ int parseCharClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_build_t
 
     if(c.state == eRegexPatternMetaChar && c.c == '^') {
         invert = 1;
-        c = parseGetNextPatternChar(pattern, NULL, NULL);
-        if(parsePatternIsValid(&c)) {
-            parsePatternCharAdvance(pattern);
+        c = _parseGetNextPatternChar(pattern, NULL, NULL);
+        if(_parsePatternIsValid(&c)) {
+            _parsePatternCharAdvance(pattern, &c);
         }
     }
 
@@ -3018,9 +3114,9 @@ int parseCharClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_build_t
                 *status = eCompileCharClassIncomplete;
                 return 0;
         }
-        c = parseGetNextPatternChar(pattern, NULL, NULL);
-        if(parsePatternIsValid(&c)) {
-            parsePatternCharAdvance(pattern);
+        c = _parseGetNextPatternChar(pattern, NULL, NULL);
+        if(_parsePatternIsValid(&c)) {
+            _parsePatternCharAdvance(pattern, &c);
         }
     }
 
@@ -3235,9 +3331,9 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
     for(; *pattern != '\0';) {
         // Get the next character in the pattern. The helper function assists
         // in disambiguating escaped characters.
-        c = parseGetNextPatternChar(&pattern, &str, &len);
-        if(parsePatternIsValid(&c)) {
-            parsePatternCharAdvance(&pattern);
+        c = _parseGetNextPatternChar(&pattern, &str, &len);
+        if(_parsePatternIsValid(&c)) {
+            _parsePatternCharAdvance(&pattern, &c);
         }
 
         switch(c.state) {
@@ -3300,10 +3396,10 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                         // Check for group meta modifiers
                         while(*pattern == '?') {
                             pattern++;
-                            if(parseCheckNextPatternChar(&pattern, 'i')) {
+                            if(_parseCheckNextPatternChar(&pattern, 'i')) {
                                 // Case insensitive matching
                                 flags |= REGEX_TOKEN_FLAG_CASEINS;
-                            } else if(parseCheckNextPatternChar(&pattern, 'P')) {
+                            } else if(_parseCheckNextPatternChar(&pattern, 'P')) {
                                 // Named sub expression
                                 if(named || (flags & (REGEX_TOKEN_FLAG_SUBROUTINE | REGEX_TOKEN_FLAG_NOCAPTURE))) {
                                     SET_RESULT(eCompileConflictingAttrs);
@@ -3315,24 +3411,24 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                                     SET_RESULT(eCompileOutOfMem);
                                 }
                                 named = 1;
-                            } else if(parseCheckNextPatternChar(&pattern, ':')) {
+                            } else if(_parseCheckNextPatternChar(&pattern, ':')) {
                                 // Non-capturing subexpression
                                 if(named || (flags & (REGEX_TOKEN_FLAG_COMPOUND))) {
                                     SET_RESULT(eCompileConflictingAttrs);
                                 }
                                 flags |= REGEX_TOKEN_FLAG_NOCAPTURE;
-                            } else if(parseCheckNextPatternChar(&pattern, '*')) {
+                            } else if(_parseCheckNextPatternChar(&pattern, '*')) {
                                 // Compound capturing subexpression
                                 if(flags & (REGEX_TOKEN_FLAG_NOCAPTURE | REGEX_TOKEN_FLAG_SUBROUTINE)) {
                                     SET_RESULT(eCompileConflictingAttrs);
                                 }
                                 flags |= REGEX_TOKEN_FLAG_COMPOUND;
-                            } else if(parseCheckNextPatternChar(&pattern, 'R')) {
+                            } else if(_parseCheckNextPatternChar(&pattern, 'R')) {
                                 // Named subroutine
                                 if(named || (flags & REGEX_TOKEN_FLAG_COMPOUND)) {
                                     SET_RESULT(eCompileConflictingAttrs);
                                 }
-                                if(!parseCheckNextPatternChar(&pattern, '<')) {
+                                if(!_parseCheckNextPatternChar(&pattern, '<')) {
                                     SET_RESULT(eCompileMalformedSubExprName);
                                 }
                                 if((index = regexSubroutineIdxEntryCreate(build, &pattern)) <= 0) {
@@ -3471,7 +3567,7 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
             case eRegexPatternUnicode:
             case eRegexPatternEscapedChar:
                 // Operand, either character literal or string literal
-                if((len = parseGetPatternStrLen(&pattern)) == -1) {
+                if((len = _parseGetPatternStrLen(&pattern)) == -1) {
                     SET_RESULT(eCompileEscapeCharIncomplete);
                 }
                 if(PARSE_DEC_CHAR_COUNT(len) == 0) {
@@ -4650,7 +4746,7 @@ void regexGetCompileResult(FILE *fp, regex_compile_ctx_t *ctx) {
 
 // Return a compiled regex, or an error and position within the pattern
 eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
-                                   unsigned int flags, regex_mem_allocator_t *allocator) {
+                                   unsigned int flags) {
     regex_vm_build_t build;
 
     if((!regexVerifyTokenDetails()) || (!_regexRegUnicodeInitializeTable())) {
@@ -5495,7 +5591,7 @@ int main(int argc, char **argv) {
     regex_match_t *match;
 
     if(argc > 1) {
-        if(regexCompile(&result, argv[1], 0, NULL) != eCompileOk) {
+        if(regexCompile(&result, argv[1], 0) != eCompileOk) {
             //printf("Compile failed: %s", regexGetCompileStatusStr(result.status));
             regexGetCompileResult(stdout, &result);
             return 1;
