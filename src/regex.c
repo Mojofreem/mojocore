@@ -125,6 +125,8 @@
         no capture global flag
         make evaluation greedy (thread's should run to exhaustion. need to look
             into potential no-advance loops)
+        label all named group save points (start and end)
+        label call instructions with the subroutine name
 
     TODO: Future work (refining, not MVP critical)
         tag meta char class -> char class -> vm path, for better runtime debug
@@ -354,7 +356,13 @@ Regex VM Bytecode (v8 - in development)
         3 - 4 byte). The inverse bit will match any character other than the
         one specified.
 
- */
+
+Subroutine generation issue test:
+ (uses the "test" utf8 class to generate a limited sized subroutine for tracing)
+
+ ^a(?P<foolio>?i\Bcd(?i(?R<chunk>e\p{test}g[hijk])(?*f.o)*)?)(?R<digits>\d+)cat\R{digits}(?:.*)$ abcdefgjfoofoofoo033195cat72364ghj
+
+*/
 
 /////////////////////////////////////////////////////////////////////////////
 
@@ -1143,6 +1151,12 @@ mojo_unicode_class_t _uax_db_default_import_table[] = {
         {"Ll", "Lowercase_Letter", _uax_db_Lowercase_Letter, NULL},
         {"L", "Letter", _uax_db_Letter, NULL},
         {NULL, NULL, NULL, NULL}
+};
+
+mojo_unicode_class_t _subroutine_test = {
+    NULL, "test",
+    "A-Za-z\\u0123-\\u0138\\uA000-\\uA0FF",
+    NULL
 };
 
 static int _regex_unicode_table_initialized = 0;
@@ -4615,6 +4629,12 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
     regex_vm_build_t build;
 
     if((!regexVerifyTokenDetails()) || (!_regexRegUnicodeInitializeTable())) {
+        ctx->status = eCompileInternalError;
+        return ctx->status;
+    }
+
+    if(!regexRegUnicodeCharClassAdd(&_subroutine_test)) {
+        printf("Import failure\n");
         ctx->status = eCompileInternalError;
         return ctx->status;
     }
