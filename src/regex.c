@@ -389,25 +389,13 @@ api
 */
 
 /////////////////////////////////////////////////////////////////////////////
+// Declarations (External)
+/////////////////////////////////////////////////////////////////////////////
 
-#define REGEX_VM_MACHINE_VERSION    7
-
-typedef struct regex_vm_s regex_vm_t;
-struct regex_vm_s {
-    int vm_version;                 // VM machine version
-    unsigned int *program;          // VM encoded regex pattern
-    int size;                       // number of instructions in the program
-    char **string_table;            // table of string literals used in the pattern
-    int string_tbl_size;            // number of strings in the string table
-    int *string_tbl_len;            // table of string lengths for string in the string table
-    unsigned int **class_table;     // table of character class bitmaps (32 bytes each)
-    int class_tbl_size;             // number of bitmaps in the class table
-    unsigned int **utf8_class_table;// table of utf8 encoding class bitmaps (8 bytes each)
-    int utf8_tbl_size;              // number of bitmaps in the utf8 table
-    char **group_table;             // table of subexpression group names
-    int group_tbl_size;             // number of groups in the group table
-};
-
+// Regex global memory allocators. If you change this, be sure and do so
+// BEFORE calling any API functions, or memory management may end up in an
+// unstable state. Any caller provided functions are expected to clear any
+// allocated memory to 0.
 typedef void *(*regexMemAllocator_t)(size_t size, void *ctx);
 typedef void (*regexMemDeallocator_t)(void *ptr, void *ctx);
 typedef void *(*regexMemReallocator_t)(void *ptr, size_t old_size, size_t new_size, void *ctx);
@@ -436,6 +424,40 @@ typedef enum {
     eCompileInternalError
 } eRegexCompileStatus_t;
 
+const char *regexCompileStatusStrGet(eRegexCompileStatus_t status);
+
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+/////////////////////////////////////////////////////////////////////////////
+// Declarations (Internal)
+/////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////////////////////////////
+// Definitions
+/////////////////////////////////////////////////////////////////////////////
+
+
+#define REGEX_VM_MACHINE_VERSION    7
+
+typedef struct regex_vm_s regex_vm_t;
+struct regex_vm_s {
+    int vm_version;                 // VM machine version
+    unsigned int *program;          // VM encoded regex pattern
+    int size;                       // number of instructions in the program
+    char **string_table;            // table of string literals used in the pattern
+    int string_tbl_size;            // number of strings in the string table
+    int *string_tbl_len;            // table of string lengths for string in the string table
+    unsigned int **class_table;     // table of character class bitmaps (32 bytes each)
+    int class_tbl_size;             // number of bitmaps in the class table
+    unsigned int **utf8_class_table;// table of utf8 encoding class bitmaps (8 bytes each)
+    int utf8_tbl_size;              // number of bitmaps in the utf8 table
+    char **group_table;             // table of subexpression group names
+    int group_tbl_size;             // number of groups in the group table
+};
+
+
+#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
+
 #define REGEX_CASE_INSENSITIVE  0x01
 #define REGEX_NO_CAPTURE        0x02
 #define REGEX_DOTALL            0x04
@@ -452,7 +474,6 @@ struct regex_compile_ctx_s {
     regex_vm_t *vm;
 };
 
-const char *regexGetCompileStatusStr(eRegexCompileStatus_t status);
 eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
                                    unsigned int flags);
 
@@ -666,6 +687,108 @@ static void _regexStrTableFreeAll(regex_str_table_t *table) {
     table->size = 0;
 }
 
+/////////////////////////////////////////////////////////////////////////////
+// Subroutine management data structures and support functions
+/////////////////////////////////////////////////////////////////////////////
+
+typedef struct regex_token_s regex_token_t;
+
+typedef struct regex_subroutine_s regex_subroutine_t;
+struct regex_subroutine_s {
+    int id;
+    uint32_t pattern_crc;
+    char *name;
+    char *alias;
+    char *pattern;
+    size_t len;
+    regex_token_t *tokens;
+    uint32_t token_crc;
+    int infixed;
+    regex_subroutine_t *next;
+};
+
+typedef struct regex_subroutine_index_s regex_subroutine_index_t;
+struct regex_subroutine_index_s {
+    regex_subroutine_t *subroutines;
+    int next_id;
+};
+
+// Public domain CRC32 routines from http://home.thep.lu.se/~bjorn/crc/
+
+static uint32_t _regexCalcCrc32ForByte(uint32_t r) {
+    for(int j = 0; j < 8; ++j) {
+        r = (r & 1u ? 0 : (uint32_t) 0xEDB88320L) ^ r >> 1u;
+    }
+    return r ^ (uint32_t)0xFF000000L;
+}
+
+static void _regexCalcCrc32(const void *data, size_t n_bytes, uint32_t* crc) {
+    static uint32_t table[0x100];
+    if(!*table) {
+        for(size_t i = 0; i < 0x100; ++i) {
+            table[i] = _regexCalcCrc32ForByte(i);
+        }
+    }
+    for(size_t i = 0; i < n_bytes; ++i) {
+        *crc = table[((unsigned char)(*crc)) ^ ((unsigned char *)data)[i]] ^ (*crc >> 8u);
+    }
+}
+
+static int _regexSubroutineIndexRegister(regex_subroutine_index_t *index,
+                                         const char *name, const char *alias,
+                                         const char *pattern, size_t pat_len,
+                                         regex_token_t *tokens) {
+    regex_subroutine_t *entry;
+    uint32_t pattern_crc = 0, token_crc = 0;
+
+    if(pattern != NULL) {
+        if(pat_len == RE_STR_NULL_TERM) {
+            pat_len = strlen(pattern);
+        }
+        _regexCalcCrc32(pattern, pat_len, &pattern_crc);
+    }
+
+    if(tokens != NULL) {
+        // TODO - generate a token stream CRC identifier
+    }
+
+    for(entry = index->subroutines; entry != NULL; entry = entry->next) {
+        if((name != NULL) && (!_regexStrncmp((unsigned char *)name,
+                                             (unsigned char *)entry->name,
+                                             RE_STR_NULL_TERM))) {
+            break;
+        } else if((alias != NULL) && (!_regexStrncmp((unsigned char *)alias,
+                                                     (unsigned char *)entry->alias,
+                                                     RE_STR_NULL_TERM))) {
+            break;
+        } else if((pattern != NULL) && (entry->pattern_crc == pattern_crc)) {
+            break;
+        }
+    }
+    // TODO
+    return 0;
+}
+
+static int _regexSubroutineIndexPatternCheck(const char *pattern, size_t len);
+// Register a subroutine ahead of time [name|alias, pattern|tokens]
+// declare a subroutine inline ie., (?R<...>...) [name,pattern | pattern | tokens]
+// implicit subroutine ie., \p{L} [name,alias,tokens]
+// call a subroutine [name|alias|id]
+
+static int _regexSubroutineIndexIdGet(regex_subroutine_index_t *index, const char *name, const char *alias) {
+    return 0;
+}
+
+static regex_subroutine_t *_regexSubroutineIndexEntryGet(regex_subroutine_index_t *index, int id) {
+    return NULL;
+}
+
+
+/////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////
+
+
+
 // Ensure that only a single entry for the data exists. When adding, if the
 // data already exists in the table, then do not add a new entry.
 #define REGEX_TABLE_DEDUPE      0x01u
@@ -862,7 +985,6 @@ typedef enum {
     eRePtrOutB
 } eRePtrListType_t;
 
-typedef struct regex_token_s regex_token_t;
 typedef struct regex_ptrlist_s regex_ptrlist_t;
 struct regex_ptrlist_s {
     eRePtrListType_t type;
@@ -906,21 +1028,21 @@ struct regex_vm_gen_path_s {
     regex_vm_gen_path_t *next;
 };
 
-typedef struct regex_subroutine_s regex_subroutine_t;
-struct regex_subroutine_s {
+typedef struct regex_subroutines_s regex_subroutines_t;
+struct regex_subroutines_s {
     int id;
     uint32_t crc;
     char *name;
     int infixed;
     regex_token_t *tokens;
-    regex_subroutine_t *next;
+    regex_subroutines_t *next;
 };
 
 typedef struct regex_vm_build_s regex_vm_build_t;
 struct regex_vm_build_s {
     regex_vm_t *vm;
     regex_token_t *tokens;
-    regex_subroutine_t *subroutine_index;
+    regex_subroutines_t *subroutine_index;
     regex_vm_pc_patch_t *patch_list;
     regex_vm_gen_path_t *gen_list;
     regex_vm_gen_path_t *subroutine_list;
@@ -929,6 +1051,32 @@ struct regex_vm_build_s {
     int groups;
     int pc;
 };
+
+typedef struct regex_build_s regex_build_t;
+struct regex_build_s {
+    regex_token_t *token_pool;
+    regex_str_table_t string_table;
+    regex_str_table_t group_table;
+    regex_str_table_t class_table;
+    regex_str_table_t utf8_table;
+    regex_ptrlist_t *ptrlist_pool;
+    regex_vm_pc_patch_t *patch_pool;
+    regex_vm_gen_path_t *gen_path_pool;
+};
+
+typedef struct regex_tokenizer_s regex_tokenizer_t;
+struct regex_tokenizer_s {
+    eRegexCompileStatus_t status;
+    const char *pattern;
+    int position;
+    regex_token_t *tokens;
+    regex_tokenizer_t *subpattern;
+};
+
+// Convert a pattern into a token stream
+
+// Manually assemble a token stream
+
 
 int regexVMGroupTableEntryAdd(regex_vm_build_t *build, const char *group,
                               int len, int index);
@@ -1020,7 +1168,7 @@ void regexPrinter_eTokenCall(FILE *fp, regex_token_t *token) {
 }
 
 void regexPrinter_eTokenSubExprStart(FILE *fp, regex_token_t *token) {
-    regex_subroutine_t *sub;
+    regex_subroutines_t *sub;
 
     if(token->flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
         fprintf(fp, "subroutine %d", token->sub_index);
@@ -1515,10 +1663,10 @@ void calcCrc32(const void *data, size_t n_bytes, uint32_t* crc) {
     }
 }
 
-regex_subroutine_t *regexSubroutineIdxCreate(regex_vm_build_t *build) {
-    regex_subroutine_t *entry, *walk;
+regex_subroutines_t *regexSubroutineIdxCreate(regex_vm_build_t *build) {
+    regex_subroutines_t *entry, *walk;
 
-    if((entry = _regexAlloc(sizeof(regex_subroutine_t), _regexMemContext)) == NULL) {
+    if((entry = _regexAlloc(sizeof(regex_subroutines_t), _regexMemContext)) == NULL) {
         return NULL;
     }
     entry->id = 1;
@@ -1534,8 +1682,8 @@ regex_subroutine_t *regexSubroutineIdxCreate(regex_vm_build_t *build) {
     return entry;
 }
 
-regex_subroutine_t *regexSubroutineIdxGet(regex_vm_build_t *build, int id) {
-    regex_subroutine_t *entry;
+regex_subroutines_t *regexSubroutineIdxGet(regex_vm_build_t *build, int id) {
+    regex_subroutines_t *entry;
 
     for(entry = build->subroutine_index; entry != NULL; entry = entry->next) {
         if(entry->id == id) {
@@ -1550,8 +1698,8 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                                            regex_token_t **tokens,
                                            regex_vm_build_t *build);
 
-regex_subroutine_t *regexSubroutineIdxGetPattern(regex_vm_build_t *build, const char *pattern) {
-    regex_subroutine_t *walk;
+regex_subroutines_t *regexSubroutineIdxGetPattern(regex_vm_build_t *build, const char *pattern) {
+    regex_subroutines_t *walk;
     uint32_t crc = 0;
 
     calcCrc32(pattern, strlen(pattern), &crc);
@@ -1567,8 +1715,8 @@ regex_subroutine_t *regexSubroutineIdxGetPattern(regex_vm_build_t *build, const 
     return NULL;
 }
 
-regex_subroutine_t *regexSubroutineIdxGetName(regex_vm_build_t *build, const char *name, int len) {
-    regex_subroutine_t *walk;
+regex_subroutines_t *regexSubroutineIdxGetName(regex_vm_build_t *build, const char *name, int len) {
+    regex_subroutines_t *walk;
 
     for(walk = build->subroutine_index; walk != NULL; walk = walk->next) {
         if((walk->name != NULL) && (!strncmp(walk->name, name, len))) {
@@ -1579,7 +1727,7 @@ regex_subroutine_t *regexSubroutineIdxGetName(regex_vm_build_t *build, const cha
 }
 
 int regexSubroutineIdxGetIndex(regex_vm_build_t *build, const char *name, int len) {
-    regex_subroutine_t *walk;
+    regex_subroutines_t *walk;
 
     for(walk = build->subroutine_index; walk != NULL; walk = walk->next) {
         if((walk->name != NULL) && (!strncmp(walk->name, name, len))) {
@@ -1590,7 +1738,7 @@ int regexSubroutineIdxGetIndex(regex_vm_build_t *build, const char *name, int le
 }
 
 void regexSubroutineIdxFree(regex_vm_build_t *build) {
-    regex_subroutine_t *walk, *next;
+    regex_subroutines_t *walk, *next;
 
     for(walk = build->subroutine_index; walk != NULL; walk = next) {
         next = walk->next;
@@ -1611,7 +1759,7 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
                                                          int *sub_id) {
     int pos;
     eRegexCompileStatus_t status;
-    regex_subroutine_t *entry = NULL;
+    regex_subroutines_t *entry = NULL;
 
     // Is there already a subroutine index entry?
     if((sub_id != NULL) && (*sub_id > 0)) {
@@ -3285,7 +3433,7 @@ int regexSubroutineIdxEntryCreate(regex_vm_build_t *build, const char **pattern)
 // entry was not found, and -1 if the name is malformed.
 int regexSubroutineIdxCall(regex_vm_build_t *build, const char **pattern) {
     int len;
-    regex_subroutine_t *subroutine;
+    regex_subroutines_t *subroutine;
 
     for(len = 0; (*pattern)[len] != '}' && (*pattern)[len] != '\0'; len++) {
         if(!parseIsAlnum((*pattern)[len])) {
@@ -3869,7 +4017,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_vm_build_t *build, regex_t
                                                 int sub_expression, unsigned int group_flags) {
     regex_token_t *token = NULL, *routine, *operators = NULL;
     regex_token_t *operands = NULL, *subexpr;
-    regex_subroutine_t *subindex;
+    regex_subroutines_t *subindex;
     eRegexCompileStatus_t status;
     int group_num;
 
@@ -4643,7 +4791,7 @@ void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
 // Pattern compilation
 /////////////////////////////////////////////////////////////////////////////
 
-const char *regexGetCompileStatusStr(eRegexCompileStatus_t status) {
+const char *regexCompileStatusStrGet(eRegexCompileStatus_t status) {
     switch(status) {
         case eCompileOk: return "compiled successfully";
         case eCompileCharClassRangeIncomplete: return "char class range is incomplete";
@@ -4730,8 +4878,8 @@ void regexEmitPatternDetail(FILE *fp, const char *label, const char *pattern, si
     fprintf(fp, "(@%-*d)  %*.*s^\n", lead - 5, pos, pos - offset, pos - offset, "");
 }
 
-void regexGetCompileResult(FILE *fp, regex_compile_ctx_t *ctx) {
-    fprintf(fp, "Result: %s\n", regexGetCompileStatusStr(ctx->status));
+void regexCompileResultEmit(FILE *fp, regex_compile_ctx_t *ctx) {
+    fprintf(fp, "Result: %s\n", regexCompileStatusStrGet(ctx->status));
     if(ctx->status != eCompileOk) {
         regexEmitPatternDetail(fp, "Pattern", ctx->pattern, strlen(ctx->pattern), ctx->position, 78);
 
@@ -5589,11 +5737,11 @@ int main(int argc, char **argv) {
 
     if(argc > 1) {
         if(regexCompile(&result, argv[1], 0) != eCompileOk) {
-            //printf("Compile failed: %s", regexGetCompileStatusStr(result.status));
-            regexGetCompileResult(stdout, &result);
+            //printf("Compile failed: %s", regexCompileStatusStrGet(result.status));
+            regexCompileResultEmit(stdout, &result);
             return 1;
         }
-        regexGetCompileResult(stdout, &result);
+        regexCompileResultEmit(stdout, &result);
         if(argc > 2) {
             regexVMPrintProgram(stdout, result.vm);
             printf("-------------------------\n");

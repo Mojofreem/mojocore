@@ -179,7 +179,7 @@ on the result of the compilation via the `eRegexCompileStatus_t` value:
 
 If an error was encountered, the `position` field of the context structure will
 indicate the pattern index at which the error occurred. For convenience, the
-`const char *regexGetCompileStatusStr(eRegexCompileStatus_t status);` function
+`const char *regexCompileStatusStrGet(eRegexCompileStatus_t status);` function
 will provide a human readable string version of the enum value. The regex VM
 program is stored in the `vm` field of the context.
 
