@@ -1083,6 +1083,7 @@ regex_tokenizer_t *regexTokenizerCreate(const char *pattern) {
         return NULL;
     }
     tokenizer->pattern = pattern;
+    return tokenizer;
 }
 
 void regexTokenizerDestroy(regex_tokenizer_t *tokenizer) {
@@ -3756,6 +3757,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                 continue;
         }
     }
+    return eCompileOk;
 }
 
 eRegexCompileStatus_t regexTokenizePattern(regex_build_t *build,
