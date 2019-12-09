@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 /*
     Flags
@@ -770,10 +771,9 @@ static int _regexSubroutineIndexRegister(regex_subroutine_index_t *index,
 }
 
 static int _regexSubroutineIndexPatternCheck(const char *pattern, size_t len);
-// Register a subroutine ahead of time [name|alias, pattern|tokens]
-// declare a subroutine inline ie., (?R<...>...) [name,pattern | pattern | tokens]
-// implicit subroutine ie., \p{L} [name,alias,tokens]
-// call a subroutine [name|alias|id]
+// Pre register a subroutine: name/alias,pattern OR name/alias,tokens
+// Subroutine declared inline: name [gets ID, flags token] THEN tokens [associated in the shunting yard]
+// utf8 class subroutine: registered from the class index when referenced, name/alias,pattern registered
 
 static int _regexSubroutineIndexIdGet(regex_subroutine_index_t *index, const char *name, const char *alias) {
     return 0;
@@ -1062,6 +1062,9 @@ struct regex_build_s {
     regex_ptrlist_t *ptrlist_pool;
     regex_vm_pc_patch_t *patch_pool;
     regex_vm_gen_path_t *gen_path_pool;
+
+    // transitionary throwback
+    regex_vm_build_t build;
 };
 
 typedef struct regex_tokenizer_s regex_tokenizer_t;
@@ -1072,6 +1075,24 @@ struct regex_tokenizer_s {
     regex_token_t *tokens;
     regex_tokenizer_t *subpattern;
 };
+
+regex_tokenizer_t *regexTokenizerCreate(const char *pattern) {
+    regex_tokenizer_t *tokenizer;
+
+    if((tokenizer = _regexAlloc(sizeof(regex_tokenizer_t), _regexMemContext)) == NULL) {
+        return NULL;
+    }
+    tokenizer->pattern = pattern;
+}
+
+void regexTokenizerDestroy(regex_tokenizer_t *tokenizer) {
+    regex_tokenizer_t *sub;
+
+    for(; tokenizer != NULL; tokenizer = sub) {
+        sub = tokenizer->subpattern;
+        _regexDealloc(tokenizer, _regexMemContext);
+    }
+}
 
 // Convert a pattern into a token stream
 
@@ -1693,10 +1714,8 @@ regex_subroutines_t *regexSubroutineIdxGet(regex_vm_build_t *build, int id) {
     return NULL;
 }
 
-eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
-                                           int *pos,
-                                           regex_token_t **tokens,
-                                           regex_vm_build_t *build);
+eRegexCompileStatus_t regexTokenizePattern(regex_build_t *build,
+                                           regex_tokenizer_t *tokenizer);
 
 regex_subroutines_t *regexSubroutineIdxGetPattern(regex_vm_build_t *build, const char *pattern) {
     regex_subroutines_t *walk;
@@ -1750,26 +1769,28 @@ void regexSubroutineIdxFree(regex_vm_build_t *build) {
     build->subroutine_index = NULL;
 }
 
-eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
+eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_build_t *build,
+                                                         regex_tokenizer_t *tokenizer,
+                                                         regex_token_t **tokens,
                                                          regex_token_t **subroutine,
-                                                         regex_vm_build_t *build,
+                                                         regex_vm_build_t *old_build,
                                                          const char *pattern,
                                                          const char *name,
                                                          int nameLen,
                                                          int *sub_id) {
-    int pos;
     eRegexCompileStatus_t status;
     regex_subroutines_t *entry = NULL;
+    regex_tokenizer_t *subtokenizer;
 
     // Is there already a subroutine index entry?
     if((sub_id != NULL) && (*sub_id > 0)) {
-        if((entry = regexSubroutineIdxGet(build, *sub_id)) == NULL) {
+        if((entry = regexSubroutineIdxGet(old_build, *sub_id)) == NULL) {
             return eCompileInternalError;
         }
     } else {
-        if((pattern != NULL) && (entry = regexSubroutineIdxGetPattern(build, pattern)) == NULL) {
+        if((pattern != NULL) && (entry = regexSubroutineIdxGetPattern(old_build, pattern)) == NULL) {
             if(name != NULL) {
-                entry = regexSubroutineIdxGetName(build, name, nameLen);
+                entry = regexSubroutineIdxGetName(old_build, name, nameLen);
             }
         }
     }
@@ -1780,17 +1801,22 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_token_t **tokens,
             // There's nothing here to identify the new entry!
             return eCompileInternalError;
         }
-        if((entry = regexSubroutineIdxCreate(build)) == NULL) {
+        if((entry = regexSubroutineIdxCreate(old_build)) == NULL) {
             return eCompileOutOfMem;
         }
     }
 
     if((subroutine != NULL) && (entry->tokens == NULL)) {
         if((*subroutine == NULL) && (pattern != NULL)) {
-            if((status = regexTokenizePattern(pattern, &pos, subroutine, build)) != eCompileOk) {
-                // TODO - retain sub-compilation status
+            if((subtokenizer = regexTokenizerCreate(pattern)) == NULL) {
+                return eCompileOutOfMem;
+            }
+            if((status = regexTokenizePattern(build, subtokenizer)) != eCompileOk) {
+                tokenizer->subpattern = subtokenizer;
                 return status;
             }
+            *subroutine = subtokenizer->tokens;
+            regexTokenizerDestroy(subtokenizer);
         }
         entry->tokens = *subroutine;
     }
@@ -2684,7 +2710,7 @@ int regexTokenUtf8ClassHighCreate(regex_token_t **tokens, utf8_charclass_high_by
     return 1;
 }
 
-int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus_t *status, regex_token_t **tokens,
+int regexTokenUtf8ClassCreate(regex_build_t *build, regex_tokenizer_t *tokenizer, regex_vm_build_t *old_build, eRegexCompileStatus_t *status, regex_token_t **tokens,
                               utf8_charclass_tree_t *tree, int invert, const char *pattern, const char *classId,
                               int len) {
     regex_token_t *utf8class = NULL;
@@ -2700,9 +2726,9 @@ int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus_t *st
 #ifdef EXP_ID_PARSE
     if(((classId != NULL) && (regexSubroutineIdxGetName(build, classId, len) == NULL)) ||
 #else
-    if(((classId != NULL) && (regexSubroutineIdxGetName(build, classId, strlen(classId)) == NULL)) ||
-#endif
-       ((classId == NULL) && (regexSubroutineIdxGetPattern(build, pattern) == NULL))) {
+    if(((classId != NULL) && (regexSubroutineIdxGetName(old_build, classId, strlen(classId)) == NULL)) ||
+       #endif
+       ((classId == NULL) && (regexSubroutineIdxGetPattern(old_build, pattern) == NULL))) {
         if(!regexTokenCreate(&utf8class, eTokenSubExprStart, 0, NULL, REGEX_TOKEN_FLAG_NOCAPTURE, 0)) {
             return 0;
         }
@@ -2800,7 +2826,7 @@ int regexTokenUtf8ClassCreate(regex_vm_build_t *build, eRegexCompileStatus_t *st
         }
     }
 
-    if((*status = regexSubroutineGenerateFromPattern(tokens, &utf8class, build, pattern, classId, len, NULL)) != eCompileOk) {
+    if((*status = regexSubroutineGenerateFromPattern(build, tokenizer, tokens, &utf8class, old_build, pattern, classId, len, NULL)) != eCompileOk) {
         return 0;
     }
 
@@ -3168,7 +3194,7 @@ int parseCharClassBitmapRangeSet(utf8_charclass_tree_t *tree, unsigned int *bitm
 // of an actual pattern expression, or is just the content of the pattern, from
 // a secodary source. An embedded pattern ends at the required ']' delimiter,
 // whereas a non embedded pattern does not contain a trailing delimiter.
-int parseCharClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_build_t *build, const char **pattern,
+int parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t *tokenizer, eRegexCompileStatus_t *status, regex_vm_build_t *old_build, const char **pattern,
                                  const char *classId, int len, int embedded, regex_token_t **tokens, int invert) {
     unsigned int bitmap[8], *ptr;
     const char *orig_pattern = *pattern;
@@ -3289,7 +3315,7 @@ parseClassCompleted:
             }
         }
 
-        if(!regexTokenUtf8ClassCreate(build, status, tokens, utf8tree, invert, orig_pattern, classId, len)) {
+        if(!regexTokenUtf8ClassCreate(build, tokenizer, old_build, status, tokens, utf8tree, invert, orig_pattern, classId, len)) {
             regexCharClassUtf8TreeFree(utf8tree);
             return 0;
         }
@@ -3316,7 +3342,7 @@ parseClassCompleted:
     return 1;
 }
 
-int parseUnicodeClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_build_t *build,
+int parseUnicodeClassAndCreateToken(regex_build_t *build, regex_tokenizer_t *tokenizer, eRegexCompileStatus_t *status, regex_vm_build_t *old_build,
                                     const char *unicodeClass, int len, int invert,
                                     regex_token_t **tokens) {
     const char *classStr;
@@ -3326,13 +3352,13 @@ int parseUnicodeClassAndCreateToken(eRegexCompileStatus_t *status, regex_vm_buil
         return 0;
     }
 
-    if(regexSubroutineIdxGetName(build, unicodeClass, len) != NULL) {
-        if((*status = regexSubroutineGenerateFromPattern(tokens, NULL, build, NULL, unicodeClass, len, NULL)) != eCompileOk) {
+    if(regexSubroutineIdxGetName(old_build, unicodeClass, len) != NULL) {
+        if((*status = regexSubroutineGenerateFromPattern(build, tokenizer, tokens, NULL, old_build, NULL, unicodeClass, len, NULL)) != eCompileOk) {
             return 0;
         }
         return 1;
     }
-    return parseCharClassAndCreateToken(status, build, &classStr, unicodeClass, len, 0, tokens, invert);
+    return parseCharClassAndCreateToken(build, tokenizer, status, old_build, &classStr, unicodeClass, len, 0, tokens, invert);
 }
 
 void regexEmitCharClassBitmap(FILE *fp, const unsigned int *bitmap) {
@@ -3404,7 +3430,7 @@ int regexSubexprLookupEntryCreate(regex_vm_build_t *build, const char **pattern,
 // Parses the subroutine name pointed to by pattern, creates a subroutine index
 // entry, and adds it to the subroutine index. Returns the subroutine id (>0) on
 // success, 0 on out of memory, and -1 if the name is malformed.
-int regexSubroutineIdxEntryCreate(regex_vm_build_t *build, const char **pattern) {
+int regexSubroutineIdxEntryCreate(regex_build_t *build, regex_tokenizer_t *tokenizer, regex_vm_build_t *old_build, const char **pattern) {
     int len, index = 0;
 
     for(len = 0; (*pattern)[len] != '>' && (*pattern)[len] != '\0'; len++) {
@@ -3416,7 +3442,7 @@ int regexSubroutineIdxEntryCreate(regex_vm_build_t *build, const char **pattern)
         return -1;
     }
 
-    if(regexSubroutineGenerateFromPattern(NULL, NULL, build, NULL, *pattern, len, &index) != eCompileOk) {
+    if(regexSubroutineGenerateFromPattern(build, tokenizer, NULL, NULL, old_build, NULL, *pattern, len, &index) != eCompileOk) {
         return 0;
     }
 
@@ -3460,17 +3486,10 @@ int regexSubroutineIdxCall(regex_vm_build_t *build, const char **pattern) {
 // Lexer - tokenizes the pattern into a token list (infix form)
 /////////////////////////////////////////////////////////////////////////////
 
-#define SET_RESULT(stat)  result = stat; goto compileFailure;
-
-eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
-                                           int *pos,
-                                           regex_token_t **tokens,
-                                           regex_vm_build_t *build) {
-    eRegexCompileStatus_t result;
-    const char *start = pattern;
+static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
+                                                   regex_tokenizer_t *tokenizer) {
     const char *class;
     parseChar_t c;
-    int response;
     int len;
     const char *str;
     unsigned int flags;
@@ -3479,66 +3498,65 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
     int subexpr = 0;
     int named;
     int index;
-    eRegexPatternId_t id_status;
 
     // Parse the regex pattern into a sequence of tokens (operators and operands)
     // The output of this stage is a sequence of lexical tokens in infix form
 
     // Loop through the pattern until we've handled it all
-    for(; *pattern != '\0';) {
+    for(; *(tokenizer->pattern) != '\0';) {
         // Get the next character in the pattern. The helper function assists
         // in disambiguating escaped characters.
-        c = _parseGetNextPatternChar(&pattern, &str, &len);
+        c = _parseGetNextPatternChar(&(tokenizer->pattern), &str, &len);
         if(_parsePatternIsValid(&c)) {
-            _parsePatternCharAdvance(&pattern, &c);
+            _parsePatternCharAdvance(&(tokenizer->pattern), &c);
         }
 
         switch(c.state) {
             case eRegexPatternEnd:
-                goto endOfPattern;
+                return eCompileOk;
 
             case eRegexPatternInvalid:
-                SET_RESULT(eCompileEscapeCharIncomplete);
+                return eCompileEscapeCharIncomplete;
 
             case eRegexPatternInvalidEscape:
-                SET_RESULT(eCompileInvalidEscapeChar);
+                return eCompileInvalidEscapeChar;
 
             case eRegexPatternMetaChar:
                 switch(c.c) {
                     case '.':
                         // Operand, the meta "ANY" char
-                        if(!regexTokenCreate(tokens, eTokenCharAny, 0, 0, ((build->flags & REGEX_DOTALL) ? REGEX_TOKEN_FLAG_DOTALL : 0), 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenCharAny, 0, 0, ((build->build.flags & REGEX_DOTALL) ? REGEX_TOKEN_FLAG_DOTALL : 0), 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
 
                     case '[':
-                        if(!parseCharClassAndCreateToken(&status, build, &pattern, NULL, 0, 1, tokens, 0)) {
-                            SET_RESULT(status);
+                        if(!parseCharClassAndCreateToken(build, tokenizer, &status, &(build->build), &(tokenizer->pattern), NULL, 0, 1, &(tokenizer->tokens), 0)) {
+                            return status;
                         }
                         continue;
 
                     case '?':
-                        if(!regexTokenCreate(tokens, eTokenZeroOrOne, 0, 0, 0, 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenZeroOrOne, 0, 0, 0, 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
 
                     case '*':
-                        if(!regexTokenCreate(tokens, eTokenZeroOrMany, 0, 0, 0, 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenZeroOrMany, 0, 0, 0, 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
 
                     case '+':
-                        if(!regexTokenCreate(tokens, eTokenOneOrMany, 0, 0, 0, 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenOneOrMany, 0, 0, 0, 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
 
                     case '|':
-                        if(!regexTokenCreate(tokens, eTokenAlternative, 0, 0, 0, 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenAlternative, 0, 0, 0, 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
 
@@ -3546,126 +3564,125 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                         // Grouped subexpression, complex operator, resolves to a compound operand
                         // Speculative subexpression number. If non-capturing, will NOT actually
                         // increase the group count.
-                        subexpr = build->groups + 1;
+                        subexpr = build->build.groups + 1;
                         flags = 0;
                         named = 0;
                         index = 0;
                         // Check for group meta modifiers
-                        while(*pattern == '?') {
-                            pattern++;
-                            if(_parseCheckNextPatternChar(&pattern, 'i')) {
+                        while(*(tokenizer->pattern) == '?') {
+                            tokenizer->pattern++;
+                            if(_parseCheckNextPatternChar(&(tokenizer->pattern), 'i')) {
                                 // Case insensitive matching
                                 flags |= REGEX_TOKEN_FLAG_CASEINS;
-                            } else if(_parseCheckNextPatternChar(&pattern, 'P')) {
+                            } else if(_parseCheckNextPatternChar(&(tokenizer->pattern), 'P')) {
                                 // Named sub expression
                                 if(named || (flags & (REGEX_TOKEN_FLAG_SUBROUTINE | REGEX_TOKEN_FLAG_NOCAPTURE))) {
-                                    SET_RESULT(eCompileConflictingAttrs);
+                                    return eCompileConflictingAttrs;
                                 }
-                                if((id_status = parseCheckIdentifier(&pattern, '<', '>', &str, &len)) != eRegexPatternIdOk) {
-                                    SET_RESULT(eCompileMalformedSubExprName);
+                                if(parseCheckIdentifier(&(tokenizer->pattern), '<', '>', &str, &len) != eRegexPatternIdOk) {
+                                    return eCompileMalformedSubExprName;
                                 }
-                                if(!regexVMGroupTableEntryAdd(build, str, len, subexpr)) {
-                                    SET_RESULT(eCompileOutOfMem);
+                                if(!regexVMGroupTableEntryAdd(&(build->build), str, len, subexpr)) {
+                                    return eCompileOutOfMem;
                                 }
                                 named = 1;
-                            } else if(_parseCheckNextPatternChar(&pattern, ':')) {
+                            } else if(_parseCheckNextPatternChar(&(tokenizer->pattern), ':')) {
                                 // Non-capturing subexpression
                                 if(named || (flags & (REGEX_TOKEN_FLAG_COMPOUND))) {
-                                    SET_RESULT(eCompileConflictingAttrs);
+                                    return eCompileConflictingAttrs;
                                 }
                                 flags |= REGEX_TOKEN_FLAG_NOCAPTURE;
-                            } else if(_parseCheckNextPatternChar(&pattern, '*')) {
+                            } else if(_parseCheckNextPatternChar(&(tokenizer->pattern), '*')) {
                                 // Compound capturing subexpression
                                 if(flags & (REGEX_TOKEN_FLAG_NOCAPTURE | REGEX_TOKEN_FLAG_SUBROUTINE)) {
-                                    SET_RESULT(eCompileConflictingAttrs);
+                                    return eCompileConflictingAttrs;
                                 }
                                 flags |= REGEX_TOKEN_FLAG_COMPOUND;
-                            } else if(_parseCheckNextPatternChar(&pattern, 'R')) {
+                            } else if(_parseCheckNextPatternChar(&(tokenizer->pattern), 'R')) {
                                 // Named subroutine
                                 if(named || (flags & REGEX_TOKEN_FLAG_COMPOUND)) {
-                                    SET_RESULT(eCompileConflictingAttrs);
+                                    return eCompileConflictingAttrs;
                                 }
-                                if(!_parseCheckNextPatternChar(&pattern, '<')) {
-                                    SET_RESULT(eCompileMalformedSubExprName);
+                                if(!_parseCheckNextPatternChar(&(tokenizer->pattern), '<')) {
+                                    return eCompileMalformedSubExprName;
                                 }
-                                if((index = regexSubroutineIdxEntryCreate(build, &pattern)) <= 0) {
-                                    SET_RESULT((index == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName));
+                                if((index = regexSubroutineIdxEntryCreate(build, tokenizer, &(build->build), &(tokenizer->pattern))) <= 0) {
+                                    return (index == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName);
                                 }
                                 flags |= REGEX_TOKEN_FLAG_SUBROUTINE | REGEX_TOKEN_FLAG_NOCAPTURE;
                             } else {
-                                SET_RESULT(eCompileUnsupportedMeta);
+                                return eCompileUnsupportedMeta;
                             }
                         }
                         if(!named) {
-                            if(!regexVMGroupTableEntryAdd(build, NULL, 0, subexpr)) {
-                                SET_RESULT(eCompileOutOfMem);
+                            if(!regexVMGroupTableEntryAdd(&(build->build), NULL, 0, subexpr)) {
+                                return eCompileOutOfMem;
                             }
                         }
                         if(!(flags & (REGEX_TOKEN_FLAG_NOCAPTURE | REGEX_TOKEN_FLAG_SUBROUTINE))) {
-                            build->groups++;
+                            build->build.groups++;
                         }
-                        if(!regexTokenCreate(tokens, eTokenSubExprStart, subexpr, NULL, (int)flags, index)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenSubExprStart, subexpr, NULL, (int)flags, index)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
 
                     case ')':
                         // End of grouped subexpression
-                        if(!regexTokenCreate(tokens, eTokenSubExprEnd, 0, 0, 0, 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenSubExprEnd, 0, 0, 0, 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
 
                     case '^':
-                        if(!regexTokenCreate(tokens, eTokenAssertion, REGEX_TOKEN_FLAG_START_OF_LINE, 0, 0, 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenAssertion, REGEX_TOKEN_FLAG_START_OF_LINE, 0, 0, 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
 
                     case '$':
-                        if(!regexTokenCreate(tokens, eTokenAssertion, REGEX_TOKEN_FLAG_END_OF_LINE, 0, 0, 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenAssertion, REGEX_TOKEN_FLAG_END_OF_LINE, 0, 0, 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
 
                     case '<':
-                        if(!regexTokenCreate(tokens, eTokenAssertion, REGEX_TOKEN_FLAG_START_OF_WORD, 0, 0, 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenAssertion, REGEX_TOKEN_FLAG_START_OF_WORD, 0, 0, 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
 
                     case '>':
-                        if(!regexTokenCreate(tokens, eTokenAssertion, REGEX_TOKEN_FLAG_END_OF_WORD, 0, 0, 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenAssertion, REGEX_TOKEN_FLAG_END_OF_WORD, 0, 0, 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
 
                     default:
                         // Unexpected meta character
-                        SET_RESULT(eCompileInternalError);
+                        return eCompileInternalError;
                 }
-                continue;
 
             case eRegexPatternMetaClass:
                 switch(c.c) {
                     case 'R': // subroutine call
-                        if((index = regexSubroutineIdxGetIndex(build, str, len)) <= 0) {
-                            SET_RESULT(eCompileUnknownSubroutine);
+                        if((index = regexSubroutineIdxGetIndex(&(build->build), str, len)) <= 0) {
+                            return eCompileUnknownSubroutine;
                         }
-                        if(!regexTokenCreate(tokens, eTokenCall, index, NULL, 0, 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenCall, index, NULL, 0, 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
                     case 'X': // full unicode glyph (base + markers)
                         // Represented by a micro NFA
                         subroutine = NULL;
-                        if((status = regexSubroutineGenerateFromPattern(tokens, &subroutine, build, "\\p{M}\\p{M}*", NULL, 0, NULL)) != eCompileOk) {
-                            SET_RESULT(status);
+                        if((status = regexSubroutineGenerateFromPattern(build, tokenizer, &(tokenizer->tokens), &subroutine, &(build->build), "\\p{M}\\p{M}*", NULL, 0, NULL)) != eCompileOk) {
+                            return status;
                         }
                         continue;
                     case 'B': // explicit byte
-                        if(!regexTokenCreate(tokens, eTokenByte, 0, 0, 0, 0)) {
-                            SET_RESULT(eCompileOutOfMem);
+                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenByte, 0, 0, 0, 0)) {
+                            return eCompileOutOfMem;
                         }
                         continue;
                 }
@@ -3694,17 +3711,17 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
                         class = META_CLASS_INV(META_WORD_PATTERN);
                         break;
                 }
-                if(!parseCharClassAndCreateToken(&status, build, &class, NULL, 0, 0, tokens, 0)) {
-                    SET_RESULT(status);
+                if(!parseCharClassAndCreateToken(build, tokenizer, &status, &(build->build), &class, NULL, 0, 0, &(tokenizer->tokens), 0)) {
+                    return status;
                 }
                 continue;
 
             case eRegexPatternUnicodeMetaClass:
                 if(regexRegUnicodeCharClassGet(str, len) == NULL) {
-                    SET_RESULT(eCompileUnknownUnicodeClass);
+                    return eCompileUnknownUnicodeClass;
                 }
-                if(!parseUnicodeClassAndCreateToken(&status, build, str, len, ((c.c == 'P') ? 1 : 0), tokens)) {
-                    SET_RESULT(status);
+                if(!parseUnicodeClassAndCreateToken(build, tokenizer, &status, &(build->build), str, len, ((c.c == 'P') ? 1 : 0), &(tokenizer->tokens))) {
+                    return status;
                 }
                 continue;
 
@@ -3712,41 +3729,42 @@ eRegexCompileStatus_t regexTokenizePattern(const char *pattern,
             case eRegexPatternUnicode:
             case eRegexPatternEscapedChar:
                 // Operand, either character literal or string literal
-                if((len = _parseGetPatternStrLen(&pattern)) == -1) {
-                    SET_RESULT(eCompileEscapeCharIncomplete);
+                if((len = _parseGetPatternStrLen(&(tokenizer->pattern))) == -1) {
+                    return eCompileEscapeCharIncomplete;
                 }
                 if(PARSE_DEC_CHAR_COUNT(len) == 0) {
-                    if(!regexTokenCreate(tokens, eTokenCharLiteral, (char) (c.c), 0, 0, 0)) {
-                        SET_RESULT(eCompileOutOfMem);
+                    if(!regexTokenCreate(&(tokenizer->tokens), eTokenCharLiteral, (char) (c.c), 0, 0, 0)) {
+                        return eCompileOutOfMem;
                     }
                 } else {
                     len++;
                     if(c.state == eRegexPatternEscapedChar) {
-                        pattern--;
+                        tokenizer->pattern--;
                     } else if(c.state == eRegexPatternUnicode) {
                         // Increment the utf8 byte accommodation
                         len += (int)((unsigned int)(parseUtf8EncodingByteLen(c.c) - 1) << 16u);
-                        pattern -= 5;
+                        tokenizer->pattern -= 5;
                     }
-                    pattern--;
-                    if((str = parseGetPatternStr(&pattern, PARSE_DEC_CHAR_COUNT(len), PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len))) == NULL) {
-                        SET_RESULT(eCompileOutOfMem);
+                    tokenizer->pattern--;
+                    if((str = parseGetPatternStr(&(tokenizer->pattern), PARSE_DEC_CHAR_COUNT(len), PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len))) == NULL) {
+                        return eCompileOutOfMem;
                     }
-                    if(!regexTokenCreate(tokens, eTokenStringLiteral, 0, str, PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len), 0)) {
-                        SET_RESULT(eCompileOutOfMem);
+                    if(!regexTokenCreate(&(tokenizer->tokens), eTokenStringLiteral, 0, str, PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len), 0)) {
+                        return eCompileOutOfMem;
                     }
                 }
                 continue;
         }
     }
+}
 
-endOfPattern:
-    SET_RESULT(eCompileOk);
+eRegexCompileStatus_t regexTokenizePattern(regex_build_t *build,
+                                           regex_tokenizer_t *tokenizer) {
+    const char *start = tokenizer->pattern;
 
-compileFailure:
-    *pos = (int)(pattern - start);
-
-    return result;
+    tokenizer->status = _regexTokenizePattern(build, tokenizer);
+    tokenizer->position = tokenizer->pattern - start;
+    return tokenizer->status;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -4892,7 +4910,8 @@ void regexCompileResultEmit(FILE *fp, regex_compile_ctx_t *ctx) {
 // Return a compiled regex, or an error and position within the pattern
 eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern,
                                    unsigned int flags) {
-    regex_vm_build_t build;
+    regex_build_t build;
+    regex_tokenizer_t *tokenizer;
 
     if((!regexVerifyTokenDetails()) || (!_regexRegUnicodeInitializeTable())) {
         ctx->status = eCompileInternalError;
@@ -4909,49 +4928,62 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
     ctx->pattern = pattern;
     ctx->status = eCompileOk;
 
-    if(!regexVMBuildInit(&build)) {
+    memset(&build, 0, sizeof(build));
+    build.build.flags = flags;
+
+    if((tokenizer = regexTokenizerCreate(pattern)) == NULL) {
         ctx->status = eCompileOutOfMem;
         return ctx->status;
     }
-    build.flags = flags;
+
+    if((build.build.vm = _regexAlloc(sizeof(regex_vm_t), _regexMemContext)) == NULL) {
+        ctx->status = eCompileOutOfMem;
+        return ctx->status;
+    }
+    build.build.vm->vm_version = REGEX_VM_MACHINE_VERSION;
 
     // Parse the regex pattern into a sequence of tokens (operators and operands)
     // The output of this stage is a sequence of lexical tokens in infix form
 
-    if((ctx->status = regexTokenizePattern(ctx->pattern, &(ctx->position),
-                                           &(build.tokens), &build)) != eCompileOk) {
-        regexTokenDestroy(build.tokens, 1);
-        build.tokens = NULL;
-        regexVMBuildDestroy(&build);
+    if((ctx->status = regexTokenizePattern(&build, tokenizer)) != eCompileOk) {
+        ctx->position = tokenizer->position;
+        regexTokenizerDestroy(tokenizer);
+        regexTokenDestroy(build.build.tokens, 1);
+        build.build.tokens = NULL;
+        regexVMBuildDestroy(&(build.build));
         ctx->vm = NULL;
         return ctx->status;
     }
+    regexTokenizerDestroy(tokenizer);
+
+    // legacy
+    build.build.tokens = tokenizer->tokens;
 
     // Next, convert the infix form of the regular expression to postfix form,
     // and derive an NFA representation. We accomplish this using the shunting
     // yard algorithm. This is then converted into a VM bytecode sequence, for
     // runtime evaluation.
 
-    if((ctx->status = regexShuntingYard(&build, &(build.tokens))) != eCompileOk) {
-        regexVMBuildDestroy(&build);
+    if((ctx->status = regexShuntingYard(&(build.build), &(build.build.tokens))) != eCompileOk) {
+        regexVMBuildDestroy(&(build.build));
         ctx->vm = NULL;
         return ctx->status;
     }
 
-    if(!regexVMProgramGenerate(&build, build.tokens)) {
-        regexVMBuildDestroy(&build);
-        regexSubroutineIdxFree(&build);
+    if(!regexVMProgramGenerate(&(build.build), build.build.tokens)) {
+        regexVMBuildDestroy(&(build.build));
+        regexSubroutineIdxFree(&(build.build));
         ctx->vm = NULL;
         ctx->status = eCompileOutOfMem;
         return ctx->status;
     }
-    regexSubroutineIdxFree(&build);
+    regexSubroutineIdxFree(&(build.build));
 
     // Fixup the lookup tables
-    build.vm->group_tbl_size = build.groups;
+    build.build.vm->group_tbl_size = build.build.groups;
 
-    build.vm->size = build.pc;
-    ctx->vm = build.vm;
+    build.build.vm->size = build.build.pc;
+    ctx->vm = build.build.vm;
 
     return eCompileOk;
 }
