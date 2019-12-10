@@ -581,6 +581,25 @@ static unsigned char *_regexStrdup(const unsigned char *str, size_t len) {
     return ptr;
 }
 
+static char *_regexPrefixedStrdup(const char *prefix, const char *str, size_t len) {
+    char *ptr;
+    size_t pre_len;
+
+    if(len == RE_STR_NULL_TERM) {
+        len = strlen((char *)str) + 1;
+    }
+    pre_len = ((prefix != NULL) ? strlen(prefix) : 0);
+    if((ptr = _regexAlloc(len + pre_len + 1, _regexMemContext)) == NULL) {
+        return NULL;
+    }
+    if(prefix != NULL) {
+        memcpy(ptr, prefix, pre_len);
+    }
+    memcpy(ptr + pre_len, str, len);
+    ptr[len + pre_len] = '\0';
+    return ptr;
+}
+
 // If len == RE_STR_NULL_TERM (-1), assumes that both strings are null terminated
 // Note: comparison is done with memcmp, to ensure we can handle embedded nulls
 static int _regexStrncmp(const unsigned char *str_a, const unsigned char *str_b, size_t len) {
@@ -591,6 +610,57 @@ static int _regexStrncmp(const unsigned char *str_a, const unsigned char *str_b,
         return memcmp(str_a, str_b, strlen((char *)str_a));
     }
     return memcmp(str_a, str_b, len);
+}
+
+static int _regexStrncmp2(const unsigned char *str_a, size_t len_a, const unsigned char *str_b, size_t len_b) {
+    if((str_a == NULL) || (str_b == NULL)) {
+        return str_a != str_b;
+    }
+    if(len_a == RE_STR_NULL_TERM) {
+        len_a = strlen((char *)str_a);
+    }
+    if(len_b == RE_STR_NULL_TERM) {
+        len_b = strlen((char *)str_b);
+    }
+    if(len_a != len_b) {
+        return -1;
+    }
+    return memcmp(str_a, str_b, len_a);
+}
+
+// Functionally similar to _regexStrncmp, but prepends prefix to str_a. If
+// prefix is NULL, behaves identically to _regexStrncmp.
+static int _regexPrefixedStrncmp(const unsigned char *prefix,
+                                 const unsigned char *str_a, size_t len_a,
+                                 const unsigned char *str_b, size_t len_b) {
+    size_t pre_len;
+
+    if((str_a == NULL) || (str_b == NULL)) {
+        return str_a != str_b;
+    }
+
+    if(len_a == RE_STR_NULL_TERM) {
+        len_a = strlen((char *)str_a);
+    }
+    if(len_b == RE_STR_NULL_TERM) {
+        len_b = strlen((char *)str_b);
+    }
+
+    if(prefix != NULL) {
+        pre_len = strlen((char *)prefix);
+        if((len_a + pre_len) != len_b) {
+            return -1;
+        }
+        if(!memcmp(prefix, str_b, pre_len)) {
+            return -1;
+        }
+        return memcmp(str_a, str_b + pre_len, len_a);
+    } else {
+        if(len_a != len_b) {
+            return -1;
+        }
+        return memcmp(str_a, str_b, len_a);
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -629,7 +699,7 @@ static int _regexStrTableEntryAdd(regex_str_table_t *table, size_t entry_size,
     }
     if(flags & RE_STR_TABLE_DEDUPE) {
         for(index = 0, entry = table->entries; entry != NULL; entry = entry->next, index++) {
-            if((entry->len == entry_size) && (!_regexStrncmp(entry_data, entry->str, entry_size))) {
+            if(!_regexStrncmp2(entry_data, entry->len, entry->str, entry_size)) {
                 break;
             }
         }
@@ -697,14 +767,13 @@ typedef struct regex_token_s regex_token_t;
 typedef struct regex_subroutine_s regex_subroutine_t;
 struct regex_subroutine_s {
     int id;
-    uint32_t pattern_crc;
     char *name;
     char *alias;
     char *pattern;
     size_t len;
     regex_token_t *tokens;
-    uint32_t token_crc;
     int infixed;
+    int program_counter;
     regex_subroutine_t *next;
 };
 
@@ -714,75 +783,207 @@ struct regex_subroutine_index_s {
     int next_id;
 };
 
-// Public domain CRC32 routines from http://home.thep.lu.se/~bjorn/crc/
-
-static uint32_t _regexCalcCrc32ForByte(uint32_t r) {
-    for(int j = 0; j < 8; ++j) {
-        r = (r & 1u ? 0 : (uint32_t) 0xEDB88320L) ^ r >> 1u;
-    }
-    return r ^ (uint32_t)0xFF000000L;
-}
-
-static void _regexCalcCrc32(const void *data, size_t n_bytes, uint32_t* crc) {
-    static uint32_t table[0x100];
-    if(!*table) {
-        for(size_t i = 0; i < 0x100; ++i) {
-            table[i] = _regexCalcCrc32ForByte(i);
-        }
-    }
-    for(size_t i = 0; i < n_bytes; ++i) {
-        *crc = table[((unsigned char)(*crc)) ^ ((unsigned char *)data)[i]] ^ (*crc >> 8u);
-    }
-}
-
-static int _regexSubroutineIndexRegister(regex_subroutine_index_t *index,
-                                         const char *name, const char *alias,
-                                         const char *pattern, size_t pat_len,
-                                         regex_token_t *tokens) {
+static regex_subroutine_t *_regexSubroutineIndexEntryCreate(regex_subroutine_index_t *index,
+                                                            const char *prefix,
+                                                            const char *name, size_t name_len,
+                                                            const char *alias, size_t alias_len) {
     regex_subroutine_t *entry;
-    uint32_t pattern_crc = 0, token_crc = 0;
 
-    if(pattern != NULL) {
-        if(pat_len == RE_STR_NULL_TERM) {
-            pat_len = strlen(pattern);
-        }
-        _regexCalcCrc32(pattern, pat_len, &pattern_crc);
+    if((entry = _regexAlloc(sizeof(regex_subroutine_t), _regexMemContext)) == NULL) {
+        return NULL;
     }
-
-    if(tokens != NULL) {
-        // TODO - generate a token stream CRC identifier
-    }
-
-    for(entry = index->subroutines; entry != NULL; entry = entry->next) {
-        if((name != NULL) && (!_regexStrncmp((unsigned char *)name,
-                                             (unsigned char *)entry->name,
-                                             RE_STR_NULL_TERM))) {
-            break;
-        } else if((alias != NULL) && (!_regexStrncmp((unsigned char *)alias,
-                                                     (unsigned char *)entry->alias,
-                                                     RE_STR_NULL_TERM))) {
-            break;
-        } else if((pattern != NULL) && (entry->pattern_crc == pattern_crc)) {
-            break;
+    if(name != NULL) {
+        if((entry->name = _regexPrefixedStrdup(prefix, name, name_len)) == NULL) {
+            _regexDealloc(entry, _regexMemContext);
+            return NULL;
         }
     }
-    // TODO
-    return 0;
+    if((alias != NULL) && (_regexPrefixedStrncmp((unsigned char *)prefix, (unsigned char *)name,
+                                                 name_len, (unsigned char *)alias, alias_len))) {
+        if((entry->alias = _regexPrefixedStrdup(prefix, alias, alias_len)) == NULL) {
+            if(entry->name != NULL) {
+                _regexDealloc(entry->name, _regexMemContext);
+            }
+            _regexDealloc(entry, _regexMemContext);
+            return NULL;
+        }
+    }
+    entry->id = index->next_id;
+    index->next_id++;
+    return entry;
 }
 
-static int _regexSubroutineIndexPatternCheck(const char *pattern, size_t len);
-// Pre register a subroutine: name/alias,pattern OR name/alias,tokens
-// Subroutine declared inline: name [gets ID, flags token] THEN tokens [associated in the shunting yard]
-// utf8 class subroutine: registered from the class index when referenced, name/alias,pattern registered
+static regex_subroutine_t *_regexSubroutineIndexEntryGet(regex_subroutine_index_t *index,
+                                                         const char *prefix,
+                                                         const char *name, size_t len,
+                                                         int id) {
+    regex_subroutine_t *entry;
 
-static int _regexSubroutineIndexIdGet(regex_subroutine_index_t *index, const char *name, const char *alias) {
-    return 0;
-}
-
-static regex_subroutine_t *_regexSubroutineIndexEntryGet(regex_subroutine_index_t *index, int id) {
+    if(name != NULL) {
+        for(entry = index->subroutines; entry != NULL; entry = entry->next) {
+            if(!_regexPrefixedStrncmp((unsigned char *)prefix,
+                                      (unsigned char *)name, len,
+                                      (unsigned char *)(entry->name), RE_STR_NULL_TERM)) {
+                return entry;
+            }
+            if(!_regexPrefixedStrncmp((unsigned char *)prefix,
+                                      (unsigned char *)name, len,
+                                      (unsigned char *)(entry->alias), RE_STR_NULL_TERM)) {
+                return entry;
+            }
+        }
+    }
+    if(id >= 0) {
+        for(entry = index->subroutines; entry != NULL; entry = entry->next) {
+            if(id == entry->id) {
+                return entry;
+            }
+        }
+    }
     return NULL;
 }
 
+// Update a subroutine index entry with a pattern/token stream. Returns 1 on
+// success, 0 if the index does not exist, and -1 if the pattern/token stream
+// has already been defined.
+
+#define RE_SUBROUTINE_NOTFOUND 0
+#define RE_SUBROUTINE_COLLISION -1
+#define RE_SUBROUTINE_OUTOFMEM -2
+#define RE_SUBROUTINE_INVALID_CALL -3
+
+static int _regexSubroutineIndexEntryPatternUpdate(regex_subroutine_index_t *index,
+                                                   const char *prefix,
+                                                   const char *name, size_t name_len,
+                                                   const char *alias, size_t alias_len,
+                                                   int id,
+                                                   const char *pattern, size_t pattern_len) {
+    regex_subroutine_t *entry = NULL;
+
+    if((name != NULL) || (id >= 0)) {
+        if((entry = _regexSubroutineIndexEntryGet(index, prefix, name, name_len, id)) == NULL) {
+            if(alias == NULL) {
+                return RE_SUBROUTINE_NOTFOUND;
+            }
+        }
+    }
+    if(entry == NULL) {
+        if((entry = _regexSubroutineIndexEntryGet(index, prefix, alias, alias_len, -1)) == NULL) {
+            return RE_SUBROUTINE_NOTFOUND;
+        }
+    }
+
+    if((pattern == NULL) || (entry->pattern != NULL)) {
+        return RE_SUBROUTINE_COLLISION;
+    }
+
+    entry->pattern = (char *)pattern;
+    entry->len = pattern_len;
+    return 1;
+}
+
+static int _regexSubroutineIndexEntryTokensUpdate(regex_subroutine_index_t *index,
+                                                  const char *prefix,
+                                                  const char *name, size_t name_len,
+                                                  const char *alias, size_t alias_len,
+                                                  int id,
+                                                  regex_token_t *tokens) {
+    regex_subroutine_t *entry = NULL;
+
+    if((name != NULL) || (id >= 0)) {
+        if((entry = _regexSubroutineIndexEntryGet(index, prefix, name, name_len, id)) == NULL) {
+            if(alias == NULL) {
+                return RE_SUBROUTINE_NOTFOUND;
+            }
+        }
+    }
+    if(entry == NULL) {
+        if((entry = _regexSubroutineIndexEntryGet(index, prefix, alias, alias_len, -1)) == NULL) {
+            return RE_SUBROUTINE_NOTFOUND;
+        }
+    }
+
+    if((tokens == NULL) || (entry->tokens != NULL)) {
+        return RE_SUBROUTINE_COLLISION;
+    }
+
+    entry->tokens = tokens;
+    return 1;
+}
+
+// The subroutine index registration functions return a subroutine ID (# >= 0)
+// on success, or a negative value on failure: -2 = out of mem, -1 name/alias
+// collision, -3 parameter errors (invalid function input)
+
+// Register a pattern with a name and/or alias
+static int _regexSubroutineIndexRegisterPattern(regex_subroutine_index_t *index,
+                                                const char *name, const char *alias,
+                                                const char *pattern) {
+    regex_subroutine_t *entry;
+
+    if(pattern == NULL) {
+        return RE_SUBROUTINE_INVALID_CALL;
+    }
+
+    if((_regexSubroutineIndexEntryGet(index, NULL, name, RE_STR_NULL_TERM, -1) != NULL) ||
+       (_regexSubroutineIndexEntryGet(index, NULL, alias, RE_STR_NULL_TERM, -1) != NULL)) {
+        return RE_SUBROUTINE_COLLISION;
+    }
+
+    if((entry = _regexSubroutineIndexEntryCreate(index, NULL, name, RE_STR_NULL_TERM, alias, RE_STR_NULL_TERM)) == NULL) {
+        return RE_SUBROUTINE_OUTOFMEM;
+    }
+
+    entry->pattern = (char *)pattern;
+    entry->len = strlen(pattern);
+
+    return entry->id;
+}
+
+// Register a token stream with a name and/or alias
+static int _regexSubroutineIndexRegisterTokens(regex_subroutine_index_t *index,
+                                               const char *name, const char *alias,
+                                               regex_token_t *tokens) {
+    regex_subroutine_t *entry;
+
+    if(tokens == NULL) {
+        return RE_SUBROUTINE_INVALID_CALL;
+    }
+
+    if((_regexSubroutineIndexEntryGet(index, NULL, name, RE_STR_NULL_TERM, -1) != NULL) ||
+       (_regexSubroutineIndexEntryGet(index, NULL, alias, RE_STR_NULL_TERM, -1) != NULL)) {
+        return RE_SUBROUTINE_COLLISION;
+    }
+
+    if((entry = _regexSubroutineIndexEntryCreate(index, NULL, name, RE_STR_NULL_TERM, alias, RE_STR_NULL_TERM)) == NULL) {
+        return RE_SUBROUTINE_OUTOFMEM;
+    }
+
+    entry->tokens = tokens;
+
+    return entry->id;
+}
+
+// Register the intent to create a subroutine with a name and/or alias. Once the
+// intended pattern or token stream is created, the subroutine index must be
+// updated. Attempting to reference the subroutine without registering a
+// pattern or token stream will result in an error.
+static int _regexSubroutineIndexRegisterIntent(regex_subroutine_index_t *index,
+                                               const char *prefix,
+                                               const char *name, const char *alias) {
+    regex_subroutine_t *entry;
+
+    if((_regexSubroutineIndexEntryGet(index, prefix, name, RE_STR_NULL_TERM, -1) != NULL) ||
+       (_regexSubroutineIndexEntryGet(index, prefix, alias, RE_STR_NULL_TERM, -1) != NULL)) {
+        return RE_SUBROUTINE_COLLISION;
+    }
+
+    if((entry = _regexSubroutineIndexEntryCreate(index, NULL, name, RE_STR_NULL_TERM, alias, RE_STR_NULL_TERM)) == NULL) {
+        return RE_SUBROUTINE_OUTOFMEM;
+    }
+
+    return entry->id;
+}
 
 /////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////
@@ -1486,7 +1687,7 @@ static int _regexRegUnicodeInitializeTable(void) {
     return regexRegUnicodeCharClassAddTable(_uax_db_default_import_table);
 }
 
-const char *regexRegUnicodeCharClassGet(const char *classId, int len) {
+static const char *_regexRegUnicodeCharClassGet(const char *classId, int len) {
     mojo_unicode_class_t *walk;
 
     if(len <= 0) {
@@ -1529,7 +1730,7 @@ void regexRegUnicodeCharClassRemove(const char *classId) {
 // Token management functions
 /////////////////////////////////////////////////////////////////////////////
 
-regex_ptrlist_t *regexPtrlistCreate(regex_token_t *token, eRePtrListType_t type) {
+static regex_ptrlist_t *_regexPtrlistCreate(regex_token_t *token, eRePtrListType_t type) {
     regex_ptrlist_t *entry;
 
     if((entry = _regexAlloc(sizeof(regex_ptrlist_t), _regexMemContext)) == NULL) {
@@ -1541,7 +1742,7 @@ regex_ptrlist_t *regexPtrlistCreate(regex_token_t *token, eRePtrListType_t type)
     return entry;
 }
 
-regex_ptrlist_t *regexPtrlistAppend(regex_ptrlist_t *lista, regex_ptrlist_t *listb) {
+static regex_ptrlist_t *_regexPtrlistAppend(regex_ptrlist_t *lista, regex_ptrlist_t *listb) {
     regex_ptrlist_t *walk;
 
     if(lista == NULL) {
@@ -1556,7 +1757,11 @@ regex_ptrlist_t *regexPtrlistAppend(regex_ptrlist_t *lista, regex_ptrlist_t *lis
     return lista;
 }
 
-int regexPtrlistPatch(regex_ptrlist_t **list, regex_token_t *token, int noJmps) {
+// If noJmps is TRUE, then any Jump tokens in list will NOT be patched. This is
+// to prevent redundant chained jumps. Caller should ensure that the remaining
+// entries in list are retained, as they may not all be patched. Returns the
+// number of entries that were actually patched.
+static int _regexPtrlistPatch(regex_ptrlist_t **list, regex_token_t *token, int noJmps) {
     regex_ptrlist_t *jmps = NULL, *next, *walk;
     int patched = 0;
 
@@ -1579,7 +1784,7 @@ int regexPtrlistPatch(regex_ptrlist_t **list, regex_token_t *token, int noJmps) 
     return patched;
 }
 
-void regexPtrListFree(regex_ptrlist_t *list) {
+static void _regexPtrListFree(regex_ptrlist_t *list) {
     regex_ptrlist_t *next = NULL;
     for(; list != NULL; list = next) {
         next = list->next;
@@ -1652,7 +1857,7 @@ void regexTokenDestroy(regex_token_t *token, int stack) {
             default:
                 break;
         }
-        regexPtrListFree(token->ptrlist);
+        _regexPtrListFree(token->ptrlist);
         _regexDealloc(token, _regexMemContext);
         if(!stack) {
             break;
@@ -3348,7 +3553,7 @@ int parseUnicodeClassAndCreateToken(regex_build_t *build, regex_tokenizer_t *tok
                                     regex_token_t **tokens) {
     const char *classStr;
 
-    if((classStr = regexRegUnicodeCharClassGet(unicodeClass, len)) == NULL) {
+    if((classStr = _regexRegUnicodeCharClassGet(unicodeClass, len)) == NULL) {
         *status = eCompileUnknownUnicodeClass;
         return 0;
     }
@@ -3718,7 +3923,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                 continue;
 
             case eRegexPatternUnicodeMetaClass:
-                if(regexRegUnicodeCharClassGet(str, len) == NULL) {
+                if(_regexRegUnicodeCharClassGet(str, len) == NULL) {
                     return eCompileUnknownUnicodeClass;
                 }
                 if(!parseUnicodeClassAndCreateToken(build, tokenizer, &status, &(build->build), str, len, ((c.c == 'P') ? 1 : 0), &(tokenizer->tokens))) {
@@ -3819,7 +4024,7 @@ int regexStackTypeGreaterOrEqualToToken(regex_token_t *stack, eRegexToken_t toke
 /////////////////////////////////////////////////////////////////////////////
 
 int regexOperatorLiteralCreate(regex_token_t **stack, regex_token_t *token) {
-    if((token->ptrlist = regexPtrlistCreate(token, eRePtrOutA)) == NULL) {
+    if((token->ptrlist = _regexPtrlistCreate(token, eRePtrOutA)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, token);
@@ -3828,7 +4033,7 @@ int regexOperatorLiteralCreate(regex_token_t **stack, regex_token_t *token) {
 
 int regexOperatorSubexprCreate(regex_token_t **stack, regex_token_t *token) {
     token->tokenType = eTokenSave;
-    if((token->ptrlist = regexPtrlistCreate(token, eRePtrOutA)) == NULL) {
+    if((token->ptrlist = _regexPtrlistCreate(token, eRePtrOutA)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, token);
@@ -3843,7 +4048,7 @@ int regexOperatorConcatenationCreate(regex_token_t **stack, regex_token_t *token
        ((e1 = regexTokenStackPop(stack)) == NULL)) {
         return 0;
     }
-    regexPtrlistPatch(&(e1->ptrlist), e2, 0);
+    _regexPtrlistPatch(&(e1->ptrlist), e2, 0);
     e1->ptrlist = e2->ptrlist;
     e2->ptrlist = NULL;
     regexTokenStackPush(stack, e1);
@@ -3866,21 +4071,21 @@ int regexOperatorAlternationCreate(regex_token_t **stack, regex_token_t *token) 
 #ifdef MOJO_REGEX_EXPERIMENTAL_CULL_JMP
     if(regexPtrlistPatch(&(e1->ptrlist), jmp, 1) == 0) {
 #else // !MOJO_REGEX_EXPERIMENTAL_CULL_JMP
-    if(regexPtrlistPatch(&(e1->ptrlist), jmp, 0) == 0) {
+    if(_regexPtrlistPatch(&(e1->ptrlist), jmp, 0) == 0) {
 #endif
         // The jmp token was unused
         regexTokenDestroy(jmp, 0);
         token->ptrlist = e1->ptrlist;
         e1->ptrlist = NULL;
     } else {
-        if((token->ptrlist = regexPtrlistCreate(jmp, eRePtrOutA)) == NULL) {
+        if((token->ptrlist = _regexPtrlistCreate(jmp, eRePtrOutA)) == NULL) {
             return 0;
         }
     }
     token->tokenType = eTokenSplit;
     token->out_a = e1;
     token->out_b = e2;
-    token->ptrlist = regexPtrlistAppend(token->ptrlist, e2->ptrlist);
+    token->ptrlist = _regexPtrlistAppend(token->ptrlist, e2->ptrlist);
     e2->ptrlist = NULL;
     regexTokenStackPush(stack, token);
 
@@ -3895,10 +4100,10 @@ int regexOperatorZeroOrOneCreate(regex_token_t **stack, regex_token_t *token) {
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    if((token->ptrlist = regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
+    if((token->ptrlist = _regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
         return 0;
     }
-    token->ptrlist = regexPtrlistAppend(e->ptrlist, token->ptrlist);
+    token->ptrlist = _regexPtrlistAppend(e->ptrlist, token->ptrlist);
     e->ptrlist = NULL;
     regexTokenStackPush(stack, token);
 
@@ -3914,14 +4119,14 @@ int regexOperatorZeroOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    if((token->ptrlist = regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
+    if((token->ptrlist = _regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
         return 0;
     }
     if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL, 0, 0)) {
         return 0;
     }
     jmp->out_a = token;
-    regexPtrlistPatch(&(e->ptrlist), jmp, 0);
+    _regexPtrlistPatch(&(e->ptrlist), jmp, 0);
     regexTokenStackPush(stack, token);
 
     return 1;
@@ -3935,8 +4140,8 @@ int regexOperatorOneOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    regexPtrlistPatch(&(e->ptrlist), token, 0);
-    if((e->ptrlist = regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
+    _regexPtrlistPatch(&(e->ptrlist), token, 0);
+    if((e->ptrlist = _regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, e);
@@ -3953,7 +4158,7 @@ int regexOperatorMatchCreate(regex_token_t **stack) {
     if(!regexTokenCreate(&token, eTokenMatch, 0, NULL, 0, 0)) {
         return 0;
     }
-    regexPtrlistPatch(&(e->ptrlist), token, 0);
+    _regexPtrlistPatch(&(e->ptrlist), token, 0);
     regexTokenStackPush(stack, e);
 
     return 1;
@@ -3970,7 +4175,7 @@ int regexOperatorReturnCreate(regex_token_t **stack) {
         return 0;
     }
     regexEmitTokenStr(stdout, e);
-    regexPtrlistPatch(&(e->ptrlist), token, 0);
+    _regexPtrlistPatch(&(e->ptrlist), token, 0);
     regexTokenStackPush(stack, e);
 
     return 1;
