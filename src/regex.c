@@ -254,10 +254,17 @@ Regex VM Bytecode (v8 - in development)
 
     Each operation is encoded into a single 32 bit int value:
 
-         31    -     18 17     -     4 3- 0
-        |--------------|--------------|----|
-        |14 bits (op a)|14 bits (op b)|4bit|
-        | Operand A    | Operand B    | Op |
+       +-------------------------------+-------------------------------+
+       |    3                   2      '            1                  |
+       |2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7'6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1|
+       +-------------------------------+-------------------------------+
+       |2                              '1                              |
+       |0 F E D C B A 9 8 7 6 5 4 3 2 1'0 F E D C B A 9 8 7 6 5 4 3 2 1|
+       +---------------------------+---------------------------+-------+
+       |         32 ... 19         |          18 ... 5         | 4...1 |
+       +---------------------------+---------------------------+-------+
+       |    14 bits (operand A)    |     14 bits (operand B)   |4bit op|
+       +---------------------------+---------------------------+-------+
 
     Operators:               opcode     Operand A               Operand B
         eTokenCharLiteral       1       char to match           program counter
@@ -279,11 +286,21 @@ Regex VM Bytecode (v8 - in development)
         <reserved>              F
 
     Note about eTokenCharLiteral:
-        Operand A:
-            [   31       ]...[  25 ... 18   ]
-            [inverse flag]...[character byte]
-        Matches the character specified. If the inverse flag is set, the logic
-        is inverted, and the instruction matches any character EXCEPT the
+
+       +-------------------------------+-------------------------------+
+       |    3                   2      '            1                  |
+       |2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7'6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1|
+       +-------------------------------+-------------------------------+
+       |2                              '1                              |
+       |0 F E D C B A 9 8 7 6 5 4 3 2 1'0 F E D C B A 9 8 7 6 5 4 3 2 1|
+       +-+---------+---------------+---------------------------+-------+
+       | |         |   26 ... 19   |          18 ... 5         | 4...1 |
+       +-+---------+---------------+---------------------------+-------+
+       |I| unused  |      char     |   (opt) program counter   |4bit op|
+       +-+---------+---------------+---------------------------+-------+
+
+        Matches the character specified. If the inverse flag (I) is set, the
+        logic is inverted, and the instruction matches any character EXCEPT the
         character specified. Operand B is optional, and, if specified, is the
         program counter to jmp to in the case of not match. If the value is
         0x3FFF, then the instruction reverts to default no match behaviour.
@@ -294,8 +311,8 @@ Regex VM Bytecode (v8 - in development)
         In ASCII mode, this instruction matches any character _except_
         newline. In Unicode mode, this instruction matches a single unicode
         codepoint, which MAY match multiple bytes, but again, does NOT match
-        newline. If the REGEX_FLAG_DOT_ALL global flag is enabled, or the
-        Operand A dotall flag is set, the instruction will ALSO match newline.
+        newline. If the Operand A dotall flag is set, the instruction will ALSO
+        match newline.
 
     Note about eTokenMatch:
         If the end of input flag is not set, the pattern matches at this
@@ -312,20 +329,25 @@ Regex VM Bytecode (v8 - in development)
         as well as "foo", "for", and "fob" (1 primary, 3 sub captures)
 
     Note about eTokenUtf8Class:
-        Operand A:
-            [31-30][ 29 ... 24  ][ 23 ... 18 ]
-            [ num ][midhigh bits][midlow bits]
 
-        Operand B:
-            [   17  ][    16 ... 4    ]
-            [inverse][utf8 class index]
+       +-------------------------------+-------------------------------+
+       |    3                   2      '            1                  |
+       |2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7'6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1|
+       +-------------------------------+-------------------------------+
+       |2                              '1                              |
+       |0 F E D C B A 9 8 7 6 5 4 3 2 1'0 F E D C B A 9 8 7 6 5 4 3 2 1|
+       +---+-----------+-----------+-+-------------------------+-------+
+       |   |  30...25  |  24...19  | |        17 ... 5         | 4...1 |
+       +---+-----------+-----------+-+-------------------------+-------+
+       |Num|  midhigh  |  midlow   |I|     utf8 class index    |4bit op|
+       +---+-----------+-----------+-+-------------------------+-------+
 
         This instruction represents the low bytes of a utf8 encoding (for 2, 3,
         and 4 byte encodings). For single byte encodings, a standard char class
         is used. num is the number of low bytes to match, with the lowest
         being the class bitmap range specified in operand B, and the midlow,
         and midhigh bytes stored in operand A. The low byte encoding is 6 bits
-        per byte, with the 2 bit 0x80 prefix removed. If the inverse bit is
+        per byte, with the 2 bit 0x80 prefix removed. If the inverse bit (I) is
         set, then the match logic is inverted for all bytes present, including
         the class bitmap (it is NOT pre-inverted).
 
@@ -344,18 +366,28 @@ Regex VM Bytecode (v8 - in development)
         was issued, the instruction is considered a non match.
 
     Note about eTokenByte:
-        This instruction explicitly matches the any single byte. This differs
-        from both eTokenCharAny and eTokenCharAnyDotAll in that it always
-        matches newline, and always matches a single byte.
+        This instruction explicitly matches any single byte. This differs
+        from both eTokenCharAny in that it always matches newline, and always
+        matches a single byte.
 
     Note about eTokenUtf8Literal:
-        Operands A & B
-        [31 ... 30][   29  ][28 .. 25][24 ... 4 ]
-        [encoding ][inverse][unused  ][codepoint]
-        This instruction explicitly matches the encoded utf8 codepoint. Two bits
-        represent the byte encoding (0 - 1 byte, 1 - 2 byte, 2 - 3 byte, and
-        3 - 4 byte). The inverse bit will match any character other than the
-        one specified.
+
+       +-------------------------------+-------------------------------+
+       |    3                   2      '            1                  |
+       |2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7'6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1|
+       +-------------------------------+-------------------------------+
+       |2                              '1                              |
+       |0 F E D C B A 9 8 7 6 5 4 3 2 1'0 F E D C B A 9 8 7 6 5 4 3 2 1|
+       +---+-+-------+-----------------+-----------------------+-------+
+       |   | |       |                25 ... 5                 | 4...1 |
+       +---+-+-------+-----------------------------------------+-------+
+       |Num|I|unused |                codepoint                |4bit op|
+       +---+-+-------+-----------------------------------------+-------+
+
+        This instruction explicitly matches the encoded utf8 codepoint. The
+        high two bits (Num) represent the byte encoding (0 - 1 byte, 1 - 2
+        byte, 2 - 3 byte, and 3 - 4 byte). The inverse bit (I) will match any
+        character other than the one specified.
 
 
 Subroutine generation issue test:
@@ -1136,6 +1168,7 @@ typedef enum {
     eTokenZeroOrOne,
     eTokenZeroOrMany,
     eTokenOneOrMany,        // 20
+    eTokenRange,
     eTokenSubExprStart,
     eTokenSubExprEnd,
     eTokenUnknown // <-- this should always be the last token enum
@@ -1193,22 +1226,101 @@ struct regex_ptrlist_s {
     regex_ptrlist_t *next;
 };
 
+#define RE_TOKEN_FLAG_INVERT
+#define RE_TOKEN_FLAG_DOTALL
+#define RE_TOKEN_FLAG_END_OF_INPUT
+#define RE_TOKEN_FLAG_COMPOUND
+#define RE_TOKEN_FLAG_NO_CAPTURE
+#define RE_TOKEN_FLAG_SUBROUTINE
+#define RE_TOKEN_FLAG_ASSERT_START_OF_LINE
+#define RE_TOKEN_FLAG_ASSERT_END_OF_LINE
+#define RE_TOKEN_FLAG_ASSERT_START_OF_WORD
+#define RE_TOKEN_FLAG_ASSERT_END_OF_WORD
+
+#define RE_VM_FLAG_CHAR_INVERT
+#define RE_VM_FLAG_CHARANY_DOTALL
+#define RE_VM_FLAG_MATCH_END_OF_INPUT
+#define RE_VM_FLAG_SAVE_COMPOUND
+#define RE_VM_FLAG_UTF8_CLASS_INVERT
+#define RE_VM_FLAG_UTF8_LITERAL_INVERT  0x2000u
+
+
+/*
+
+char literal
+    -0 character
+    -b inverse
+
+utf8 literal
+    -0 character
+    -b inverse
+
+char class
+    -a bitmap
+
+string literal
+    -a string
+    -b len
+
+char any
+    -b dotall
+
+match
+    -b EOI
+
+sub expr start
+    -b compound
+    -a group
+
+utf8 class
+    -a bitmap
+    -b inverse
+    -0 leading bytes
+    b byte count
+
+call
+    -b sub_index
+
+range
+    -a min
+    -b max
+
+
+    int c
+
+    char *str;
+    unsigned int *bitmap;
+    int min;
+    int group;
+    int id;
+
+    unsigned short flags;
+    int max;
+
+    short leading;
+
+*/
 struct regex_token_s {
     eRegexToken_t tokenType;
+    int c; // eTokenCharLiteral, eTokenUtf8Literal, eTokenUtf8Class
     union {
-        int c; // char literal
-        const char *str; // str literal
-        unsigned int *bitmap; // char class, utf8 class
-        int group; // subexpr start
+        const char *str; // eTokenStrLiteral
+        unsigned int *bitmap; // eTokenCharClass, eTokenUtf8Class
+        int group; // eTokenSubExprStart
+        int min; // eTokenRange
     };
-    int pc; // program counter index, for NFA -> VM
     union {
-        int len; // string length, to allow embedded \0 chars
+        int len; // eTokenStrLiteral - string length, to allow embedded \0 chars
+        int max; // eTokenRange
         struct {
-            unsigned short flags; // char any, match, utf8 class, char any dotall, subexpr
-            short sub_index;
+            unsigned short flags; // eTokenChar, eTokenCharAny, eTokenUtf8Class, eTokenUtf8Literal, eTokenMatch, eTokenSubExprStart
+            union {
+                short sub_index; // eTokenCall
+                short leading; // eTokenUtf8Class
+            };
         };
     };
+    int pc; // program counter index, for NFA -> VM
     regex_ptrlist_t *ptrlist;
     regex_token_t *out_a;
     regex_token_t *out_b;
@@ -1410,6 +1522,11 @@ void regexPrinter_eTokenAssertion(FILE *fp, regex_token_t *token) {
     if(token->flags & REGEX_TOKEN_FLAG_END_OF_WORD) { fputs("end of word (\\>)", fp); }
 }
 
+void regexPrinter_eTokenRange(FILE *fp, regex_token_t *token) {
+    // TODO
+    fprintf(fp, "{#, #}");
+}
+
 // Token VM instruction printers
 
 void regexPrintVM_eTokenCharLiteral(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b) {
@@ -1497,12 +1614,16 @@ struct regex_token_detail_s {
     int arity;
 };
 
+// Token has a detail printer, but no VM instruction
 #define RE_TOK_DETAIL_P_(token,printer,priority,terminal,arity) \
         {token, #token, regexPrinter_ ## token, regexPrintVM_eTokenUnknown, priority, terminal, arity}
+// Token has a detail printer, and a VM instruction
 #define RE_TOK_DETAIL_PV(token,printer,priority,terminal,arity) \
         {token, #token, regexPrinter_ ## token, regexPrintVM_ ## token, priority, terminal, arity}
+// Token does not have a detail printer, or a VM instruction
 #define RE_TOK_DETAIL_N_(token,priority,terminal,arity) \
         {token, #token, NULL, regexPrintVM_eTokenUnknown, priority, terminal, arity}
+// Token does not have a detail printer, but does have a VM instruction
 #define RE_TOK_DETAIL_NV(token,priority,terminal,arity) \
         {token, #token, NULL, regexPrintVM_ ## token, priority, terminal, arity}
 
@@ -1528,6 +1649,7 @@ regex_token_detail_t _regexTokenDetails[] = {
     RE_TOK_DETAIL_N_(eTokenZeroOrOne, ePriorityHigh, eReTokPreceeding, 1),
     RE_TOK_DETAIL_N_(eTokenZeroOrMany, ePriorityHigh, eReTokPreceeding, 1),
     RE_TOK_DETAIL_N_(eTokenOneOrMany, ePriorityHigh, eReTokPreceeding, 1),
+    RE_TOK_DETAIL_N_(eTokenRange, ePriorityHigh, eReTokPreceeding, 1),
     RE_TOK_DETAIL_P_(eTokenSubExprStart, regexTokenDetailSubExprStart, ePriorityLow, eReTokNotPreceeding, 0),
     RE_TOK_DETAIL_N_(eTokenSubExprEnd, ePriorityLow, eReTokPreceeding, 0),
     RE_TOK_DETAIL_END
@@ -2171,27 +2293,6 @@ static eRegexPatternId_t _parseCheckIdentifier(const char *pattern, int start, i
     return eRegexPatternIdOk;
 }
 
-eRegexPatternId_t parseCheckIdentifier(const char **pattern, int start, int end, const char **id, int *len) {
-    int k;
-
-    if(!_parseCheckNextPatternChar(pattern, start)) {
-        return eRegexPatternIdMissing;
-    }
-    for(k = 0; _parseIsIdChar((*pattern)[k]) && ((*pattern)[k] != end); k++);
-    if((k == 0) || ((*pattern)[k] != end)) {
-        *pattern += k;
-        return eRegexPatternIdMalformed;
-    }
-    if(id != NULL) {
-        *id = *pattern;
-    }
-    if(len != NULL) {
-        *len = k;
-    }
-    *pattern += k + 1;
-    return eRegexPatternIdOk;
-}
-
 static parseChar_t _parseGetNextPatternChar(const char **pattern, const char **id, int *len) {
     parseChar_t result = {
         .c = 0,
@@ -2362,7 +2463,7 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, const char **i
 // String literal parsing handlers
 /////////////////////////////////////////////////////////////////////////////
 
-int parseUtf8EncodingByteLen(int c) {
+static int _parseUtf8EncodingByteLen(int c) {
     if(c > 65535) {
         return 4;
     } else if(c >2047) {
@@ -2376,7 +2477,7 @@ int parseUtf8EncodingByteLen(int c) {
 // bytes should be a 5 byte sequence, and c a unicode codepoint
 // bytes will be filled with the byte count, and the utf8 encoding bytes
 // from high to low
-void parseUtf8EncodeSequence(unsigned char *bytes, int c) {
+static void _parseUtf8EncodeSequence(unsigned char *bytes, int c) {
     if(c <= 127) { // 1 byte
         bytes[0] = 1;
         bytes[1] = (unsigned int)c;
@@ -2482,7 +2583,7 @@ static int _parseGetPatternStrLen(const char **pattern) {
 
             case eRegexPatternUnicode:
                 count++;
-                utf8 += parseUtf8EncodingByteLen(c.c) - 1;
+                utf8 += _parseUtf8EncodingByteLen(c.c) - 1;
                 break;
 
             case eRegexPatternInvalid:
@@ -2498,7 +2599,7 @@ static int _parseGetPatternStrLen(const char **pattern) {
 // Note: this function expects the len to have been pre-validated, and does NOT
 // recognize the null character, to allow it to be used as an actual value
 // within the string.
-char *parseGetPatternStr(const char **pattern, int len, int size) {
+static char *_parseGetPatternStr(const char **pattern, int len, int size) {
     char *str, *ptr;
     int k;
     parseChar_t c;
@@ -2512,7 +2613,7 @@ char *parseGetPatternStr(const char **pattern, int len, int size) {
         c = _parseGetNextPatternChar(pattern, NULL, NULL);
         _parsePatternCharAdvance(pattern, &c);
         if(c.state == eRegexPatternUnicode) {
-            for(k = parseUtf8EncodingByteLen(c.c); k; k--) {
+            for(k = _parseUtf8EncodingByteLen(c.c); k; k--) {
                 *ptr = (char)(((unsigned int)c.c >> (unsigned int)((k - 1) * 8)) & 0xFFu);
                 ptr++;
             }
@@ -3051,7 +3152,7 @@ int parseUtf8CharClassCodepoint(utf8_charclass_tree_t *tree, int codepoint) {
     unsigned char bytes[5];
     int byte;
 
-    parseUtf8EncodeSequence(bytes, codepoint);
+    _parseUtf8EncodeSequence(bytes, codepoint);
     if((bitmap = parseUtf8TreeGetLowByte(tree, bytes)) == NULL) {
         return 0;
     }
@@ -3257,8 +3358,8 @@ int parseUtf8CharClassRangeSet(utf8_charclass_tree_t *tree, int code_a, int code
     unsigned char b_a[5], b_b[5], b_r[5], b_r2[5];
     int k;
 
-    parseUtf8EncodeSequence(b_a, code_a);
-    parseUtf8EncodeSequence(b_b, code_b);
+    _parseUtf8EncodeSequence(b_a, code_a);
+    _parseUtf8EncodeSequence(b_b, code_b);
 
     if(b_a[0] == b_b[0]) {
         // The utf8 encoding byte length in the range is equal
@@ -3785,9 +3886,10 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                                 if(named || (flags & (REGEX_TOKEN_FLAG_SUBROUTINE | REGEX_TOKEN_FLAG_NOCAPTURE))) {
                                     return eCompileConflictingAttrs;
                                 }
-                                if(parseCheckIdentifier(&(tokenizer->pattern), '<', '>', &str, &len) != eRegexPatternIdOk) {
+                                if(_parseCheckIdentifier(tokenizer->pattern, '<', '>', &str, &len) != eRegexPatternIdOk) {
                                     return eCompileMalformedSubExprName;
                                 }
+                                tokenizer->pattern += len + 2;
                                 if(!regexVMGroupTableEntryAdd(&(build->build), str, len, subexpr)) {
                                     return eCompileOutOfMem;
                                 }
@@ -3948,11 +4050,12 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                         tokenizer->pattern--;
                     } else if(c.state == eRegexPatternUnicode) {
                         // Increment the utf8 byte accommodation
-                        len += (int)((unsigned int)(parseUtf8EncodingByteLen(c.c) - 1) << 16u);
+                        len += (int)((unsigned int)(_parseUtf8EncodingByteLen(c.c) - 1) << 16u);
                         tokenizer->pattern -= 5;
                     }
                     tokenizer->pattern--;
-                    if((str = parseGetPatternStr(&(tokenizer->pattern), PARSE_DEC_CHAR_COUNT(len), PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len))) == NULL) {
+                    if((str = _parseGetPatternStr(&(tokenizer->pattern), PARSE_DEC_CHAR_COUNT(len),
+                                                  PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len))) == NULL) {
                         return eCompileOutOfMem;
                     }
                     if(!regexTokenCreate(&(tokenizer->tokens), eTokenStringLiteral, 0, str, PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len), 0)) {
