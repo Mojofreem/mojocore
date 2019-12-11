@@ -1448,7 +1448,7 @@ void regexPrinter_eTokenUtf8Class(FILE *fp, regex_token_t *token) {
 }
 
 void regexPrinter_eTokenCall(FILE *fp, regex_token_t *token) {
-    fprintf(fp, "%d", token->c);
+    fprintf(fp, "%d", token->sub_index);
 }
 
 void regexPrinter_eTokenSubExprStart(FILE *fp, regex_token_t *token) {
@@ -2371,7 +2371,7 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_build_t *build,
         entry->name[nameLen] = '\0';
     }
     if(tokens != NULL) {
-        if(!regexTokenCreate(tokens, eTokenCall, entry->id, NULL, 0, 0)) {
+        if(!regexTokenCreate(tokens, eTokenCall, 0, NULL, 0, entry->id)) {
             return eCompileOutOfMem;
         }
     }
@@ -4165,20 +4165,19 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                         }
                         continue;
 
-                    case '<':
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenAssertion, REGEX_TOKEN_FLAG_START_OF_WORD, 0, 0, 0)) {
+                    case '<': // Meta, assertion - start of word
+                        if(!_regexCreateTokenAssertion(build, tokenizer, REGEX_TOKEN_FLAG_START_OF_WORD)) {
                             return eCompileOutOfMem;
                         }
                         continue;
 
-                    case '>':
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenAssertion, REGEX_TOKEN_FLAG_END_OF_WORD, 0, 0, 0)) {
+                    case '>': // Meta, assertion - end of word
+                        if(!_regexCreateTokenAssertion(build, tokenizer, REGEX_TOKEN_FLAG_END_OF_WORD)) {
                             return eCompileOutOfMem;
                         }
                         continue;
 
-                    default:
-                        // Unexpected meta character
+                    default: // Unexpected meta character
                         return eCompileInternalError;
                 }
 
@@ -4188,7 +4187,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                         if((index = regexSubroutineIdxGetIndex(build, str, len)) <= 0) {
                             return eCompileUnknownSubroutine;
                         }
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenCall, index, NULL, 0, 0)) {
+                        if(!_regexCreateTokenCall(build, tokenizer, index)) {
                             return eCompileOutOfMem;
                         }
                         continue;
@@ -4603,7 +4602,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
                 // Generate the sub sequence pattern, and tie it into the current pattern
                 // with an eTokenCall
                 subexpr = NULL;
-                if((subindex = regexSubroutineIdxGet(build, token->c)) == NULL) {
+                if((subindex = regexSubroutineIdxGet(build, token->sub_index)) == NULL) {
                     SET_YARD_RESULT(eCompileInternalError);
                 }
                 if(!subindex->infixed) {
