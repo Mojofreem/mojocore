@@ -1227,16 +1227,16 @@ struct regex_ptrlist_s {
 };
 
 // Token flags
-#define RE_TOKEN_FLAG_INVERT                0x01
-#define RE_TOKEN_FLAG_DOTALL                0x01
-#define RE_TOKEN_FLAG_END_OF_INPUT          0x01
-#define RE_TOKEN_FLAG_COMPOUND              0x01
-#define RE_TOKEN_FLAG_NO_CAPTURE            0x02
-#define RE_TOKEN_FLAG_SUBROUTINE            0x04
-#define RE_TOKEN_FLAG_ASSERT_START_OF_LINE  0x01
-#define RE_TOKEN_FLAG_ASSERT_END_OF_LINE    0x02
-#define RE_TOKEN_FLAG_ASSERT_START_OF_WORD  0x03
-#define RE_TOKEN_FLAG_ASSERT_END_OF_WORD    0x04
+#define RE_TOKEN_FLAG_INVERT                0x01u
+#define RE_TOKEN_FLAG_DOTALL                0x01u
+#define RE_TOKEN_FLAG_END_OF_INPUT          0x01u
+#define RE_TOKEN_FLAG_COMPOUND              0x01u
+#define RE_TOKEN_FLAG_NO_CAPTURE            0x02u
+#define RE_TOKEN_FLAG_SUBROUTINE            0x04u
+#define RE_TOKEN_FLAG_ASSERT_START_OF_LINE  0x01u
+#define RE_TOKEN_FLAG_ASSERT_END_OF_LINE    0x02u
+#define RE_TOKEN_FLAG_ASSERT_START_OF_WORD  0x03u
+#define RE_TOKEN_FLAG_ASSERT_END_OF_WORD    0x04u
 
 // Map instruction bits to operand bit positions
 #define VM_OP_A_BIT(bit)    ((0x1u << (bit)) >> 18u)
@@ -1254,7 +1254,7 @@ struct regex_token_s {
     eRegexToken_t tokenType;
     int c; // eTokenCharLiteral, eTokenUtf8Literal, eTokenUtf8Class
     union {
-        const char *str; // eTokenStrLiteral
+        char *str; // eTokenStrLiteral
         unsigned int *bitmap; // eTokenCharClass, eTokenUtf8Class
         int group; // eTokenSubExprStart
         int min; // eTokenRange
@@ -1266,9 +1266,10 @@ struct regex_token_s {
             unsigned short flags; // eTokenChar, eTokenCharAny, eTokenUtf8Class,
                     // eTokenUtf8Literal, eTokenMatch, eTokenSubExprStart
             union {
-                short sub_index; // eTokenCall
-                short leading; // eTokenUtf8Class
+                short sub_index; // eTokenCall, eTokenSubExprStart
+                short lead_count; // eTokenUtf8Class
             };
+            unsigned short lead_bits; // eTokenUtf8Class
         };
     };
     int pc; // program counter index, for NFA -> VM
@@ -1356,11 +1357,6 @@ void regexTokenizerDestroy(regex_tokenizer_t *tokenizer) {
         _regexDealloc(tokenizer, _regexMemContext);
     }
 }
-
-// Convert a pattern into a token stream
-
-// Manually assemble a token stream
-
 
 int regexVMGroupTableEntryAdd(regex_build_t *build, const char *group,
                               int len, int index);
@@ -1801,13 +1797,18 @@ void regexRegUnicodeCharClassRemove(const char *classId) {
 // Token management functions
 /////////////////////////////////////////////////////////////////////////////
 
-static regex_ptrlist_t *_regexPtrlistCreate(regex_token_t *token, eRePtrListType_t type) {
+static regex_ptrlist_t *_regexPtrlistCreate(regex_build_t *build,
+                                            regex_token_t *token,
+                                            eRePtrListType_t type) {
     regex_ptrlist_t *entry;
 
-    if((entry = _regexAlloc(sizeof(regex_ptrlist_t), _regexMemContext)) == NULL) {
+    if((build != NULL) && (build->ptrlist_pool != NULL)) {
+        entry = build->ptrlist_pool;
+        build->ptrlist_pool = entry->next;
+        memset(entry, 0, sizeof(regex_ptrlist_t));
+    } else if((entry = _regexAlloc(sizeof(regex_ptrlist_t), _regexMemContext)) == NULL) {
         return NULL;
     }
-    memset(entry, 0, sizeof(regex_ptrlist_t));
     entry->token = token;
     entry->type = type;
     return entry;
@@ -1832,13 +1833,13 @@ static regex_ptrlist_t *_regexPtrlistAppend(regex_ptrlist_t *lista, regex_ptrlis
 // to prevent redundant chained jumps. Caller should ensure that the remaining
 // entries in list are retained, as they may not all be patched. Returns the
 // number of entries that were actually patched.
-static int _regexPtrlistPatch(regex_ptrlist_t **list, regex_token_t *token, int noJmps) {
+static int _regexPtrlistPatch(regex_build_t *build, regex_ptrlist_t **list, regex_token_t *token, int no_jumps) {
     regex_ptrlist_t *jmps = NULL, *next, *walk;
     int patched = 0;
 
     for(walk = *list; walk != NULL; walk = next) {
         next = walk->next;
-        if(noJmps && (walk->token->tokenType = eTokenJmp)) {
+        if(no_jumps && (walk->token->tokenType = eTokenJmp)) {
             walk->next = jmps;
             jmps = walk;
             continue;
@@ -1848,20 +1849,273 @@ static int _regexPtrlistPatch(regex_ptrlist_t **list, regex_token_t *token, int 
         } else {
             walk->token->out_b = token;
         }
-        _regexDealloc(walk, _regexMemContext);
+        if(build != NULL) {
+            walk->next = build->ptrlist_pool;
+            build->ptrlist_pool = walk;
+        } else {
+            _regexDealloc(walk, _regexMemContext);
+        }
         patched++;
     }
     *list = jmps;
     return patched;
 }
 
-static void _regexPtrListFree(regex_ptrlist_t *list) {
+static void _regexPtrListFree(regex_build_t *build, regex_ptrlist_t *list) {
     regex_ptrlist_t *next = NULL;
+
     for(; list != NULL; list = next) {
         next = list->next;
-        _regexDealloc(list, _regexMemContext);
+        if(build != NULL) {
+            list->next = build->ptrlist_pool;
+            build->ptrlist_pool = list;
+        } else {
+            _regexDealloc(list, _regexMemContext);
+        }
     }
 }
+
+static regex_token_t *_regexAllocToken(regex_build_t *build, eRegexToken_t tokenType,
+                                       const char *str, const unsigned int *bitmap,
+                                       int len, int retain_ptr) {
+    regex_token_t *token;
+
+    if(build->tokens != NULL) {
+        token = build->tokens;
+        build->tokens = token->next;
+        memset(token, 0, sizeof(regex_token_t));
+    } else if((token = _regexAlloc(sizeof(regex_token_t), _regexMemContext)) == NULL) {
+        return NULL;
+    }
+    token->tokenType = tokenType;
+    token->pc = VM_PC_UNVISITED;
+    if(str != NULL) {
+        if(len == RE_STR_NULL_TERM) {
+            len = (int)strlen(str);
+        }
+        token->len = len;
+        if(retain_ptr) {
+            token->str = (char *)str;
+        } else {
+            if((token->str = (char *)_regexStrdup((unsigned char *)str, len)) == NULL) {
+                _regexDealloc(token, _regexMemContext);
+                return NULL;
+            }
+        }
+    } else if(bitmap != NULL) {
+        if(retain_ptr) {
+            token->bitmap = (unsigned int *)bitmap;
+        } else if((token->bitmap = _regexAlloc(len, _regexMemContext)) == NULL) {
+            _regexDealloc(token, _regexMemContext);
+            return NULL;
+        }
+        token->len = len;
+    }
+    return token;
+}
+
+static void _regexTokenDestroy(regex_build_t *build, regex_token_t *token, int full_stack) {
+    regex_token_t *next;
+
+    if(token == NULL) {
+        return;
+    }
+
+    for(; token != NULL; token = next) {
+        next = token->next;
+        switch(token->tokenType) {
+            case eTokenCharClass:
+            case eTokenStringLiteral:
+            case eTokenUtf8Class:
+                if(token->str != NULL) {
+                    _regexDealloc((void *)(token->str), _regexMemContext);
+                }
+                break;
+            default:
+                break;
+        }
+        _regexPtrListFree(NULL, token->ptrlist);
+        _regexDealloc(token, _regexMemContext);
+        if(!full_stack) {
+            break;
+        }
+    }
+}
+
+static regex_token_t *_regexTokenBaseCreate(regex_build_t *build, regex_tokenizer_t *tokenizer,
+                                            eRegexToken_t tokenType, const void *ptr,
+                                            int retain_ptr, int len) {
+    regex_token_t *token, *walk;
+
+    if((token = _regexAllocToken(build, tokenType, ptr, ptr, len, retain_ptr)) == NULL) {
+        tokenizer->status = eCompileOutOfMem;
+        return NULL;
+    }
+
+    if(tokenizer->tokens == NULL) {
+        tokenizer->tokens = token;
+    } else {
+        for(walk = tokenizer->tokens; walk->next != NULL; walk = walk->next);
+        if(regexTokenIsTerminal(token, 0) && regexTokenIsTerminal(walk, 1)) {
+            // Two adjacent terminals have an implicit concatenation
+            if((walk->next = _regexAllocToken(build, eTokenConcatenation, NULL, NULL, 0, 0)) == NULL) {
+                _regexTokenDestroy(build, token, 0);
+                tokenizer->status = eCompileOutOfMem;
+                return NULL;
+            }
+            walk = walk->next;
+        }
+        walk->next = token;
+    }
+    return token;
+}
+
+static int _regexCreateTokenCharLiteral(regex_build_t *build, regex_tokenizer_t *tokenizer, int c, int invert) {
+    regex_token_t *token;
+
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenCharLiteral, NULL, 0, 0)) == NULL) {
+        return 0;
+    }
+    token->c = c;
+    token->flags = (invert ? RE_TOKEN_FLAG_INVERT : 0);
+    return 1;
+}
+
+static int _regexCreateTokenCharClass(regex_build_t *build, regex_tokenizer_t *tokenizer, unsigned int *bitmap) {
+    return _regexTokenBaseCreate(build, tokenizer, eTokenCharClass, bitmap, 1, 0) != NULL;
+}
+
+static int _regexCreateTokenStringLiteral(regex_build_t *build, regex_tokenizer_t *tokenizer, const char *str, int len) {
+    return _regexTokenBaseCreate(build, tokenizer, eTokenStringLiteral, str, 0, len) != NULL;
+}
+
+static int _regexCreateTokenCharAny(regex_build_t *build, regex_tokenizer_t *tokenizer, int dot_all) {
+    regex_token_t *token;
+
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenCharAny, NULL, 0, 0)) == NULL) {
+        return 0;
+    }
+    token->flags = (dot_all ? RE_TOKEN_FLAG_DOTALL : 0);
+    return 1;
+}
+
+static int _regexCreateTokenMatch(regex_build_t *build, regex_tokenizer_t *tokenizer, int dot_all) {
+    regex_token_t *token;
+
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenMatch, NULL, 0, 0)) == NULL) {
+        return 0;
+    }
+    token->flags = (dot_all ? RE_TOKEN_FLAG_DOTALL : 0);
+    return 1;
+}
+
+static int _regexCreateTokenJmp(regex_build_t *build, regex_tokenizer_t *tokenizer) {
+    return _regexTokenBaseCreate(build, tokenizer, eTokenJmp, NULL, 0, 0) != NULL;
+}
+
+static int _regexCreateTokenUtf8Class(regex_build_t *build, regex_tokenizer_t *tokenizer,
+                                      unsigned int *bitmap, int lead_bytes, int midhigh, int midlow, int invert) {
+    regex_token_t *token;
+    short lead_bits = (midhigh << 6u) | midlow;
+
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenUtf8Class, bitmap, 1, 64)) == NULL) {
+        return 0;
+    }
+    token->flags = (invert ? RE_TOKEN_FLAG_INVERT : 0);
+    token->lead_bits = (short)lead_bits;
+    token->lead_count = (short)lead_bytes;
+    return 1;
+}
+
+static int _regexCreateTokenCall(regex_build_t *build, regex_tokenizer_t *tokenizer, int sub_index) {
+    regex_token_t *token;
+
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenCall, NULL, 0, 0)) == NULL) {
+        return 0;
+    }
+    token->sub_index = (short)sub_index;
+    return 1;
+}
+
+static int _regexCreateTokenReturn(regex_build_t *build, regex_tokenizer_t *tokenizer) {
+    return _regexTokenBaseCreate(build, tokenizer, eTokenReturn, NULL, 0, 0) != NULL;
+}
+
+static int _regexCreateTokenByte(regex_build_t *build, regex_tokenizer_t *tokenizer) {
+    return _regexTokenBaseCreate(build, tokenizer, eTokenByte, NULL, 0, 0) != NULL;
+}
+
+static int _regexCreateTokenAssertion(regex_build_t *build, regex_tokenizer_t *tokenizer, int assertion) {
+    regex_token_t *token;
+
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenAssertion, NULL, 0, 0)) == NULL) {
+        return 0;
+    }
+    token->flags = (unsigned int)assertion;
+    return 1;
+}
+
+static int _regexCreateTokenConcatenation(regex_build_t *build, regex_tokenizer_t *tokenizer) {
+    return _regexTokenBaseCreate(build, tokenizer, eTokenConcatenation, NULL, 0, 0) != NULL;
+}
+
+static int _regexCreateTokenAlternative(regex_build_t *build, regex_tokenizer_t *tokenizer) {
+    return _regexTokenBaseCreate(build, tokenizer, eTokenAlternative, NULL, 0, 0) != NULL;
+}
+
+static int _regexCreateTokenZeroOrOne(regex_build_t *build, regex_tokenizer_t *tokenizer) {
+    return _regexTokenBaseCreate(build, tokenizer, eTokenZeroOrOne, NULL, 0, 0) != NULL;
+}
+
+static int _regexCreateTokenZeroOrMany(regex_build_t *build, regex_tokenizer_t *tokenizer) {
+    return _regexTokenBaseCreate(build, tokenizer, eTokenZeroOrMany, NULL, 0, 0) != NULL;
+}
+
+static int _regexCreateTokenOneOrMany(regex_build_t *build, regex_tokenizer_t *tokenizer) {
+    return _regexTokenBaseCreate(build, tokenizer, eTokenOneOrMany, NULL, 0, 0) != NULL;
+}
+
+static int _regexCreateTokenRange(regex_build_t *build, regex_tokenizer_t *tokenizer, int min, int max) {
+    regex_token_t *token;
+
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenRange, NULL, 0, 0)) == NULL) {
+        return 0;
+    }
+    token->min = min;
+    token->max = max;
+    return 1;
+}
+
+static int _regexCreateTokenSubExprStart(regex_build_t *build, regex_tokenizer_t *tokenizer, int group, int sub_index, int compound, int no_capture) {
+    unsigned int flags = 0;
+
+    if(sub_index >= 0) {
+        flags |= RE_TOKEN_FLAG_SUBROUTINE;
+    }
+    if(compound) {
+        flags |= RE_TOKEN_FLAG_COMPOUND;
+    }
+    if(no_capture) {
+        flags |= RE_TOKEN_FLAG_NO_CAPTURE;
+    }
+    regex_token_t *token;
+
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenSubExprStart, NULL, 0, 0)) == NULL) {
+        return 0;
+    }
+    token->flags = flags;
+    token->group = group;
+    token->sub_index = (short)sub_index;
+    return 1;
+}
+
+static int _regexCreateTokenSubExprEnd(regex_build_t *build, regex_tokenizer_t *tokenizer) {
+    return _regexTokenBaseCreate(build, tokenizer, eTokenSubExprEnd, NULL, 0, 0) != NULL;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Original concept
+/////////////////////////////////////////////////////////////////////////////
 
 regex_token_t *regexAllocToken(eRegexToken_t tokenType, int c, const char *str, int sizeOrFlags, int sub_index) {
     regex_token_t *token;
@@ -1873,7 +2127,7 @@ regex_token_t *regexAllocToken(eRegexToken_t tokenType, int c, const char *str, 
     token->tokenType = tokenType;
     token->pc = VM_PC_UNVISITED;
     if(str != NULL) {
-        token->str = str;
+        token->str = (char *)str;
         token->len = sizeOrFlags;
     } else {
         token->c = c;
@@ -1928,7 +2182,7 @@ void regexTokenDestroy(regex_token_t *token, int stack) {
             default:
                 break;
         }
-        _regexPtrListFree(token->ptrlist);
+        _regexPtrListFree(NULL, token->ptrlist);
         _regexDealloc(token, _regexMemContext);
         if(!stack) {
             break;
@@ -4075,7 +4329,7 @@ int regexStackTypeGreaterOrEqualToToken(regex_token_t *stack, eRegexToken_t toke
 /////////////////////////////////////////////////////////////////////////////
 
 int regexOperatorLiteralCreate(regex_token_t **stack, regex_token_t *token) {
-    if((token->ptrlist = _regexPtrlistCreate(token, eRePtrOutA)) == NULL) {
+    if((token->ptrlist = _regexPtrlistCreate(NULL, token, eRePtrOutA)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, token);
@@ -4084,7 +4338,7 @@ int regexOperatorLiteralCreate(regex_token_t **stack, regex_token_t *token) {
 
 int regexOperatorSubexprCreate(regex_token_t **stack, regex_token_t *token) {
     token->tokenType = eTokenSave;
-    if((token->ptrlist = _regexPtrlistCreate(token, eRePtrOutA)) == NULL) {
+    if((token->ptrlist = _regexPtrlistCreate(NULL, token, eRePtrOutA)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, token);
@@ -4099,7 +4353,7 @@ int regexOperatorConcatenationCreate(regex_token_t **stack, regex_token_t *token
        ((e1 = regexTokenStackPop(stack)) == NULL)) {
         return 0;
     }
-    _regexPtrlistPatch(&(e1->ptrlist), e2, 0);
+    _regexPtrlistPatch(NULL, &(e1->ptrlist), e2, 0);
     e1->ptrlist = e2->ptrlist;
     e2->ptrlist = NULL;
     regexTokenStackPush(stack, e1);
@@ -4120,16 +4374,16 @@ int regexOperatorAlternationCreate(regex_token_t **stack, regex_token_t *token) 
         return 0;
     }
 #ifdef MOJO_REGEX_EXPERIMENTAL_CULL_JMP
-    if(regexPtrlistPatch(&(e1->ptrlist), jmp, 1) == 0) {
+    if(regexPtrlistPatch(NULL, &(e1->ptrlist), jmp, 1) == 0) {
 #else // !MOJO_REGEX_EXPERIMENTAL_CULL_JMP
-    if(_regexPtrlistPatch(&(e1->ptrlist), jmp, 0) == 0) {
+    if(_regexPtrlistPatch(NULL, &(e1->ptrlist), jmp, 0) == 0) {
 #endif
         // The jmp token was unused
         regexTokenDestroy(jmp, 0);
         token->ptrlist = e1->ptrlist;
         e1->ptrlist = NULL;
     } else {
-        if((token->ptrlist = _regexPtrlistCreate(jmp, eRePtrOutA)) == NULL) {
+        if((token->ptrlist = _regexPtrlistCreate(NULL, jmp, eRePtrOutA)) == NULL) {
             return 0;
         }
     }
@@ -4151,7 +4405,7 @@ int regexOperatorZeroOrOneCreate(regex_token_t **stack, regex_token_t *token) {
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    if((token->ptrlist = _regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
+    if((token->ptrlist = _regexPtrlistCreate(NULL, token, eRePtrOutB)) == NULL) {
         return 0;
     }
     token->ptrlist = _regexPtrlistAppend(e->ptrlist, token->ptrlist);
@@ -4170,14 +4424,14 @@ int regexOperatorZeroOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    if((token->ptrlist = _regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
+    if((token->ptrlist = _regexPtrlistCreate(NULL, token, eRePtrOutB)) == NULL) {
         return 0;
     }
     if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL, 0, 0)) {
         return 0;
     }
     jmp->out_a = token;
-    _regexPtrlistPatch(&(e->ptrlist), jmp, 0);
+    _regexPtrlistPatch(NULL, &(e->ptrlist), jmp, 0);
     regexTokenStackPush(stack, token);
 
     return 1;
@@ -4191,8 +4445,8 @@ int regexOperatorOneOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    _regexPtrlistPatch(&(e->ptrlist), token, 0);
-    if((e->ptrlist = _regexPtrlistCreate(token, eRePtrOutB)) == NULL) {
+    _regexPtrlistPatch(NULL, &(e->ptrlist), token, 0);
+    if((e->ptrlist = _regexPtrlistCreate(NULL, token, eRePtrOutB)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, e);
@@ -4209,7 +4463,7 @@ int regexOperatorMatchCreate(regex_token_t **stack) {
     if(!regexTokenCreate(&token, eTokenMatch, 0, NULL, 0, 0)) {
         return 0;
     }
-    _regexPtrlistPatch(&(e->ptrlist), token, 0);
+    _regexPtrlistPatch(NULL, &(e->ptrlist), token, 0);
     regexTokenStackPush(stack, e);
 
     return 1;
@@ -4226,7 +4480,7 @@ int regexOperatorReturnCreate(regex_token_t **stack) {
         return 0;
     }
     regexEmitTokenStr(stdout, e);
-    _regexPtrlistPatch(&(e->ptrlist), token, 0);
+    _regexPtrlistPatch(NULL, &(e->ptrlist), token, 0);
     regexTokenStackPush(stack, e);
 
     return 1;
