@@ -2016,18 +2016,26 @@ static int _regexCreateTokenCharAny(regex_build_t *build, regex_tokenizer_t *tok
     return 1;
 }
 
-static int _regexCreateTokenMatch(regex_build_t *build, regex_tokenizer_t *tokenizer, int dot_all) {
+static int _regexCreateTokenMatch(regex_build_t *build, regex_token_t **tokens, int dot_all) {
     regex_token_t *token;
+    regex_tokenizer_t tokenizer = {.tokens = NULL};
 
-    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenMatch, NULL, 0, 0)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, &tokenizer, eTokenMatch, NULL, 0, 0)) == NULL) {
         return 0;
     }
     token->flags = (dot_all ? RE_TOKEN_FLAG_DOTALL : 0);
+    *tokens = tokenizer.tokens;
     return 1;
 }
 
-static int _regexCreateTokenJmp(regex_build_t *build, regex_tokenizer_t *tokenizer) {
-    return _regexTokenBaseCreate(build, tokenizer, eTokenJmp, NULL, 0, 0) != NULL;
+static int _regexCreateTokenJmp(regex_build_t *build, regex_token_t **tokens) {
+    regex_tokenizer_t tokenizer = {.tokens = NULL};
+    regex_token_t *token;
+    if((token = _regexTokenBaseCreate(build, &tokenizer, eTokenJmp, NULL, 0, 0)) == NULL) {
+        return 0;
+    }
+    *tokens = tokenizer.tokens;
+    return 1;
 }
 
 static int _regexCreateTokenUtf8Class(regex_build_t *build, regex_tokenizer_t *tokenizer,
@@ -2054,8 +2062,14 @@ static int _regexCreateTokenCall(regex_build_t *build, regex_tokenizer_t *tokeni
     return 1;
 }
 
-static int _regexCreateTokenReturn(regex_build_t *build, regex_tokenizer_t *tokenizer) {
-    return _regexTokenBaseCreate(build, tokenizer, eTokenReturn, NULL, 0, 0) != NULL;
+static int _regexCreateTokenReturn(regex_build_t *build, regex_token_t **tokens) {
+    regex_token_t *token;
+    regex_tokenizer_t tokenizer = {.tokens = NULL};
+    if((token = _regexTokenBaseCreate(build, &tokenizer, eTokenReturn, NULL, 0, 0)) == NULL) {
+        return 0;
+    }
+    *tokens = tokenizer.tokens;
+    return 1;
 }
 
 static int _regexCreateTokenByte(regex_build_t *build, regex_tokenizer_t *tokenizer) {
@@ -4384,7 +4398,7 @@ int regexOperatorAlternationCreate(regex_build_t *build, regex_token_t **stack, 
         return 0;
     }
 
-    if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL, 0, 0)) {
+    if(!_regexCreateTokenJmp(build, &jmp)) {
         return 0;
     }
 #ifdef MOJO_REGEX_EXPERIMENTAL_CULL_JMP
@@ -4441,7 +4455,7 @@ int regexOperatorZeroOrMoreCreate(regex_build_t *build, regex_token_t **stack, r
     if((token->ptrlist = _regexPtrlistCreate(build, token, eRePtrOutB)) == NULL) {
         return 0;
     }
-    if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL, 0, 0)) {
+    if(!_regexCreateTokenJmp(build, &jmp)) {
         return 0;
     }
     jmp->out_a = token;
@@ -4474,7 +4488,7 @@ int regexOperatorMatchCreate(regex_build_t *build, regex_token_t **stack) {
     if((e = regexTokenStackPop(stack)) == NULL) {
         return 0;
     }
-    if(!regexTokenCreate(&token, eTokenMatch, 0, NULL, 0, 0)) {
+    if(!_regexCreateTokenMatch(build, &token, 0)) {
         return 0;
     }
     _regexPtrlistPatch(build, &(e->ptrlist), token, 0);
@@ -4490,7 +4504,7 @@ int regexOperatorReturnCreate(regex_build_t *build, regex_token_t **stack) {
     if((e = regexTokenStackPop(stack)) == NULL) {
         return 0;
     }
-    if(!regexTokenCreate(&token, eTokenReturn, 0, NULL, 0, 0)) {
+    if(!_regexCreateTokenReturn(build, &token)) {
         return 0;
     }
     _regexPtrlistPatch(build, &(e->ptrlist), token, 0);
@@ -4562,15 +4576,17 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
     regex_token_t *operands = NULL, *subexpr;
     regex_subroutines_t *subindex;
     eRegexCompileStatus_t status;
+    regex_tokenizer_t tokenizer;
     int group_num;
 
     if((sub_expression >= 0) || (sub_expression == REGEX_SHUNTING_YARD_NO_CAPTURE)) {
         operands = *root_stack;
         if(operands != NULL) {
-            if(!regexTokenCreate(&token, eTokenConcatenation, 0, NULL, 0, 0)) {
+            tokenizer.tokens = NULL;
+            if(!_regexCreateTokenConcatenation(build, &tokenizer)) {
                 return eCompileOutOfMem;
             }
-            regexTokenStackPush(&operators, token);
+            regexTokenStackPush(&operators, tokenizer.tokens);
         }
     }
 
@@ -4675,11 +4691,11 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
                     if(!regexOperatorSubexprCreate(build, &operands, token)) {
                         SET_YARD_RESULT(eCompileOutOfMem);
                     }
-                    token = NULL;
-                    if(!regexTokenCreate(&token, eTokenConcatenation, 0, NULL, 0, 0)) {
+                    tokenizer.tokens = NULL;
+                    if(!_regexCreateTokenConcatenation(build, &tokenizer)) {
                         return eCompileOutOfMem;
                     }
-                    regexTokenStackPush(&operators, token);
+                    regexTokenStackPush(&operators, tokenizer.tokens);
                 }
                 if((status = regexOperatorApply(build, &operators, OP_ALL, 0, &operands)) != eCompileOk) {
                     goto ShuntingYardFailure;
