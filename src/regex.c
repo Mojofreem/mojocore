@@ -5331,6 +5331,16 @@ void regexVMPrintProgram(FILE *fp, regex_vm_t *vm) {
 // Pattern compilation
 /////////////////////////////////////////////////////////////////////////////
 
+const char *regexCompilePhaseStrGet(eRegexCompilePhase_t phase) {
+    switch(phase) {
+        case ePhaseTokenize: return "tokenizer";
+        case ePhaseNFAGraph: return "NFA graph generation";
+        case ePhaseVMGen: return "VM generation";
+        case ePhaseComplete: return "compilation completed";
+        default: return "unknown phase";
+    }
+}
+
 const char *regexCompileStatusStrGet(eRegexCompileStatus_t status) {
     switch(status) {
         case eCompileOk: return "compiled successfully";
@@ -5421,6 +5431,7 @@ void regexEmitPatternDetail(FILE *fp, const char *label, const char *pattern, si
 void regexCompileResultEmit(FILE *fp, regex_compile_ctx_t *ctx) {
     fprintf(fp, "Result: %s\n", regexCompileStatusStrGet(ctx->status));
     if(ctx->status != eCompileOk) {
+        fprintf(fp, "Phase: %s\n", regexCompilePhaseStrGet(ctx->phase));
         if(ctx->phase == ePhaseTokenize) {
             regexEmitPatternDetail(fp, "Pattern", ctx->pattern, strlen(ctx->pattern), ctx->position, 78);
 
