@@ -491,9 +491,9 @@ struct regex_vm_s {
 
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
-#define REGEX_CASE_INSENSITIVE  0x01
-#define REGEX_NO_CAPTURE        0x02
-#define REGEX_DOTALL            0x04
+#define REGEX_CASE_INSENSITIVE  0x01u
+#define REGEX_NO_CAPTURE        0x02u
+#define REGEX_DOTALL            0x04u
 
 #define REGEX_STR_NULL_TERMINATED   -1
 
@@ -4044,7 +4044,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
             case eRegexPatternMetaChar:
                 switch(c.c) {
                     case '.': // Meta, any char
-                        if(!_regexCreateTokenCharAny(build, tokenizer, (int)(build->flags & REGEX_DOTALL))) {
+                        if(!_regexCreateTokenCharAny(build, tokenizer, (int)((unsigned int)(build->flags) & REGEX_DOTALL))) {
                             return eCompileOutOfMem;
                         }
                         continue;
@@ -4199,7 +4199,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                         }
                         continue;
                     case 'B': // explicit byte
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenByte, 0, 0, 0, 0)) {
+                        if(!_regexCreateTokenByte(build, tokenizer)) {
                             return eCompileOutOfMem;
                         }
                         continue;
@@ -4251,7 +4251,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                     return eCompileEscapeCharIncomplete;
                 }
                 if(PARSE_DEC_CHAR_COUNT(len) == 0) {
-                    if(!regexTokenCreate(&(tokenizer->tokens), eTokenCharLiteral, (char) (c.c), 0, 0, 0)) {
+                    if(!_regexCreateTokenCharLiteral(build, tokenizer, (char) (c.c), 0)) {
                         return eCompileOutOfMem;
                     }
                 } else {
@@ -4268,7 +4268,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                                                   PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len))) == NULL) {
                         return eCompileOutOfMem;
                     }
-                    if(!regexTokenCreate(&(tokenizer->tokens), eTokenStringLiteral, 0, str, PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len), 0)) {
+                    if(!_regexCreateTokenStringLiteral(build, tokenizer, str, PARSE_DEC_UTF8_COUNT(len) + PARSE_DEC_CHAR_COUNT(len))) {
                         return eCompileOutOfMem;
                     }
                 }
@@ -4283,7 +4283,7 @@ eRegexCompileStatus_t regexTokenizePattern(regex_build_t *build,
     const char *start = tokenizer->pattern;
 
     tokenizer->status = _regexTokenizePattern(build, tokenizer);
-    tokenizer->position = tokenizer->pattern - start;
+    tokenizer->position = (int)(tokenizer->pattern - start);
     return tokenizer->status;
 }
 
