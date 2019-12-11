@@ -351,6 +351,11 @@ Regex VM Bytecode (v8 - in development)
         set, then the match logic is inverted for all bytes present, including
         the class bitmap (it is NOT pre-inverted).
 
+        00 - 2 byte encoding (midlow, low)
+        01 - 3 byte encoding (midhigh, midlow, low)
+        10 - 4 byte encoding, seperate leading high byte (midhigh, midlow, low)
+        11 - unused
+
     Note about eTokenCall:
         This instruction allows common repeating sequences to be factored out
         into a subroutine. The evaluation implementation is limited to an
@@ -454,6 +459,7 @@ typedef enum {
     eCompileMissingSubexprStart,
     eCompileConflictingAttrs,
     eCompileUnknownSubroutine,
+    eCompileSubroutineNameCollision,
     eCompileInternalError
 } eRegexCompileStatus_t;
 
@@ -1246,6 +1252,10 @@ struct regex_ptrlist_s {
 #define RE_TOKEN_FLAG_ASSERT_START_OF_WORD  0x04u
 #define RE_TOKEN_FLAG_ASSERT_END_OF_WORD    0x08u
 
+#define RE_TOKEN_UTF8_2_BYTES               0x00
+#define RE_TOKEN_UTF8_3_BYTES               0x01
+#define RE_TOKEN_UTF8_4_BYTES               0x02
+
 // Map instruction bits to operand bit positions
 #define VM_OP_A_BIT(bit)    ((0x1u << (bit)) >> 18u)
 #define VM_OP_B_BIT(bit)    ((0x1u << (bit)) >> 4u)
@@ -1783,6 +1793,29 @@ static const char *_regexRegUnicodeCharClassGet(const char *classId, int len) {
     return NULL;
 }
 
+static int _regexRegUnicodeCharClassLookup(const char *classId, int len, const char **name, const char **alias) {
+    mojo_unicode_class_t *walk;
+
+    if(len <= 0) {
+        len = (int)strlen(classId);
+    }
+
+    for(walk = _regex_unicode_charclass_table; walk != NULL; walk = walk->next) {
+        if((walk->abbreviation != NULL) && (strlen(walk->abbreviation) == len) &&
+           (!strncmp(walk->abbreviation, classId, len))) {
+            *name = walk->property;
+            *alias = walk->abbreviation;
+            return 1;
+        }
+        if((strlen(walk->property) == len) && (!strncmp(walk->property, classId, len))) {
+            *name = walk->property;
+            *alias = walk->abbreviation;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void regexRegUnicodeCharClassRemove(const char *classId) {
     mojo_unicode_class_t *entry, *last = NULL;
 
@@ -2043,7 +2076,7 @@ static int _regexCreateTokenUtf8Class(regex_build_t *build, regex_tokenizer_t *t
     regex_token_t *token;
     short lead_bits = (short)(((unsigned int)midhigh << 6u) | (unsigned int)midlow);
 
-    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenUtf8Class, bitmap, 1, 64)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenUtf8Class, bitmap, 0, 64)) == NULL) {
         return 0;
     }
     token->flags = (invert ? RE_TOKEN_FLAG_INVERT : 0);
@@ -2732,18 +2765,18 @@ static void _parseUtf8EncodeSequence(unsigned char *bytes, int c) {
     }
 }
 
-#define UTF8_FOUR_BYTE_PREFIX   0xF0
-#define UTF8_FOUR_BYTE_MASK     0xF8
-#define UTF8_FOUR_BYTE_BITMASK  0x07
-#define UTF8_THREE_BYTE_PREFIX  0xE0
-#define UTF8_THREE_BYTE_MASK    0xF0
-#define UTF8_THREE_BYTE_BITMASK 0x0F
-#define UTF8_TWO_BYTE_PREFIX    0xC0
-#define UTF8_TWO_BYTE_MASK      0xE0
-#define UTF8_TWO_BYTE_BITMASK   0x1F
-#define UTF8_LOW_BYTE_PREFIX    0x80
-#define UTF8_LOW_BYTE_MASK      0xC0
-#define UTF8_LOW_BYTE_BITMASK   0x3F
+#define UTF8_FOUR_BYTE_PREFIX   0xF0u
+#define UTF8_FOUR_BYTE_MASK     0xF8u
+#define UTF8_FOUR_BYTE_BITMASK  0x07u
+#define UTF8_THREE_BYTE_PREFIX  0xE0u
+#define UTF8_THREE_BYTE_MASK    0xF0u
+#define UTF8_THREE_BYTE_BITMASK 0x0Fu
+#define UTF8_TWO_BYTE_PREFIX    0xC0u
+#define UTF8_TWO_BYTE_MASK      0xE0u
+#define UTF8_TWO_BYTE_BITMASK   0x1Fu
+#define UTF8_LOW_BYTE_PREFIX    0x80u
+#define UTF8_LOW_BYTE_MASK      0xC0u
+#define UTF8_LOW_BYTE_BITMASK   0x3Fu
 
 int parseUtf8EncodedHighByte(char c) {
     if((c & UTF8_TWO_BYTE_MASK) == UTF8_TWO_BYTE_PREFIX) {
@@ -3031,8 +3064,8 @@ struct utf8_charclass_tree_s {
     unsigned int one_byte[8];
 };
 
-utf8_charclass_midlow_byte_t *parseUtf8GetMidLowByte(utf8_charclass_midlow_byte_t **base,
-                                                     unsigned char prefix) {
+static utf8_charclass_midlow_byte_t *_parseUtf8GetMidLowByte(utf8_charclass_midlow_byte_t **base,
+                                                             unsigned char prefix) {
     utf8_charclass_midlow_byte_t *midlow, *ml_last = NULL;
 
     for(midlow = *base; midlow != NULL; midlow = midlow->next) {
@@ -3053,8 +3086,8 @@ utf8_charclass_midlow_byte_t *parseUtf8GetMidLowByte(utf8_charclass_midlow_byte_
     return midlow;
 }
 
-utf8_charclass_midhigh_byte_t *parseUtf8GetMidHighByte(utf8_charclass_midhigh_byte_t **base,
-                                                       unsigned char prefix) {
+static utf8_charclass_midhigh_byte_t *_parseUtf8GetMidHighByte(utf8_charclass_midhigh_byte_t **base,
+                                                               unsigned char prefix) {
     utf8_charclass_midhigh_byte_t *midhigh, *mh_last = NULL;
 
     for(midhigh = *base; midhigh != NULL; midhigh = midhigh->next) {
@@ -3075,8 +3108,8 @@ utf8_charclass_midhigh_byte_t *parseUtf8GetMidHighByte(utf8_charclass_midhigh_by
     return midhigh;
 }
 
-utf8_charclass_high_byte_t *parseUtf8GetHighByte(utf8_charclass_high_byte_t **base,
-                                                    unsigned char prefix) {
+static utf8_charclass_high_byte_t *_parseUtf8GetHighByte(utf8_charclass_high_byte_t **base,
+                                                         unsigned char prefix) {
     utf8_charclass_high_byte_t *high, *last = NULL;
 
     for(high = *base; high != NULL; high = high->next) {
@@ -3097,7 +3130,7 @@ utf8_charclass_high_byte_t *parseUtf8GetHighByte(utf8_charclass_high_byte_t **ba
     return high;
 }
 
-unsigned int *parseUtf8TreeGetLowByte(utf8_charclass_tree_t *tree, unsigned char *bytes) {
+static unsigned int *_parseUtf8TreeGetLowByte(utf8_charclass_tree_t *tree, unsigned char *bytes) {
     utf8_charclass_midlow_byte_t *midlow;
     utf8_charclass_midhigh_byte_t *midhigh;
     utf8_charclass_high_byte_t *high;
@@ -3108,35 +3141,39 @@ unsigned int *parseUtf8TreeGetLowByte(utf8_charclass_tree_t *tree, unsigned char
             return tree->one_byte;
 
         case 2:
-            if((midlow = parseUtf8GetMidLowByte(&(tree->two_byte), bytes[1])) == NULL) {
+            if((midlow = _parseUtf8GetMidLowByte(&(tree->two_byte), bytes[1])) == NULL) {
                 return NULL;
             }
             return midlow->bitmap;
 
         case 3:
-            if((midhigh = parseUtf8GetMidHighByte(&(tree->three_byte), bytes[1])) == NULL) {
+            if((midhigh = _parseUtf8GetMidHighByte(&(tree->three_byte), bytes[1])) == NULL) {
                 return NULL;
             }
-            if((midlow = parseUtf8GetMidLowByte(&(midhigh->midlow_byte), bytes[2])) == NULL) {
+            if((midlow = _parseUtf8GetMidLowByte(&(midhigh->midlow_byte), bytes[2])) == NULL) {
                 return NULL;
             }
             return midlow->bitmap;
 
         case 4:
-            if((high = parseUtf8GetHighByte(&(tree->four_byte), bytes[1])) == NULL) {
+            if((high = _parseUtf8GetHighByte(&(tree->four_byte), bytes[1])) == NULL) {
                 return NULL;
             }
-            if((midhigh = parseUtf8GetMidHighByte(&(high->midhigh_byte), bytes[2])) == NULL) {
+            if((midhigh = _parseUtf8GetMidHighByte(&(high->midhigh_byte), bytes[2])) == NULL) {
                 return NULL;
             }
-            if((midlow = parseUtf8GetMidLowByte(&(midhigh->midlow_byte), bytes[3])) == NULL) {
+            if((midlow = _parseUtf8GetMidLowByte(&(midhigh->midlow_byte), bytes[3])) == NULL) {
                 return NULL;
             }
             return midlow->bitmap;
     }
 }
 
-unsigned int *charClassBitmapCopy(unsigned int *bitmap) {
+/////////////////////////////////////////////////////////////////////////////
+// Original char class parsing
+/////////////////////////////////////////////////////////////////////////////
+
+static unsigned int *_charClassBitmapCopy(unsigned int *bitmap) {
     unsigned int *copy;
 
     if((copy = _regexAlloc(32, _regexMemContext)) == NULL) {
@@ -3146,7 +3183,7 @@ unsigned int *charClassBitmapCopy(unsigned int *bitmap) {
     return copy;
 }
 
-unsigned int *utf8ClassBitmapCopy(unsigned int *bitmap, int invert) {
+static unsigned int *_utf8ClassBitmapCopy(unsigned int *bitmap, int invert) {
     unsigned int *copy;
     int k;
 
@@ -3179,7 +3216,7 @@ int regexTokenUtf8ClassMidlowCreate(regex_token_t **tokens, utf8_charclass_midlo
                          NULL, (invert ? REGEX_TOKEN_FLAG_INVERT : 0), 0)) {
         return 0;
     }
-    if((bitmap = utf8ClassBitmapCopy(midlow->bitmap, invert)) == NULL) {
+    if((bitmap = _utf8ClassBitmapCopy(midlow->bitmap, invert)) == NULL) {
         return 0;
     }
     if(!regexTokenCreate(tokens, eTokenUtf8Class, 0, (char *)bitmap, 0, 0)) {
@@ -3287,7 +3324,7 @@ int regexTokenUtf8ClassCreate(regex_build_t *build, regex_tokenizer_t *tokenizer
                     tree->one_byte[k] ^= 0xFFu;
                 }
             }
-            if((bitmap = charClassBitmapCopy(tree->one_byte)) == NULL) {
+            if((bitmap = _charClassBitmapCopy(tree->one_byte)) == NULL) {
                 *status = eCompileOutOfMem;
                 return 0;
             }
@@ -3386,7 +3423,7 @@ int parseUtf8CharClassCodepoint(utf8_charclass_tree_t *tree, int codepoint) {
     int byte;
 
     _parseUtf8EncodeSequence(bytes, codepoint);
-    if((bitmap = parseUtf8TreeGetLowByte(tree, bytes)) == NULL) {
+    if((bitmap = _parseUtf8TreeGetLowByte(tree, bytes)) == NULL) {
         return 0;
     }
     switch(bytes[0]) {
@@ -3431,7 +3468,7 @@ int parseUtf8SetTreeClassBitmapRange(utf8_charclass_tree_t *tree, int count,
         default:
             break;
     }
-    if((bitmap = parseUtf8TreeGetLowByte(tree, bytes)) == NULL) {
+    if((bitmap = _parseUtf8TreeGetLowByte(tree, bytes)) == NULL) {
         return 0;
     }
     parseUtf8SetCharClassBitmapRange(bitmap, start, end);
@@ -3869,7 +3906,7 @@ parseClassCompleted:
             }
         }
 
-        if((ptr = charClassBitmapCopy(bitmap)) == NULL) {
+        if((ptr = _charClassBitmapCopy(bitmap)) == NULL) {
             *status = eCompileOutOfMem;
             return 0;
         }
@@ -3916,6 +3953,652 @@ void regexEmitCharClassBitmap(FILE *fp, const unsigned int *bitmap) {
             }
         }
     }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Reworked char class parsing
+/////////////////////////////////////////////////////////////////////////////
+
+// 1 byte encoding - rolled into eTokenCharClass
+// 2 & 3 byte encoding - eTokenUtf8Class
+// 4 byte encoding - eTokenCharLiteral + eTokenCharClass
+static int _parseUtf8ClassTreeAndCreateToken(regex_build_t *build, regex_tokenizer_t *tokenizer,
+                                             const char *name, int name_len,
+                                             utf8_charclass_tree_t *tree, int invert) {
+    utf8_charclass_midlow_byte_t *midlow;
+    utf8_charclass_midhigh_byte_t *midhigh;
+    utf8_charclass_high_byte_t *high;
+    regex_tokenizer_t routine_tokenizer = {.tokens = NULL};
+    regex_subroutine_t *subroutine;
+    unsigned int *bitmap;
+    int id;
+    int k, first = 1;
+
+    // Preset to OoM, change to eCompileOk on success
+    tokenizer->status = eCompileOutOfMem;
+
+    if(!_regexCreateTokenSubExprStart(build, &routine_tokenizer,0, 0, 0, 1)) {
+        return 0;
+    }
+
+    // Single byte character encoding
+    // Are low bytes set?
+    for(k = 0; k < 32; k++) {
+        if(tree->one_byte[k] != 0) {
+            break;
+        }
+    }
+    if(k < 32) {
+        // The single byte encoding has a glyph set
+        // TODO - protect against high bit single byte classes?
+        if(invert) {
+            for(k = 0; k < 32; k++) {
+                tree->one_byte[k] ^= 0xFFu;
+            }
+        }
+        if((bitmap = _charClassBitmapCopy(tree->one_byte)) == NULL) {
+            return 0;
+        }
+        if(!_regexCreateTokenCharClass(build, &routine_tokenizer, (unsigned int *)bitmap)) {
+            return 0;
+        }
+        first = 0;
+    }
+
+    if(tree->two_byte != NULL) {
+        if(!first) {
+            if(!_regexCreateTokenAlternative(build, &routine_tokenizer)) {
+                return 0;
+            }
+        }
+        if(!_regexCreateTokenSubExprStart(build, &routine_tokenizer, 0, 0, 0, 1)) {
+            return 0;
+        }
+        first = 1;
+        for(midlow = tree->two_byte; midlow != NULL; midlow = midlow->next) {
+            if(!_regexCreateTokenUtf8Class(build, &routine_tokenizer, midlow->bitmap, RE_TOKEN_UTF8_2_BYTES, 0, midlow->prefix, invert)) {
+                return 0;
+            }
+            first = 0;
+        }
+        if(!_regexCreateTokenSubExprEnd(build, &routine_tokenizer)) {
+            return 0;
+        }
+    }
+
+    if(tree->three_byte != NULL) {
+        if(!first) {
+            if(!_regexCreateTokenAlternative(build, &routine_tokenizer)) {
+                return 0;
+            }
+        }
+        if(!_regexCreateTokenSubExprStart(build, &routine_tokenizer, 0, 0, 0, 1)) {
+            return 0;
+        }
+        first = 1;
+        for(midhigh = tree->three_byte; midhigh != NULL; midhigh = midhigh->next) {
+            for(midlow = midhigh->midlow_byte; midlow != NULL; midlow = midlow->next) {
+                if(!_regexCreateTokenUtf8Class(build, &routine_tokenizer, midlow->bitmap, RE_TOKEN_UTF8_3_BYTES, midhigh->prefix, midlow->prefix, invert)) {
+                    return 0;
+                }
+            }
+            first = 0;
+        }
+        if(!_regexCreateTokenSubExprEnd(build, &routine_tokenizer)) {
+            return 0;
+        }
+    }
+
+    if(tree->four_byte != NULL) {
+        if(!first) {
+            if(!_regexCreateTokenAlternative(build, &routine_tokenizer)) {
+                return 0;
+            }
+        }
+        if(!_regexCreateTokenSubExprStart(build, &routine_tokenizer, 0, 0, 0, 1)) {
+            return 0;
+        }
+        for(high = tree->four_byte; high != NULL; high = high->next) {
+            for(midhigh = high->midhigh_byte; midhigh != NULL; midhigh = midhigh->next) {
+                for(midlow = midhigh->midlow_byte; midlow != NULL; midlow = midlow->next) {
+                    if(!_regexCreateTokenCharLiteral(build, &routine_tokenizer,
+                                                     (((unsigned int)high->prefix & UTF8_FOUR_BYTE_BITMASK) | UTF8_FOUR_BYTE_PREFIX),
+                                                     invert)) {
+                        return 0;
+                    }
+                    if(!_regexCreateTokenUtf8Class(build, &routine_tokenizer, midlow->bitmap, RE_TOKEN_UTF8_4_BYTES,
+                                                   midhigh->prefix, midlow->prefix, invert)) {
+                        return 0;
+                    }
+                }
+            }
+        }
+        if(!_regexCreateTokenSubExprEnd(build, &routine_tokenizer)) {
+            return 0;
+        }
+    }
+
+    if(!_regexCreateTokenSubExprEnd(build, &routine_tokenizer)) {
+        return 0;
+    }
+
+    if(name != NULL) {
+        if((subroutine = _regexSubroutineIndexEntryGet(build->new_subroutine_index, "class:", name, name_len, -1)) == NULL) {
+            tokenizer->status = eCompileInternalError;
+            return 0;
+        }
+        subroutine->tokens = routine_tokenizer.tokens;
+        id = subroutine->id;
+    } else {
+        switch(id = _regexSubroutineIndexRegisterTokens(build->new_subroutine_index, NULL, NULL, routine_tokenizer.tokens)) {
+            case RE_SUBROUTINE_INVALID_CALL:
+            case RE_SUBROUTINE_COLLISION:
+                tokenizer->status = eCompileInternalError;
+                return 0;
+            case RE_SUBROUTINE_OUTOFMEM:
+                tokenizer->status = eCompileOutOfMem;
+                return 0;
+            default:
+                break;
+        }
+    }
+    if(!_regexCreateTokenCall(build, tokenizer, id)) {
+        tokenizer->status = eCompileOutOfMem;
+        return 0;
+    }
+    tokenizer->status = eCompileOk;
+    return 1;
+}
+
+static int _parseUtf8CharClassCodepoint(utf8_charclass_tree_t *tree, int codepoint) {
+    unsigned int *bitmap;
+    unsigned char bytes[5];
+    int byte;
+
+    _parseUtf8EncodeSequence(bytes, codepoint);
+    if((bitmap = _parseUtf8TreeGetLowByte(tree, bytes)) == NULL) {
+        return 0;
+    }
+    switch(bytes[0]) {
+        default:
+        case 1: byte = bytes[1]; break;
+        case 2: byte = bytes[2]; break;
+        case 3: byte = bytes[3]; break;
+        case 4: byte = bytes[4]; break;
+    }
+    bitmap[byte / 32] |= 0x1u << (byte % 32u);
+    return 1;
+}
+
+static int _parseCharClassBitmapSet(utf8_charclass_tree_t *tree, unsigned int *bitmap, int c) {
+    if((c > 127) && (tree != NULL)) {
+        return _parseUtf8CharClassCodepoint(tree, c);
+    }
+    bitmap[c / 32u] |= (1u << (c % 32u));
+    return 1;
+}
+
+static int _parseUtf8SetTreeClassBitmapRange(utf8_charclass_tree_t *tree, int count,
+                                             int high, int midhigh, int midlow,
+                                             int start, int end) {
+    unsigned int *bitmap;
+    unsigned char bytes[5];
+    int k;
+
+    bytes[0] = count;
+    switch(count) {
+        case 2:
+            bytes[1] = midlow;
+            break;
+        case 3:
+            bytes[1] = midhigh;
+            bytes[2] = midlow;
+            break;
+        case 4:
+            bytes[1] = high;
+            bytes[2] = midhigh;
+            bytes[3] = midlow;
+            break;
+        default:
+            break;
+    }
+    if((bitmap = _parseUtf8TreeGetLowByte(tree, bytes)) == NULL) {
+        return 0;
+    }
+    for(k = start; k <= end; k++) {
+        bitmap[k / 32] |= 0x1u << (k % 32u);
+    }
+    return 1;
+}
+
+static int _parseUtf8TreeGenerateRange(utf8_charclass_tree_t *tree,
+                                       unsigned char *start, unsigned char *end) {
+    // Byte order for documenting byte encodings: DCBA
+    // a_ references the start, b_ references the end
+    // i___ references an iterated intermediary value between two points:
+    //     _x__ - ABCD, the byte identifier
+    //     __x_ - ab0, range base, a, b, or zero
+    //     ___x - abHL, range end, a (exclusive), b (exclusive),
+    //                             high byte max value (inclusive),
+    //                             low byte max value (inclusive)
+    // H references the max value for the high byte
+    // L references the max value for the low bytes
+
+    int mh, ml, h;
+
+    switch(start[0]) {
+        case 1:
+            // aA - bA
+            if(!parseUtf8SetTreeClassBitmapRange(tree, 1, 0, 0, 0, start[1], end[1])) { return 0; }
+            break;
+
+        case 2:
+            if(start[1] == end[1]) {
+                // aA - bA
+                if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, 0, start[1], start[2], end[2])) { return 0; }
+            } else {
+                // aB, aA - aL
+                if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, 0, start[1], start[2], UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                // iBab, 0 - L
+                for(ml = start[1] + 1; ml < end[1]; ml++) {
+                    if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, 0, ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                }
+                // bB, 0 - bA
+                if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, 0, end[1], 0, end[2])) { return 0; }
+            }
+            break;
+
+        case 3:
+            if(start[1] == end[1]) {
+                if(start[2] == end[2]) {
+                    // aC, aB, aA - bA
+                    if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, start[1], start[2], start[3], end[3])) { return 0; }
+                } else {
+                    // aC, aB, aA - L
+                    if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, start[1], start[2], start[3], UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                    // aC, iBab, 0 - L
+                    for(ml = start[1] + 1; ml < end[1]; ml++) {
+                        if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, start[1], ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                    }
+                    // aC, bB, 0 - bA
+                    if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, start[1], end[2], 0, end[3])) { return 0; }
+                }
+            } else {
+                // aC, aB, aA - L
+                if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, start[1], start[2], start[3], UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                // aC, iBaL, 0 - L
+                for(ml = start[2] + 1; ml <= UTF8_ENC_LOW_BYTE_FULL_RANGE; ml++) {
+                    if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, start[1], ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                }
+                // iCab, iB0L, 0 - L
+                for(mh = start[1] + 1; mh < end[1]; mh++) {
+                    for(ml = 0; ml <= UTF8_ENC_LOW_BYTE_FULL_RANGE; ml++) {
+                        if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, mh, ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                    }
+                }
+                // bC, iB0b, 0 - L
+                for(ml = 0; ml < end[2]; ml++) {
+                    if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, end[1], ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                }
+                // bC, bB, 0 - bA
+                if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, 0, end[1], end[2], 0, end[3])) { return 0; }
+            }
+            break;
+
+        case 4:
+            if(start[1] == end[1]) {
+                if(start[2] == end[2]) {
+                    if(start[3] == end[3]) {
+                        // aD, aC, aB, aA - bA
+                        if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], start[2], start[3], start[4], end[4])) { return 0; }
+                    } else {
+                        // aD, aC, aB, aA - L
+                        if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], start[2], start[3], start[4], UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                        // aD, aC, iBab, 0 - L
+                        for(ml = start[3] + 1; ml < end[3]; ml++) {
+                            if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], start[2], ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                        }
+                        // aD, aC, bB, 0 - bA
+                        if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], start[2], end[3], 0, end[4])) { return 0; }
+                    }
+                } else {
+                    // aD, aC, aB, aA - L
+                    if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], start[2], start[3], start[4], UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                    // aD, aC, iBaL, 0 - L
+                    for(ml = start[3] + 1; ml <= UTF8_ENC_LOW_BYTE_FULL_RANGE; ml++) {
+                        if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], start[2], ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                    }
+                    // aD, iCab, iB0L, 0 - L
+                    for(mh = start[2] + 1; mh < end[2]; mh++) {
+                        for(ml = 0; ml <= UTF8_ENC_LOW_BYTE_FULL_RANGE; ml++) {
+                            if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], mh, ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                        }
+                    }
+                    // aD, bC, iB0b, 0 - L
+                    for(ml = 0; ml < end[3]; ml++) {
+                        if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], end[2], ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                    }
+                    // aD, bC, bB, 0 - bA
+                    if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], end[2], end[3], 0, end[4])) { return 0; }
+                }
+            } else {
+                // aD, aC, aB, aA - L
+                if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], start[2], start[3], start[4], UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                // aD, aC, iBaL, 0 - L
+                for(ml = start[3] + 1; ml <= UTF8_ENC_LOW_BYTE_FULL_RANGE; ml++) {
+                    if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], start[2], ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                }
+                // aD, iCab, iB0L, 0 - L
+                for(mh = start[2] + 1; mh < end[2]; mh++) {
+                    for(ml = 0; ml <= UTF8_ENC_LOW_BYTE_FULL_RANGE; ml++) {
+                        if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, start[1], mh, ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                    }
+                }
+                // iDab, iC0L, iB0L, 0 - L
+                for(h = start[1] + 1; h < end[1]; h++) {
+                    for(mh = 0; mh < UTF8_ENC_LOW_BYTE_FULL_RANGE; mh++) {
+                        for(ml = 0; ml < UTF8_ENC_LOW_BYTE_FULL_RANGE; ml++) {
+                            if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, h, mh, ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                        }
+                    }
+                }
+                // bD, iC0b, iB0L, 0 - L
+                for(mh = 0; mh < end[2]; mh++) {
+                    for(ml = 0; ml < UTF8_ENC_LOW_BYTE_FULL_RANGE; ml++) {
+                        if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, end[1], mh, ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                    }
+                }
+                // bD, bC, iB0b, 0 - L
+                for(ml = 0; ml < end[3]; ml++) {
+                    if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, end[1], end[2], ml, 0, UTF8_ENC_LOW_BYTE_FULL_RANGE)) { return 0; }
+                }
+                // bD, bC, bB, 0 - bA
+                if(!_parseUtf8SetTreeClassBitmapRange(tree, 2, end[1], end[2], end[3], 0, end[4])) { return 0; }
+            }
+            break;
+    }
+    return 1;
+}
+
+static int _parseUtf8CharClassRangeSet(utf8_charclass_tree_t *tree, int code_a, int code_b) {
+    unsigned char b_a[5], b_b[5], b_r[5], b_r2[5];
+    int k;
+
+    _parseUtf8EncodeSequence(b_a, code_a);
+    _parseUtf8EncodeSequence(b_b, code_b);
+
+    if(b_a[0] == b_b[0]) {
+        // The utf8 encoding byte length in the range is equal
+        return _parseUtf8TreeGenerateRange(tree, b_a, b_b);
+    }
+    // The range crosses a utf8 encoding byte length boundary
+
+    // Fill to the end of this start of range utf8 byte length encoding
+    if(b_a[0] != 4) {
+        b_r[0] = b_a[0];
+        b_r[2] = UTF8_ENC_LOW_BYTE_FULL_RANGE;
+        b_r[3] = UTF8_ENC_LOW_BYTE_FULL_RANGE;
+        switch(b_a[0]) {
+            case 1: b_r[1] = UTF8_ENC_ONE_BYTE_FULL_RANGE; break;
+            case 2: b_r[1] = UTF8_ENC_HIGH_TWO_BYTE_FULL_RANGE; break;
+            case 3: b_r[1] = UTF8_ENC_HIGH_THREE_BYTE_FULL_RANGE; break;
+        }
+        if(!_parseUtf8TreeGenerateRange(tree, b_a, b_r)) {
+            return 0;
+        }
+    }
+
+    // Fill intermediary utf8 byte length encoding ranges
+    for(k = b_a[0] + 1; k < b_b[0]; k++) {
+        b_r[0] = k;
+        b_r[1] = 0;
+        b_r[2] = 0;
+        b_r[3] = 0;
+        b_r2[0] = k;
+        b_r2[2] = UTF8_ENC_LOW_BYTE_FULL_RANGE;
+        b_r2[3] = UTF8_ENC_LOW_BYTE_FULL_RANGE;
+        if(k == 2) {
+            b_r2[1] = UTF8_ENC_HIGH_TWO_BYTE_FULL_RANGE;
+        } else if(k == 3) {
+            b_r2[1] = UTF8_ENC_HIGH_THREE_BYTE_FULL_RANGE;
+        }
+        if(!_parseUtf8TreeGenerateRange(tree, b_r, b_r2)) {
+            return 0;
+        }
+    }
+
+    // Fill to the end of range utf8 byte length encoding
+    b_r[0] = b_b[0];
+    b_r[1] = 0;
+    b_r[2] = 0;
+    b_r[3] = 0;
+    b_r[4] = 0;
+    if(!_parseUtf8TreeGenerateRange(tree, b_r, b_b)) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int _parseCharClassBitmapRangeSet(utf8_charclass_tree_t *tree, unsigned int *bitmap, int a, int b) {
+    if((b > 127) && (tree != NULL)) {
+        return _parseUtf8CharClassRangeSet(tree, a, b);
+    }
+    for(; a <= b; a++) {
+        bitmap[a / 32u] |= (1u << (a % 32u));
+    }
+    return 1;
+}
+
+// Parse a class pattern, and generate a eTokenCharClass or eTokenUtf8Class token.
+// By default, uses the pattern in tokenizer. If class_pattern is defined, it will
+// use it as the pattern instead of the tokenizer pattern. If class_pattern and
+// name are defined, then name will be associated with the class_pattern in
+// diagnostic output. If class_pattern is not defined, but name is defined, then
+// it is assumed that name is referencing a utf8 property class, and an attempt
+// will be made to lookup the class pattern in the registered unicode classes.
+static int _parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t *tokenizer,
+                                         const char *class_pattern, const char *name, int name_len,
+                                         int invert) {
+    unsigned int bitmap[8], *ptr;
+    parseChar_t c;
+    int range = 0;
+    int last = 0;
+    int k;
+
+    utf8_charclass_tree_t *utf8tree = NULL;
+    regex_tokenizer_t *active = tokenizer;
+    regex_subroutine_t *subroutine;
+    const char *sub_name;
+    const char *sub_alias;
+
+    if((name != NULL) && (class_pattern == NULL)) {
+        if((subroutine = _regexSubroutineIndexEntryGet(build->new_subroutine_index, "class:", name, name_len, -1)) != NULL) {
+            // Found the class in the subroutine index
+            if(!_regexCreateTokenCall(build, tokenizer, subroutine->id)) {
+                return 0;
+            }
+            return 1;
+        }
+        if((class_pattern = _regexRegUnicodeCharClassGet(name, name_len)) == NULL) {
+            active->status = eCompileUnknownUnicodeClass;
+            return 0;
+        }
+        if(!_regexRegUnicodeCharClassLookup(name, name_len, &sub_name, &sub_alias)) {
+            active->status = eCompileInternalError;
+            return 0;
+        }
+        switch(_regexSubroutineIndexRegisterPattern(build->new_subroutine_index,
+                                                    sub_name, sub_alias, class_pattern)) {
+            case RE_SUBROUTINE_INVALID_CALL:
+                active->status = eCompileInternalError;
+                return 0;
+            case RE_SUBROUTINE_COLLISION:
+                active->status = eCompileSubroutineNameCollision;
+                return 0;
+            case RE_SUBROUTINE_OUTOFMEM:
+                active->status = eCompileOutOfMem;
+                return 0;
+            default:
+                break;
+        }
+    }
+
+    if(class_pattern != NULL) {
+        if((tokenizer->subpattern = regexTokenizerCreate(class_pattern)) == NULL) {
+            tokenizer->status = eCompileOutOfMem;
+        }
+        active = tokenizer->subpattern;
+    }
+    const char *pattern = active->pattern;
+
+    memset(bitmap, 0, 32);
+
+    c = _parseGetNextPatternChar(&pattern, NULL, NULL);
+    active->position = (int)(pattern - active->pattern);
+    if(_parsePatternIsValid(&c)) {
+        _parsePatternCharAdvance(&pattern, &c);
+    }
+    if(c.state == eRegexPatternEnd) {
+        active->status = eCompileCharClassIncomplete;
+        return 0;
+    }
+
+    if(c.state == eRegexPatternMetaChar && c.c == '^') {
+        invert = 1;
+        c = _parseGetNextPatternChar(&pattern, NULL, NULL);
+        active->position = (int)(pattern - active->pattern);
+        if(_parsePatternIsValid(&c)) {
+            _parsePatternCharAdvance(&pattern, &c);
+        }
+    }
+
+    for(;;) {
+        switch(c.state) {
+            case eRegexPatternInvalid:
+                active->status = eCompileEscapeCharIncomplete;
+                return 0;
+
+            case eRegexPatternInvalidEscape:
+                active->status = eCompileInvalidEscapeChar;
+                return 0;
+
+            case eRegexPatternUnicode:
+                if(utf8tree == NULL) {
+                    if((utf8tree = _regexAlloc(sizeof(utf8_charclass_tree_t), _regexMemContext)) == NULL) {
+                        active->status = eCompileOutOfMem;
+                        return 0;
+                    }
+                    memset(utf8tree, 0, sizeof(utf8_charclass_tree_t));
+                }
+                // intentional fall through
+
+            case eRegexPatternChar:
+                if(c.c == ']') {
+                    if(range == 2) {
+                        active->status = eCompileCharClassRangeIncomplete;
+                        return 0;
+                    }
+                    goto parseClassCompleted;
+                }
+                // intentional fall through
+
+            case eRegexPatternMetaChar:
+            case eRegexPatternEscapedChar:
+                if(range == 0) {
+                    last = c.c;
+                    if(!_parseCharClassBitmapSet(utf8tree, bitmap, last)) {
+                        active->status = eCompileOutOfMem;
+                        return 0;
+                    }
+                    range = 1;
+                } else if(range == 1) {
+                    if(c.state != eRegexPatternEscapedChar && c.c == '-') {
+                        range = 2;
+                    } else {
+                        last = c.c;
+                        if(!_parseCharClassBitmapSet(utf8tree, bitmap, last)) {
+                            active->status = eCompileOutOfMem;
+                            return 0;
+                        }
+                    }
+                } else {
+                    if(!_parseCharClassBitmapRangeSet(utf8tree, bitmap, last, c.c)) {
+                        active->status = eCompileOutOfMem;
+                        return 0;
+                    }
+                    range = 0;
+                }
+                break;
+
+            case eRegexPatternMetaClass:
+            case eRegexPatternUnicodeMetaClass:
+                active->status = eCompileInvalidEscapeChar;
+                return 0;
+
+            case eRegexPatternEnd:
+                if(range == 2) {
+                    active->status = eCompileCharClassRangeIncomplete;
+                    return 0;
+                }
+                if(class_pattern != NULL) {
+                    goto parseClassCompleted;
+                }
+                active->status = eCompileCharClassIncomplete;
+                return 0;
+        }
+        c = _parseGetNextPatternChar(&pattern, NULL, NULL);
+        active->position = (int)(pattern - active->pattern);
+        if(_parsePatternIsValid(&c)) {
+            _parsePatternCharAdvance(&pattern, &c);
+        }
+    }
+
+    parseClassCompleted:
+
+    active->status = eCompileOk;
+
+    if(utf8tree != NULL) {
+        // Merge any entries in the single byte bitmap into the utf8 tree
+        for(k = 0; k < 256; k++) {
+            if(bitmap[k / 32u] & (1u << k % 32u)) {
+                utf8tree->one_byte[k / 32u] |= (1u << (k % 32u));
+            }
+        }
+
+        if(!_parseUtf8ClassTreeAndCreateToken(build, tokenizer, name, name_len, utf8tree, invert)) {
+            regexCharClassUtf8TreeFree(utf8tree);
+            return 0;
+        }
+        regexCharClassUtf8TreeFree(utf8tree);
+    } else {
+        // Strictly single byte, use a regular char class only
+        if(invert) {
+            for(k = 0; k < 8; k++) {
+                bitmap[k] ^= (unsigned int)0xFFFFFFFFu;
+            }
+        }
+
+        if((ptr = _charClassBitmapCopy(bitmap)) == NULL) {
+            active->status = eCompileOutOfMem;
+            return 0;
+        }
+
+        if(!_regexCreateTokenCharClass(build, tokenizer, (unsigned int *)ptr)) {
+            active->status = eCompileOutOfMem;
+            return 0;
+        }
+
+        if(name != NULL) {
+            // TODO - associate the name with this class, for diagnostic output
+        }
+    }
+
+    if(tokenizer->subpattern != NULL) {
+        regexTokenizerDestroy(tokenizer->subpattern);
+        tokenizer->subpattern = NULL;
+    }
+    return 1;
 }
 
 /////////////////////////////////////////////////////////////////////////////
