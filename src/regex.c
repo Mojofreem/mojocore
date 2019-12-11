@@ -457,6 +457,13 @@ typedef enum {
     eCompileInternalError
 } eRegexCompileStatus_t;
 
+typedef enum {
+    ePhaseTokenize,
+    ePhaseNFAGraph,
+    ePhaseVMGen,
+    ePhaseComplete
+} eRegexCompilePhase_t;
+
 const char *regexCompileStatusStrGet(eRegexCompileStatus_t status);
 
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
@@ -500,6 +507,7 @@ struct regex_vm_s {
 typedef struct regex_compile_ctx_s regex_compile_ctx_t;
 struct regex_compile_ctx_s {
     eRegexCompileStatus_t status;
+    eRegexCompilePhase_t phase;
     const char *pattern;
     int position;
     const char *subpattern;
@@ -1322,8 +1330,6 @@ struct regex_build_s {
     int groups;
     int pc;
 
-    regex_token_t *tokens;
-
     regex_subroutine_index_t *new_subroutine_index;
 
     regex_subroutines_t *subroutine_index;
@@ -1884,9 +1890,9 @@ static regex_token_t *_regexAllocToken(regex_build_t *build, eRegexToken_t token
                                        int len, int retain_ptr) {
     regex_token_t *token;
 
-    if(build->tokens != NULL) {
-        token = build->tokens;
-        build->tokens = token->next;
+    if(build->token_pool != NULL) {
+        token = build->token_pool;
+        build->token_pool = token->next;
         memset(token, 0, sizeof(regex_token_t));
     } else if((token = _regexAlloc(sizeof(regex_token_t), _regexMemContext)) == NULL) {
         return NULL;
@@ -1942,8 +1948,8 @@ static void _regexTokenDestroy(regex_build_t *build, regex_token_t *token, int f
         }
         _regexPtrListFree(NULL, token->ptrlist);
         if(build != NULL) {
-            token->next = build->tokens;
-            build->tokens = token;
+            token->next = build->token_pool;
+            build->token_pool = token;
         } else {
             _regexDealloc(token, _regexMemContext);
         }
@@ -5122,7 +5128,7 @@ void regexVMBuildDestroy(regex_build_t *build) {
     regexVMFree(build->vm);
     regexVMGenPathFree(build);
     regexVMPatchListFree(build->patch_list);
-    regexTokenDestroy(build->tokens, 1);
+    regexTokenDestroy(build->token_pool, 1);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -5415,10 +5421,16 @@ void regexEmitPatternDetail(FILE *fp, const char *label, const char *pattern, si
 void regexCompileResultEmit(FILE *fp, regex_compile_ctx_t *ctx) {
     fprintf(fp, "Result: %s\n", regexCompileStatusStrGet(ctx->status));
     if(ctx->status != eCompileOk) {
-        regexEmitPatternDetail(fp, "Pattern", ctx->pattern, strlen(ctx->pattern), ctx->position, 78);
+        if(ctx->phase == ePhaseTokenize) {
+            regexEmitPatternDetail(fp, "Pattern", ctx->pattern, strlen(ctx->pattern), ctx->position, 78);
 
-        if(ctx->subpattern != NULL) {
-            regexEmitPatternDetail(fp, "Subpat ", ctx->subpattern, strlen(ctx->subpattern), ctx->sub_position, 78);
+            if(ctx->subpattern != NULL) {
+                regexEmitPatternDetail(fp, "Subpat ", ctx->subpattern, strlen(ctx->subpattern), ctx->sub_position, 78);
+            }
+        } else if(ctx->phase == ePhaseNFAGraph) {
+            // ...?
+        } else if(ctx->phase == ePhaseVMGen) {
+            // ...?
         }
     }
 }
@@ -5442,6 +5454,7 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
     memset(ctx, 0, sizeof(regex_compile_ctx_t));
     ctx->pattern = pattern;
     ctx->status = eCompileOk;
+    ctx->phase = ePhaseTokenize;
 
     memset(&build, 0, sizeof(build));
     build.flags = flags;
@@ -5463,29 +5476,28 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
     if((ctx->status = regexTokenizePattern(&build, tokenizer)) != eCompileOk) {
         ctx->position = tokenizer->position;
         regexTokenizerDestroy(tokenizer);
-        regexTokenDestroy(build.tokens, 1);
-        build.tokens = NULL;
+        regexTokenDestroy(build.token_pool, 1);
+        build.token_pool = NULL;
         regexVMBuildDestroy(&build);
         ctx->vm = NULL;
         return ctx->status;
     }
     regexTokenizerDestroy(tokenizer);
-
-    // legacy
-    build.tokens = tokenizer->tokens;
+    ctx->phase = ePhaseNFAGraph;
 
     // Next, convert the infix form of the regular expression to postfix form,
     // and derive an NFA representation. We accomplish this using the shunting
     // yard algorithm. This is then converted into a VM bytecode sequence, for
     // runtime evaluation.
 
-    if((ctx->status = regexShuntingYard(&build, &(build.tokens))) != eCompileOk) {
+    if((ctx->status = regexShuntingYard(&build, &(tokenizer->tokens))) != eCompileOk) {
         regexVMBuildDestroy(&build);
         ctx->vm = NULL;
         return ctx->status;
     }
+    ctx->phase = ePhaseVMGen;
 
-    if(!regexVMProgramGenerate(&build, build.tokens)) {
+    if(!regexVMProgramGenerate(&build, tokenizer->tokens)) {
         regexVMBuildDestroy(&build);
         regexSubroutineIdxFree(&build);
         ctx->vm = NULL;
@@ -5493,6 +5505,7 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
         return ctx->status;
     }
     regexSubroutineIdxFree(&build);
+    ctx->phase = ePhaseComplete;
 
     // Fixup the lookup tables
     build.vm->group_tbl_size = build.groups;
