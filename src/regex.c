@@ -1993,11 +1993,12 @@ static void _regexTokenDestroy(regex_build_t *build, regex_token_t *token, int f
 }
 
 static regex_token_t *_regexTokenBaseCreate(regex_build_t *build, regex_tokenizer_t *tokenizer,
-                                            eRegexToken_t tokenType, const void *ptr,
+                                            eRegexToken_t tokenType,
+                                            const void *str, const void *ptr,
                                             int retain_ptr, int len) {
     regex_token_t *token, *walk;
 
-    if((token = _regexAllocToken(build, tokenType, ptr, ptr, len, retain_ptr)) == NULL) {
+    if((token = _regexAllocToken(build, tokenType, str, ptr, len, retain_ptr)) == NULL) {
         tokenizer->status = eCompileOutOfMem;
         return NULL;
     }
@@ -2023,7 +2024,7 @@ static regex_token_t *_regexTokenBaseCreate(regex_build_t *build, regex_tokenize
 static int _regexCreateTokenCharLiteral(regex_build_t *build, regex_tokenizer_t *tokenizer, int c, int invert) {
     regex_token_t *token;
 
-    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenCharLiteral, NULL, 0, 0)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenCharLiteral, NULL, NULL, 0, 0)) == NULL) {
         return 0;
     }
     token->c = c;
@@ -2032,17 +2033,17 @@ static int _regexCreateTokenCharLiteral(regex_build_t *build, regex_tokenizer_t 
 }
 
 static int _regexCreateTokenCharClass(regex_build_t *build, regex_tokenizer_t *tokenizer, unsigned int *bitmap) {
-    return _regexTokenBaseCreate(build, tokenizer, eTokenCharClass, bitmap, 1, 0) != NULL;
+    return _regexTokenBaseCreate(build, tokenizer, eTokenCharClass, NULL, bitmap, 1, 0) != NULL;
 }
 
 static int _regexCreateTokenStringLiteral(regex_build_t *build, regex_tokenizer_t *tokenizer, const char *str, int len) {
-    return _regexTokenBaseCreate(build, tokenizer, eTokenStringLiteral, str, 0, len) != NULL;
+    return _regexTokenBaseCreate(build, tokenizer, eTokenStringLiteral, str, NULL, 0, len) != NULL;
 }
 
 static int _regexCreateTokenCharAny(regex_build_t *build, regex_tokenizer_t *tokenizer, int dot_all) {
     regex_token_t *token;
 
-    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenCharAny, NULL, 0, 0)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenCharAny, NULL, NULL, 0, 0)) == NULL) {
         return 0;
     }
     token->flags = (dot_all ? RE_TOKEN_FLAG_DOTALL : 0);
@@ -2053,7 +2054,7 @@ static int _regexCreateTokenMatch(regex_build_t *build, regex_token_t **tokens, 
     regex_token_t *token;
     regex_tokenizer_t tokenizer = {.tokens = NULL};
 
-    if((token = _regexTokenBaseCreate(build, &tokenizer, eTokenMatch, NULL, 0, 0)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, &tokenizer, eTokenMatch, NULL, NULL, 0, 0)) == NULL) {
         return 0;
     }
     token->flags = (dot_all ? RE_TOKEN_FLAG_DOTALL : 0);
@@ -2064,7 +2065,7 @@ static int _regexCreateTokenMatch(regex_build_t *build, regex_token_t **tokens, 
 static int _regexCreateTokenJmp(regex_build_t *build, regex_token_t **tokens) {
     regex_tokenizer_t tokenizer = {.tokens = NULL};
     regex_token_t *token;
-    if((token = _regexTokenBaseCreate(build, &tokenizer, eTokenJmp, NULL, 0, 0)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, &tokenizer, eTokenJmp, NULL, NULL, 0, 0)) == NULL) {
         return 0;
     }
     *tokens = tokenizer.tokens;
@@ -2076,7 +2077,7 @@ static int _regexCreateTokenUtf8Class(regex_build_t *build, regex_tokenizer_t *t
     regex_token_t *token;
     short lead_bits = (short)(((unsigned int)midhigh << 6u) | (unsigned int)midlow);
 
-    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenUtf8Class, bitmap, 0, 64)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenUtf8Class, NULL, bitmap, 0, 64)) == NULL) {
         return 0;
     }
     token->flags = (invert ? RE_TOKEN_FLAG_INVERT : 0);
@@ -2088,7 +2089,7 @@ static int _regexCreateTokenUtf8Class(regex_build_t *build, regex_tokenizer_t *t
 static int _regexCreateTokenCall(regex_build_t *build, regex_tokenizer_t *tokenizer, int sub_index) {
     regex_token_t *token;
 
-    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenCall, NULL, 0, 0)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenCall, NULL, NULL, 0, 0)) == NULL) {
         return 0;
     }
     token->sub_index = (short)sub_index;
@@ -2098,7 +2099,7 @@ static int _regexCreateTokenCall(regex_build_t *build, regex_tokenizer_t *tokeni
 static int _regexCreateTokenReturn(regex_build_t *build, regex_token_t **tokens) {
     regex_token_t *token;
     regex_tokenizer_t tokenizer = {.tokens = NULL};
-    if((token = _regexTokenBaseCreate(build, &tokenizer, eTokenReturn, NULL, 0, 0)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, &tokenizer, eTokenReturn, NULL, NULL, 0, 0)) == NULL) {
         return 0;
     }
     *tokens = tokenizer.tokens;
@@ -2106,13 +2107,13 @@ static int _regexCreateTokenReturn(regex_build_t *build, regex_token_t **tokens)
 }
 
 static int _regexCreateTokenByte(regex_build_t *build, regex_tokenizer_t *tokenizer) {
-    return _regexTokenBaseCreate(build, tokenizer, eTokenByte, NULL, 0, 0) != NULL;
+    return _regexTokenBaseCreate(build, tokenizer, eTokenByte, NULL, NULL, 0, 0) != NULL;
 }
 
 static int _regexCreateTokenAssertion(regex_build_t *build, regex_tokenizer_t *tokenizer, int assertion) {
     regex_token_t *token;
 
-    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenAssertion, NULL, 0, 0)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenAssertion, NULL, NULL, 0, 0)) == NULL) {
         return 0;
     }
     token->flags = (unsigned int)assertion;
@@ -2120,29 +2121,29 @@ static int _regexCreateTokenAssertion(regex_build_t *build, regex_tokenizer_t *t
 }
 
 static int _regexCreateTokenConcatenation(regex_build_t *build, regex_tokenizer_t *tokenizer) {
-    return _regexTokenBaseCreate(build, tokenizer, eTokenConcatenation, NULL, 0, 0) != NULL;
+    return _regexTokenBaseCreate(build, tokenizer, eTokenConcatenation, NULL, NULL, 0, 0) != NULL;
 }
 
 static int _regexCreateTokenAlternative(regex_build_t *build, regex_tokenizer_t *tokenizer) {
-    return _regexTokenBaseCreate(build, tokenizer, eTokenAlternative, NULL, 0, 0) != NULL;
+    return _regexTokenBaseCreate(build, tokenizer, eTokenAlternative, NULL, NULL, 0, 0) != NULL;
 }
 
 static int _regexCreateTokenZeroOrOne(regex_build_t *build, regex_tokenizer_t *tokenizer) {
-    return _regexTokenBaseCreate(build, tokenizer, eTokenZeroOrOne, NULL, 0, 0) != NULL;
+    return _regexTokenBaseCreate(build, tokenizer, eTokenZeroOrOne, NULL, NULL, 0, 0) != NULL;
 }
 
 static int _regexCreateTokenZeroOrMany(regex_build_t *build, regex_tokenizer_t *tokenizer) {
-    return _regexTokenBaseCreate(build, tokenizer, eTokenZeroOrMany, NULL, 0, 0) != NULL;
+    return _regexTokenBaseCreate(build, tokenizer, eTokenZeroOrMany, NULL, NULL, 0, 0) != NULL;
 }
 
 static int _regexCreateTokenOneOrMany(regex_build_t *build, regex_tokenizer_t *tokenizer) {
-    return _regexTokenBaseCreate(build, tokenizer, eTokenOneOrMany, NULL, 0, 0) != NULL;
+    return _regexTokenBaseCreate(build, tokenizer, eTokenOneOrMany, NULL, NULL, 0, 0) != NULL;
 }
 
 static int _regexCreateTokenRange(regex_build_t *build, regex_tokenizer_t *tokenizer, int min, int max) {
     regex_token_t *token;
 
-    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenRange, NULL, 0, 0)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenRange, NULL, NULL, 0, 0)) == NULL) {
         return 0;
     }
     token->min = min;
@@ -2164,7 +2165,7 @@ static int _regexCreateTokenSubExprStart(regex_build_t *build, regex_tokenizer_t
     }
     regex_token_t *token;
 
-    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenSubExprStart, NULL, 0, 0)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, tokenizer, eTokenSubExprStart, NULL, NULL, 0, 0)) == NULL) {
         return 0;
     }
     token->flags = flags;
@@ -2174,7 +2175,7 @@ static int _regexCreateTokenSubExprStart(regex_build_t *build, regex_tokenizer_t
 }
 
 static int _regexCreateTokenSubExprEnd(regex_build_t *build, regex_tokenizer_t *tokenizer) {
-    return _regexTokenBaseCreate(build, tokenizer, eTokenSubExprEnd, NULL, 0, 0) != NULL;
+    return _regexTokenBaseCreate(build, tokenizer, eTokenSubExprEnd, NULL, NULL, 0, 0) != NULL;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -4450,14 +4451,14 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t
         }
         active = tokenizer->subpattern;
     }
-    const char *pattern = active->pattern;
+    const char *orig_pattern = active->pattern;
 
     memset(bitmap, 0, 32);
 
-    c = _parseGetNextPatternChar(&pattern, NULL, NULL);
-    active->position = (int)(pattern - active->pattern);
+    c = _parseGetNextPatternChar(&(active->pattern), NULL, NULL);
+    active->position = (int)(orig_pattern - active->pattern);
     if(_parsePatternIsValid(&c)) {
-        _parsePatternCharAdvance(&pattern, &c);
+        _parsePatternCharAdvance(&(active->pattern), &c);
     }
     if(c.state == eRegexPatternEnd) {
         active->status = eCompileCharClassIncomplete;
@@ -4466,10 +4467,10 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t
 
     if(c.state == eRegexPatternMetaChar && c.c == '^') {
         invert = 1;
-        c = _parseGetNextPatternChar(&pattern, NULL, NULL);
-        active->position = (int)(pattern - active->pattern);
+        c = _parseGetNextPatternChar(&(active->pattern), NULL, NULL);
+        active->position = (int)(orig_pattern - active->pattern);
         if(_parsePatternIsValid(&c)) {
-            _parsePatternCharAdvance(&pattern, &c);
+            _parsePatternCharAdvance(&(active->pattern), &c);
         }
     }
 
@@ -4547,10 +4548,10 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t
                 active->status = eCompileCharClassIncomplete;
                 return 0;
         }
-        c = _parseGetNextPatternChar(&pattern, NULL, NULL);
-        active->position = (int)(pattern - active->pattern);
+        c = _parseGetNextPatternChar(&(active->pattern), NULL, NULL);
+        active->position = (int)(orig_pattern - active->pattern);
         if(_parsePatternIsValid(&c)) {
-            _parsePatternCharAdvance(&pattern, &c);
+            _parsePatternCharAdvance(&(active->pattern), &c);
         }
     }
 
@@ -4584,6 +4585,7 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t
             return 0;
         }
 
+        printf("Create token char class\n");
         if(!_regexCreateTokenCharClass(build, tokenizer, (unsigned int *)ptr)) {
             active->status = eCompileOutOfMem;
             return 0;
@@ -4753,8 +4755,8 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                         continue;
 
                     case '[': // Meta, char class
-                        if(!parseCharClassAndCreateToken(build, tokenizer, &status, &(tokenizer->pattern), NULL, 0, 1, &(tokenizer->tokens), 0)) {
-                            return status;
+                        if(!_parseCharClassAndCreateToken(build, tokenizer, NULL, NULL, 0, 0)) {
+                            return tokenizer->status;
                         }
                         continue;
 
@@ -4931,9 +4933,12 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                     case 'W': // non word character
                         class = META_CLASS_INV(META_WORD_PATTERN);
                         break;
+
+                    default:
+                        return eCompileUnsupportedMeta;
                 }
-                if(!parseCharClassAndCreateToken(build, tokenizer, &status, &class, NULL, 0, 0, &(tokenizer->tokens), 0)) {
-                    return status;
+                if(!_parseCharClassAndCreateToken(build, tokenizer, class, NULL, 0, 0)) {
+                    return tokenizer->status;
                 }
                 continue;
 
