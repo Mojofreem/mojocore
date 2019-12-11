@@ -1235,8 +1235,8 @@ struct regex_ptrlist_s {
 #define RE_TOKEN_FLAG_SUBROUTINE            0x04u
 #define RE_TOKEN_FLAG_ASSERT_START_OF_LINE  0x01u
 #define RE_TOKEN_FLAG_ASSERT_END_OF_LINE    0x02u
-#define RE_TOKEN_FLAG_ASSERT_START_OF_WORD  0x03u
-#define RE_TOKEN_FLAG_ASSERT_END_OF_WORD    0x04u
+#define RE_TOKEN_FLAG_ASSERT_START_OF_WORD  0x04u
+#define RE_TOKEN_FLAG_ASSERT_END_OF_WORD    0x08u
 
 // Map instruction bits to operand bit positions
 #define VM_OP_A_BIT(bit)    ((0x1u << (bit)) >> 18u)
@@ -1247,6 +1247,10 @@ struct regex_ptrlist_s {
 #define RE_VM_FLAG_CHARANY_DOTALL       0x1
 #define RE_VM_FLAG_MATCH_END_OF_INPUT   0x1
 #define RE_VM_FLAG_SAVE_COMPOUND        0x1
+#define RE_VM_FLAG_ASSERT_START_OF_LINE 0x01
+#define RE_VM_FLAG_ASSERT_END_OF_LINE   0x02
+#define RE_VM_FLAG_ASSERT_START_OF_WORD 0x04
+#define RE_VM_FLAG_ASSERT_END_OF_WORD   0x08
 #define RE_VM_FLAG_UTF8_CLASS_INVERT    VM_OP_B_BIT(17)
 #define RE_VM_FLAG_UTF8_LITERAL_INVERT  VM_OP_A_BIT(29)
 
@@ -1908,6 +1912,8 @@ static regex_token_t *_regexAllocToken(regex_build_t *build, eRegexToken_t token
         } else if((token->bitmap = _regexAlloc(len, _regexMemContext)) == NULL) {
             _regexDealloc(token, _regexMemContext);
             return NULL;
+        } else {
+            memcpy(token->bitmap, bitmap, len);
         }
         token->len = len;
     }
@@ -1935,7 +1941,12 @@ static void _regexTokenDestroy(regex_build_t *build, regex_token_t *token, int f
                 break;
         }
         _regexPtrListFree(NULL, token->ptrlist);
-        _regexDealloc(token, _regexMemContext);
+        if(build != NULL) {
+            token->next = build->tokens;
+            build->tokens = token;
+        } else {
+            _regexDealloc(token, _regexMemContext);
+        }
         if(!full_stack) {
             break;
         }
@@ -2016,7 +2027,7 @@ static int _regexCreateTokenJmp(regex_build_t *build, regex_tokenizer_t *tokeniz
 static int _regexCreateTokenUtf8Class(regex_build_t *build, regex_tokenizer_t *tokenizer,
                                       unsigned int *bitmap, int lead_bytes, int midhigh, int midlow, int invert) {
     regex_token_t *token;
-    short lead_bits = (midhigh << 6u) | midlow;
+    short lead_bits = (short)(((unsigned int)midhigh << 6u) | (unsigned int)midlow);
 
     if((token = _regexTokenBaseCreate(build, tokenizer, eTokenUtf8Class, bitmap, 1, 64)) == NULL) {
         return 0;
@@ -4032,39 +4043,38 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
 
             case eRegexPatternMetaChar:
                 switch(c.c) {
-                    case '.':
-                        // Operand, the meta "ANY" char
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenCharAny, 0, 0, ((build->flags & REGEX_DOTALL) ? REGEX_TOKEN_FLAG_DOTALL : 0), 0)) {
+                    case '.': // Meta, any char
+                        if(!_regexCreateTokenCharAny(build, tokenizer, (int)(build->flags & REGEX_DOTALL))) {
                             return eCompileOutOfMem;
                         }
                         continue;
 
-                    case '[':
+                    case '[': // Meta, char class
                         if(!parseCharClassAndCreateToken(build, tokenizer, &status, &(tokenizer->pattern), NULL, 0, 1, &(tokenizer->tokens), 0)) {
                             return status;
                         }
                         continue;
 
-                    case '?':
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenZeroOrOne, 0, 0, 0, 0)) {
+                    case '?': // Meta, zero or one quantifier
+                        if(!_regexCreateTokenZeroOrOne(build, tokenizer)) {
                             return eCompileOutOfMem;
                         }
                         continue;
 
-                    case '*':
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenZeroOrMany, 0, 0, 0, 0)) {
+                    case '*': // Meta, kleene star, zero or many quantifier
+                        if(!_regexCreateTokenZeroOrMany(build, tokenizer)) {
                             return eCompileOutOfMem;
                         }
                         continue;
 
-                    case '+':
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenOneOrMany, 0, 0, 0, 0)) {
+                    case '+': // Meta, one or many quantifier
+                        if(!_regexCreateTokenOneOrMany(build, tokenizer)) {
                             return eCompileOutOfMem;
                         }
                         continue;
 
-                    case '|':
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenAlternative, 0, 0, 0, 0)) {
+                    case '|': // Meta, alternative operator
+                        if(!_regexCreateTokenAlternative(build, tokenizer)) {
                             return eCompileOutOfMem;
                         }
                         continue;
@@ -4137,21 +4147,20 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                         }
                         continue;
 
-                    case ')':
-                        // End of grouped subexpression
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenSubExprEnd, 0, 0, 0, 0)) {
+                    case ')': // Meta, end of subexpression (group)
+                        if(!_regexCreateTokenSubExprEnd(build, tokenizer)) {
                             return eCompileOutOfMem;
                         }
                         continue;
 
-                    case '^':
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenAssertion, REGEX_TOKEN_FLAG_START_OF_LINE, 0, 0, 0)) {
+                    case '^': // Meta, assertion - start of line
+                        if(!_regexCreateTokenAssertion(build, tokenizer, REGEX_TOKEN_FLAG_START_OF_LINE)) {
                             return eCompileOutOfMem;
                         }
                         continue;
 
-                    case '$':
-                        if(!regexTokenCreate(&(tokenizer->tokens), eTokenAssertion, REGEX_TOKEN_FLAG_END_OF_LINE, 0, 0, 0)) {
+                    case '$': // Meta, assertion - end of line
+                        if(!_regexCreateTokenAssertion(build, tokenizer, REGEX_TOKEN_FLAG_END_OF_LINE)) {
                             return eCompileOutOfMem;
                         }
                         continue;
@@ -4479,7 +4488,6 @@ int regexOperatorReturnCreate(regex_token_t **stack) {
     if(!regexTokenCreate(&token, eTokenReturn, 0, NULL, 0, 0)) {
         return 0;
     }
-    regexEmitTokenStr(stdout, e);
     _regexPtrlistPatch(NULL, &(e->ptrlist), token, 0);
     regexTokenStackPush(stack, e);
 
@@ -4688,14 +4696,11 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
         goto ShuntingYardFailure;
     }
 
-    printf("Leaving the yard...\n");
     if(group_flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
-        printf("closing subroutine\n");
         if(!regexOperatorReturnCreate(&operands)) {
             SET_YARD_RESULT(eCompileOutOfMem);
         }
     } else {
-        printf("closing pattern\n");
         if(sub_expression != REGEX_SHUNTING_YARD_NO_PARENT) {
             SET_YARD_RESULT(eCompileInternalError);
         }
@@ -5040,7 +5045,7 @@ int regexVMProgramGenerateInstr(regex_build_t *build, regex_token_t *token, rege
             }
             break;
         case eTokenAssertion:
-            idx_a = token->c;
+            idx_a = token->flags;
             break;
         default:
             break;
@@ -5431,7 +5436,6 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
     }
 
     if(!regexRegUnicodeCharClassAdd(&_subroutine_test)) {
-        printf("Import failure\n");
         ctx->status = eCompileInternalError;
         return ctx->status;
     }
