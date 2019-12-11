@@ -4342,32 +4342,32 @@ int regexStackTypeGreaterOrEqualToToken(regex_token_t *stack, eRegexToken_t toke
 // NFA form regex support
 /////////////////////////////////////////////////////////////////////////////
 
-int regexOperatorLiteralCreate(regex_token_t **stack, regex_token_t *token) {
-    if((token->ptrlist = _regexPtrlistCreate(NULL, token, eRePtrOutA)) == NULL) {
+int regexOperatorLiteralCreate(regex_build_t *build, regex_token_t **stack, regex_token_t *token) {
+    if((token->ptrlist = _regexPtrlistCreate(build, token, eRePtrOutA)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, token);
     return 1;
 }
 
-int regexOperatorSubexprCreate(regex_token_t **stack, regex_token_t *token) {
+int regexOperatorSubexprCreate(regex_build_t *build, regex_token_t **stack, regex_token_t *token) {
     token->tokenType = eTokenSave;
-    if((token->ptrlist = _regexPtrlistCreate(NULL, token, eRePtrOutA)) == NULL) {
+    if((token->ptrlist = _regexPtrlistCreate(build, token, eRePtrOutA)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, token);
     return 1;
 }
 
-int regexOperatorConcatenationCreate(regex_token_t **stack, regex_token_t *token) {
+int regexOperatorConcatenationCreate(regex_build_t *build, regex_token_t **stack, regex_token_t *token) {
     regex_token_t *e1, *e2;
 
-    regexTokenDestroy(token, 1);
+    _regexTokenDestroy(build, token, 1);
     if(((e2 = regexTokenStackPop(stack)) == NULL) ||
        ((e1 = regexTokenStackPop(stack)) == NULL)) {
         return 0;
     }
-    _regexPtrlistPatch(NULL, &(e1->ptrlist), e2, 0);
+    _regexPtrlistPatch(build, &(e1->ptrlist), e2, 0);
     e1->ptrlist = e2->ptrlist;
     e2->ptrlist = NULL;
     regexTokenStackPush(stack, e1);
@@ -4375,7 +4375,7 @@ int regexOperatorConcatenationCreate(regex_token_t **stack, regex_token_t *token
     return 1;
 }
 
-int regexOperatorAlternationCreate(regex_token_t **stack, regex_token_t *token) {
+int regexOperatorAlternationCreate(regex_build_t *build, regex_token_t **stack, regex_token_t *token) {
     regex_token_t *e1, *e2;
     regex_token_t *jmp = NULL;
 
@@ -4388,16 +4388,16 @@ int regexOperatorAlternationCreate(regex_token_t **stack, regex_token_t *token) 
         return 0;
     }
 #ifdef MOJO_REGEX_EXPERIMENTAL_CULL_JMP
-    if(regexPtrlistPatch(NULL, &(e1->ptrlist), jmp, 1) == 0) {
+    if(regexPtrlistPatch(build, &(e1->ptrlist), jmp, 1) == 0) {
 #else // !MOJO_REGEX_EXPERIMENTAL_CULL_JMP
-    if(_regexPtrlistPatch(NULL, &(e1->ptrlist), jmp, 0) == 0) {
+    if(_regexPtrlistPatch(build, &(e1->ptrlist), jmp, 0) == 0) {
 #endif
         // The jmp token was unused
-        regexTokenDestroy(jmp, 0);
+        _regexTokenDestroy(build, jmp, 0);
         token->ptrlist = e1->ptrlist;
         e1->ptrlist = NULL;
     } else {
-        if((token->ptrlist = _regexPtrlistCreate(NULL, jmp, eRePtrOutA)) == NULL) {
+        if((token->ptrlist = _regexPtrlistCreate(build, jmp, eRePtrOutA)) == NULL) {
             return 0;
         }
     }
@@ -4411,7 +4411,7 @@ int regexOperatorAlternationCreate(regex_token_t **stack, regex_token_t *token) 
     return 1;
 }
 
-int regexOperatorZeroOrOneCreate(regex_token_t **stack, regex_token_t *token) {
+int regexOperatorZeroOrOneCreate(regex_build_t *build, regex_token_t **stack, regex_token_t *token) {
     regex_token_t *e;
 
     if((e = regexTokenStackPop(stack)) == NULL) {
@@ -4419,7 +4419,7 @@ int regexOperatorZeroOrOneCreate(regex_token_t **stack, regex_token_t *token) {
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    if((token->ptrlist = _regexPtrlistCreate(NULL, token, eRePtrOutB)) == NULL) {
+    if((token->ptrlist = _regexPtrlistCreate(build, token, eRePtrOutB)) == NULL) {
         return 0;
     }
     token->ptrlist = _regexPtrlistAppend(e->ptrlist, token->ptrlist);
@@ -4429,7 +4429,7 @@ int regexOperatorZeroOrOneCreate(regex_token_t **stack, regex_token_t *token) {
     return 1;
 }
 
-int regexOperatorZeroOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
+int regexOperatorZeroOrMoreCreate(regex_build_t *build, regex_token_t **stack, regex_token_t *token) {
     regex_token_t *e;
     regex_token_t *jmp = NULL;
 
@@ -4438,20 +4438,20 @@ int regexOperatorZeroOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    if((token->ptrlist = _regexPtrlistCreate(NULL, token, eRePtrOutB)) == NULL) {
+    if((token->ptrlist = _regexPtrlistCreate(build, token, eRePtrOutB)) == NULL) {
         return 0;
     }
     if(!regexTokenCreate(&jmp, eTokenJmp, 0, NULL, 0, 0)) {
         return 0;
     }
     jmp->out_a = token;
-    _regexPtrlistPatch(NULL, &(e->ptrlist), jmp, 0);
+    _regexPtrlistPatch(build, &(e->ptrlist), jmp, 0);
     regexTokenStackPush(stack, token);
 
     return 1;
 }
 
-int regexOperatorOneOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
+int regexOperatorOneOrMoreCreate(regex_build_t *build, regex_token_t **stack, regex_token_t *token) {
     regex_token_t *e;
 
     if((e = regexTokenStackPop(stack)) == NULL) {
@@ -4459,15 +4459,15 @@ int regexOperatorOneOrMoreCreate(regex_token_t **stack, regex_token_t *token) {
     }
     token->tokenType = eTokenSplit;
     token->out_a = e;
-    _regexPtrlistPatch(NULL, &(e->ptrlist), token, 0);
-    if((e->ptrlist = _regexPtrlistCreate(NULL, token, eRePtrOutB)) == NULL) {
+    _regexPtrlistPatch(build, &(e->ptrlist), token, 0);
+    if((e->ptrlist = _regexPtrlistCreate(build, token, eRePtrOutB)) == NULL) {
         return 0;
     }
     regexTokenStackPush(stack, e);
     return 1;
 }
 
-int regexOperatorMatchCreate(regex_token_t **stack) {
+int regexOperatorMatchCreate(regex_build_t *build, regex_token_t **stack) {
     regex_token_t *e;
     regex_token_t *token = NULL;
 
@@ -4477,13 +4477,13 @@ int regexOperatorMatchCreate(regex_token_t **stack) {
     if(!regexTokenCreate(&token, eTokenMatch, 0, NULL, 0, 0)) {
         return 0;
     }
-    _regexPtrlistPatch(NULL, &(e->ptrlist), token, 0);
+    _regexPtrlistPatch(build, &(e->ptrlist), token, 0);
     regexTokenStackPush(stack, e);
 
     return 1;
 }
 
-int regexOperatorReturnCreate(regex_token_t **stack) {
+int regexOperatorReturnCreate(regex_build_t *build, regex_token_t **stack) {
     regex_token_t *e;
     regex_token_t *token = NULL;
 
@@ -4493,7 +4493,7 @@ int regexOperatorReturnCreate(regex_token_t **stack) {
     if(!regexTokenCreate(&token, eTokenReturn, 0, NULL, 0, 0)) {
         return 0;
     }
-    _regexPtrlistPatch(NULL, &(e->ptrlist), token, 0);
+    _regexPtrlistPatch(build, &(e->ptrlist), token, 0);
     regexTokenStackPush(stack, e);
 
     return 1;
@@ -4504,7 +4504,7 @@ int regexHasSufficientOperands(regex_token_t *fragments, int arity) {
     return arity == 0;
 }
 
-eRegexCompileStatus_t regexOperatorApply(regex_token_t **operators, eRegexOpApply apply, eRegexToken_t tokenType, regex_token_t **operands) {
+eRegexCompileStatus_t regexOperatorApply(regex_build_t *build, regex_token_t **operators, eRegexOpApply apply, eRegexToken_t tokenType, regex_token_t **operands) {
     regex_token_t *operator;
 
     while((apply == OP_ALL && *operators != NULL) ||
@@ -4515,31 +4515,31 @@ eRegexCompileStatus_t regexOperatorApply(regex_token_t **operators, eRegexOpAppl
         }
         switch(operator->tokenType) {
             case eTokenZeroOrOne:
-                if(!regexOperatorZeroOrOneCreate(operands, operator)) {
+                if(!regexOperatorZeroOrOneCreate(build, operands, operator)) {
                     return eCompileOutOfMem;
                 }
                 break;
 
             case eTokenZeroOrMany:
-                if(!regexOperatorZeroOrMoreCreate(operands, operator)) {
+                if(!regexOperatorZeroOrMoreCreate(build, operands, operator)) {
                     return eCompileOutOfMem;
                 }
                 break;
 
             case eTokenOneOrMany:
-                if(!regexOperatorOneOrMoreCreate(operands, operator)) {
+                if(!regexOperatorOneOrMoreCreate(build, operands, operator)) {
                     return eCompileOutOfMem;
                 }
                 break;
 
             case eTokenConcatenation:
-                if(!regexOperatorConcatenationCreate(operands, operator)) {
+                if(!regexOperatorConcatenationCreate(build, operands, operator)) {
                     return eCompileOutOfMem;
                 }
                 break;
 
             case eTokenAlternative:
-                if(!regexOperatorAlternationCreate(operands, operator)) {
+                if(!regexOperatorAlternationCreate(build, operands, operator)) {
                     return eCompileOutOfMem;
                 }
                 break;
@@ -4587,7 +4587,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
             case eTokenAssertion:
             case eTokenReturn:
             case eTokenMatch:
-                if(!regexOperatorLiteralCreate(&operands, token)) {
+                if(!regexOperatorLiteralCreate(build, &operands, token)) {
                     SET_YARD_RESULT(eCompileOutOfMem);
                 }
                 break;
@@ -4597,7 +4597,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
             case eTokenOneOrMany:
             case eTokenConcatenation:
             case eTokenAlternative:
-                if((status = regexOperatorApply(&operators, OP_GREATER_OR_EQUAL,
+                if((status = regexOperatorApply(build, &operators, OP_GREATER_OR_EQUAL,
                                                 token->tokenType, &operands)) != eCompileOk) {
                     goto ShuntingYardFailure;
                 }
@@ -4622,7 +4622,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
                     subindex->infixed = 1;
                 }
                 token->out_b = subindex->tokens;
-                if(!regexOperatorLiteralCreate(&operands, token)) {
+                if(!regexOperatorLiteralCreate(build, &operands, token)) {
                     SET_YARD_RESULT(eCompileOutOfMem);
                 }
                 break;
@@ -4635,7 +4635,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
                 } else {
                     group_num = token->group;
                     token->group = regexSubexprStartFromGroup(token->group);
-                    if(!regexOperatorSubexprCreate(&subexpr, token)) {
+                    if(!regexOperatorSubexprCreate(build, &subexpr, token)) {
                         SET_YARD_RESULT(eCompileOutOfMem);
                     }
                 }
@@ -4653,7 +4653,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
                     }
                     token->out_b = subindex->tokens;
                     token->tokenType = eTokenCall;
-                    if(!regexOperatorLiteralCreate(&operands, token)) {
+                    if(!regexOperatorLiteralCreate(build, &operands, token)) {
                         SET_YARD_RESULT(eCompileOutOfMem);
                     }
                 } else {
@@ -4672,7 +4672,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
                 if(sub_expression != REGEX_SHUNTING_YARD_NO_CAPTURE) {
                     token->group = regexSubexprEndFromGroup(sub_expression);
                     token->flags = group_flags;
-                    if(!regexOperatorSubexprCreate(&operands, token)) {
+                    if(!regexOperatorSubexprCreate(build, &operands, token)) {
                         SET_YARD_RESULT(eCompileOutOfMem);
                     }
                     token = NULL;
@@ -4681,14 +4681,14 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
                     }
                     regexTokenStackPush(&operators, token);
                 }
-                if((status = regexOperatorApply(&operators, OP_ALL, 0, &operands)) != eCompileOk) {
+                if((status = regexOperatorApply(build, &operators, OP_ALL, 0, &operands)) != eCompileOk) {
                     goto ShuntingYardFailure;
                 }
                 if(operands->next != NULL) {
                     SET_YARD_RESULT(eCompileInternalError);
                 }
                 if(group_flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
-                    if(!regexOperatorReturnCreate(&operands)) {
+                    if(!regexOperatorReturnCreate(build, &operands)) {
                         return eCompileOutOfMem;
                     }
                 }
@@ -4697,12 +4697,12 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
         }
     }
 
-    if((status = regexOperatorApply(&operators, OP_ALL, 0, &operands)) != eCompileOk) {
+    if((status = regexOperatorApply(build, &operators, OP_ALL, 0, &operands)) != eCompileOk) {
         goto ShuntingYardFailure;
     }
 
     if(group_flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
-        if(!regexOperatorReturnCreate(&operands)) {
+        if(!regexOperatorReturnCreate(build, &operands)) {
             SET_YARD_RESULT(eCompileOutOfMem);
         }
     } else {
@@ -4711,7 +4711,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
         }
 
         // Complete the sequence with a match
-        if(!regexOperatorMatchCreate(&operands)) {
+        if(!regexOperatorMatchCreate(build, &operands)) {
             SET_YARD_RESULT(eCompileOutOfMem);
         }
     }
