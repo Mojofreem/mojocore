@@ -16,6 +16,13 @@
 #include <string.h>
 #include <stdint.h>
 
+#define DEBUG_INTERNAL_ERRORS
+#ifdef DEBUG_INTERNAL_ERRORS
+#   define INTERNAL_ERROR(msg)  fprintf(stderr, "ERROR: Internal error [%s] in %s @ %d\n", msg, __FUNCTION__, __LINE__)
+#else
+#   define INTERNAL_ERROR(msg)
+#endif
+
 /*
     Flags
     --------------------------
@@ -697,7 +704,7 @@ static int _regexPrefixedStrncmp(const unsigned char *prefix,
         if((len_a + pre_len) != len_b) {
             return -1;
         }
-        if(!memcmp(prefix, str_b, pre_len)) {
+        if(memcmp(prefix, str_b, pre_len) != 0) {
             return -1;
         }
         return memcmp(str_a, str_b + pre_len, len_a);
@@ -856,6 +863,8 @@ static regex_subroutine_t *_regexSubroutineIndexEntryCreate(regex_subroutine_ind
     }
     entry->id = index->next_id;
     index->next_id++;
+    entry->next = index->subroutines;
+    index->subroutines = entry;
     return entry;
 }
 
@@ -866,6 +875,11 @@ static regex_subroutine_t *_regexSubroutineIndexEntryGet(regex_subroutine_index_
     regex_subroutine_t *entry;
 
     if(name != NULL) {
+        printf("subroutine get: [%s][%*.*s](%d) #%d\n",
+               prefix,
+               (int)((len == RE_STR_NULL_TERM) ? strlen(name) : len),
+               (int)((len == RE_STR_NULL_TERM) ? strlen(name) : len),
+               name, (int)len, id);
         for(entry = index->subroutines; entry != NULL; entry = entry->next) {
             if(!_regexPrefixedStrncmp((unsigned char *)prefix,
                                       (unsigned char *)name, len,
@@ -880,6 +894,7 @@ static regex_subroutine_t *_regexSubroutineIndexEntryGet(regex_subroutine_index_
         }
     }
     if(id >= 0) {
+        printf("subroutine get: #%d\n", id);
         for(entry = index->subroutines; entry != NULL; entry = entry->next) {
             if(id == entry->id) {
                 return entry;
@@ -963,20 +978,20 @@ static int _regexSubroutineIndexEntryTokensUpdate(regex_subroutine_index_t *inde
 
 // Register a pattern with a name and/or alias
 static int _regexSubroutineIndexRegisterPattern(regex_subroutine_index_t *index,
-                                                const char *name, const char *alias,
-                                                const char *pattern) {
+                                                const char *prefix, const char *name,
+                                                const char *alias, const char *pattern) {
     regex_subroutine_t *entry;
 
     if(pattern == NULL) {
         return RE_SUBROUTINE_INVALID_CALL;
     }
 
-    if((_regexSubroutineIndexEntryGet(index, NULL, name, RE_STR_NULL_TERM, -1) != NULL) ||
-       (_regexSubroutineIndexEntryGet(index, NULL, alias, RE_STR_NULL_TERM, -1) != NULL)) {
+    if((_regexSubroutineIndexEntryGet(index, prefix, name, RE_STR_NULL_TERM, -1) != NULL) ||
+       (_regexSubroutineIndexEntryGet(index, prefix, alias, RE_STR_NULL_TERM, -1) != NULL)) {
         return RE_SUBROUTINE_COLLISION;
     }
 
-    if((entry = _regexSubroutineIndexEntryCreate(index, NULL, name, RE_STR_NULL_TERM, alias, RE_STR_NULL_TERM)) == NULL) {
+    if((entry = _regexSubroutineIndexEntryCreate(index, prefix, name, RE_STR_NULL_TERM, alias, RE_STR_NULL_TERM)) == NULL) {
         return RE_SUBROUTINE_OUTOFMEM;
     }
 
@@ -988,20 +1003,20 @@ static int _regexSubroutineIndexRegisterPattern(regex_subroutine_index_t *index,
 
 // Register a token stream with a name and/or alias
 static int _regexSubroutineIndexRegisterTokens(regex_subroutine_index_t *index,
-                                               const char *name, const char *alias,
-                                               regex_token_t *tokens) {
+                                               const char *prefix, const char *name,
+                                               const char *alias, regex_token_t *tokens) {
     regex_subroutine_t *entry;
 
     if(tokens == NULL) {
         return RE_SUBROUTINE_INVALID_CALL;
     }
 
-    if((_regexSubroutineIndexEntryGet(index, NULL, name, RE_STR_NULL_TERM, -1) != NULL) ||
-       (_regexSubroutineIndexEntryGet(index, NULL, alias, RE_STR_NULL_TERM, -1) != NULL)) {
+    if((_regexSubroutineIndexEntryGet(index, prefix, name, RE_STR_NULL_TERM, -1) != NULL) ||
+       (_regexSubroutineIndexEntryGet(index, prefix, alias, RE_STR_NULL_TERM, -1) != NULL)) {
         return RE_SUBROUTINE_COLLISION;
     }
 
-    if((entry = _regexSubroutineIndexEntryCreate(index, NULL, name, RE_STR_NULL_TERM, alias, RE_STR_NULL_TERM)) == NULL) {
+    if((entry = _regexSubroutineIndexEntryCreate(index, prefix, name, RE_STR_NULL_TERM, alias, RE_STR_NULL_TERM)) == NULL) {
         return RE_SUBROUTINE_OUTOFMEM;
     }
 
@@ -1014,17 +1029,17 @@ static int _regexSubroutineIndexRegisterTokens(regex_subroutine_index_t *index,
 // intended pattern or token stream is created, the subroutine index must be
 // updated. Attempting to reference the subroutine without registering a
 // pattern or token stream will result in an error.
-static int _regexSubroutineIndexRegisterIntent(regex_subroutine_index_t *index,
-                                               const char *prefix,
-                                               const char *name, const char *alias) {
+static int _regexSubroutineIndexRegisterIntent(regex_subroutine_index_t *index, const char *prefix,
+                                               const char *name, int name_len,
+                                               const char *alias, int alias_len) {
     regex_subroutine_t *entry;
 
-    if((_regexSubroutineIndexEntryGet(index, prefix, name, RE_STR_NULL_TERM, -1) != NULL) ||
-       (_regexSubroutineIndexEntryGet(index, prefix, alias, RE_STR_NULL_TERM, -1) != NULL)) {
+    if((_regexSubroutineIndexEntryGet(index, prefix, name, name_len, -1) != NULL) ||
+       (_regexSubroutineIndexEntryGet(index, prefix, alias, alias_len, -1) != NULL)) {
         return RE_SUBROUTINE_COLLISION;
     }
 
-    if((entry = _regexSubroutineIndexEntryCreate(index, NULL, name, RE_STR_NULL_TERM, alias, RE_STR_NULL_TERM)) == NULL) {
+    if((entry = _regexSubroutineIndexEntryCreate(index, NULL, name, name_len, alias, alias_len)) == NULL) {
         return RE_SUBROUTINE_OUTOFMEM;
     }
 
@@ -1340,9 +1355,10 @@ struct regex_build_s {
     int groups;
     int pc;
 
-    regex_subroutine_index_t *new_subroutine_index;
+    regex_subroutine_index_t new_subroutine_index;
 
-    regex_subroutines_t *subroutine_index;
+    //regex_subroutines_t *subroutine_index;
+
     regex_vm_pc_patch_t *patch_list;
     regex_vm_gen_path_t *path_list;
     regex_vm_gen_path_t *subroutine_path_list;
@@ -2280,6 +2296,7 @@ void calcCrc32(const void *data, size_t n_bytes, uint32_t* crc) {
     }
 }
 
+#if 0
 regex_subroutines_t *regexSubroutineIdxCreate(regex_build_t *build) {
     regex_subroutines_t *entry, *walk;
 
@@ -2434,6 +2451,7 @@ eRegexCompileStatus_t regexSubroutineGenerateFromPattern(regex_build_t *build,
     }
     return eCompileOk;
 }
+#endif
 
 /////////////////////////////////////////////////////////////////////////////
 // Character parsing, assists with escaped chars
@@ -2612,6 +2630,9 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, const char **i
                 if(_parseCheckIdentifier(*pattern + 2, '{', '}', id, &size) != eRegexPatternIdOk) {
                     result.state = eRegexPatternInvalidEscape;
                     return result;
+                }
+                if(len != NULL) {
+                    *len = size;
                 }
                 result.state = eRegexPatternMetaClass;
                 result.len = size + 4; // \R{size}
@@ -3200,6 +3221,7 @@ static unsigned int *_utf8ClassBitmapCopy(unsigned int *bitmap, int invert) {
     return copy;
 }
 
+#if 0
 int regexTokenUtf8ClassMidlowCreate(regex_token_t **tokens, utf8_charclass_midlow_byte_t *midlow,
                                     int first, int nested, int invert) {
     unsigned int *bitmap;
@@ -3411,6 +3433,7 @@ int regexTokenUtf8ClassCreate(regex_build_t *build, regex_tokenizer_t *tokenizer
     *status = eCompileOk;
     return 1;
 }
+#endif
 
 #define UTF8_ENC_LOW_BYTE_FULL_RANGE        0x3F // 10xxxxxx
 #define UTF8_ENC_ONE_BYTE_FULL_RANGE        0x7F // 0xxxxxxx
@@ -3418,6 +3441,7 @@ int regexTokenUtf8ClassCreate(regex_build_t *build, regex_tokenizer_t *tokenizer
 #define UTF8_ENC_HIGH_THREE_BYTE_FULL_RANGE 0x0F // 1110xxxx
 #define UTF8_ENC_HIGH_FOUR_BYTE_FULL_RANGE  0x07 // 11110xxx
 
+#if 0
 int parseUtf8CharClassCodepoint(utf8_charclass_tree_t *tree, int codepoint) {
     unsigned int *bitmap;
     unsigned char bytes[5];
@@ -3684,6 +3708,7 @@ int parseUtf8CharClassRangeSet(utf8_charclass_tree_t *tree, int code_a, int code
 
     return 1;
 }
+#endif
 
 void regexCharClassUtf8TreeFree(utf8_charclass_tree_t *tree) {
     utf8_charclass_midlow_byte_t *midlow, *ml_next;
@@ -3750,6 +3775,7 @@ int utf8ClassBitmapCheck(const unsigned int *bitmap, int pos) {
 //
 /////////////////////////////////////////////////////////////////////////////
 
+#if 0
 int parseCharClassBitmapSet(utf8_charclass_tree_t *tree, unsigned int *bitmap, int c) {
     if((c > 127) && (tree != NULL)) {
         return parseUtf8CharClassCodepoint(tree, c);
@@ -3767,7 +3793,9 @@ int parseCharClassBitmapRangeSet(utf8_charclass_tree_t *tree, unsigned int *bitm
     }
     return 1;
 }
+#endif
 
+#if 0
 // The embedded flag indicates whether this class pattern is within the context
 // of an actual pattern expression, or is just the content of the pattern, from
 // a secodary source. An embedded pattern ends at the required ']' delimiter,
@@ -3919,7 +3947,9 @@ parseClassCompleted:
     }
     return 1;
 }
+#endif
 
+#if 0
 int parseUnicodeClassAndCreateToken(regex_build_t *build, regex_tokenizer_t *tokenizer, eRegexCompileStatus_t *status,
                                     const char *unicodeClass, int len, int invert,
                                     regex_token_t **tokens) {
@@ -3938,6 +3968,7 @@ int parseUnicodeClassAndCreateToken(regex_build_t *build, regex_tokenizer_t *tok
     }
     return parseCharClassAndCreateToken(build, tokenizer, status, &classStr, unicodeClass, len, 0, tokens, invert);
 }
+#endif
 
 void regexEmitCharClassBitmap(FILE *fp, const unsigned int *bitmap) {
     int k;
@@ -4084,17 +4115,20 @@ static int _parseUtf8ClassTreeAndCreateToken(regex_build_t *build, regex_tokeniz
     }
 
     if(name != NULL) {
-        if((subroutine = _regexSubroutineIndexEntryGet(build->new_subroutine_index, "class:", name, name_len, -1)) == NULL) {
+        if((subroutine = _regexSubroutineIndexEntryGet(&(build->new_subroutine_index), "class:", name, name_len, -1)) == NULL) {
             tokenizer->status = eCompileInternalError;
+            INTERNAL_ERROR("failed to retrieve subroutine index");
             return 0;
         }
         subroutine->tokens = routine_tokenizer.tokens;
         id = subroutine->id;
     } else {
-        switch(id = _regexSubroutineIndexRegisterTokens(build->new_subroutine_index, NULL, NULL, routine_tokenizer.tokens)) {
+        switch(id = _regexSubroutineIndexRegisterTokens(&(build->new_subroutine_index), "class:", NULL, NULL,
+                                                        routine_tokenizer.tokens)) {
             case RE_SUBROUTINE_INVALID_CALL:
             case RE_SUBROUTINE_COLLISION:
                 tokenizer->status = eCompileInternalError;
+                INTERNAL_ERROR("failed to update char class subroutine tokens");
                 return 0;
             case RE_SUBROUTINE_OUTOFMEM:
                 tokenizer->status = eCompileOutOfMem;
@@ -4190,7 +4224,7 @@ static int _parseUtf8TreeGenerateRange(utf8_charclass_tree_t *tree,
     switch(start[0]) {
         case 1:
             // aA - bA
-            if(!parseUtf8SetTreeClassBitmapRange(tree, 1, 0, 0, 0, start[1], end[1])) { return 0; }
+            if(!_parseUtf8SetTreeClassBitmapRange(tree, 1, 0, 0, 0, start[1], end[1])) { return 0; }
             break;
 
         case 2:
@@ -4414,7 +4448,7 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t
     const char *sub_alias;
 
     if((name != NULL) && (class_pattern == NULL)) {
-        if((subroutine = _regexSubroutineIndexEntryGet(build->new_subroutine_index, "class:", name, name_len, -1)) != NULL) {
+        if((subroutine = _regexSubroutineIndexEntryGet(&(build->new_subroutine_index), "class:", name, name_len, -1)) != NULL) {
             // Found the class in the subroutine index
             if(!_regexCreateTokenCall(build, tokenizer, subroutine->id)) {
                 return 0;
@@ -4427,12 +4461,14 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t
         }
         if(!_regexRegUnicodeCharClassLookup(name, name_len, &sub_name, &sub_alias)) {
             active->status = eCompileInternalError;
+            INTERNAL_ERROR("failed to retrieve utf8 char class");
             return 0;
         }
-        switch(_regexSubroutineIndexRegisterPattern(build->new_subroutine_index,
+        switch(_regexSubroutineIndexRegisterPattern(&(build->new_subroutine_index), "class:",
                                                     sub_name, sub_alias, class_pattern)) {
             case RE_SUBROUTINE_INVALID_CALL:
                 active->status = eCompileInternalError;
+                INTERNAL_ERROR("failed to register subroutine for utf8 char class");
                 return 0;
             case RE_SUBROUTINE_COLLISION:
                 active->status = eCompileSubroutineNameCollision;
@@ -4585,7 +4621,6 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t
             return 0;
         }
 
-        printf("Create token char class\n");
         if(!_regexCreateTokenCharClass(build, tokenizer, (unsigned int *)ptr)) {
             active->status = eCompileOutOfMem;
             return 0;
@@ -4619,6 +4654,7 @@ int regexSubexprEndFromGroup(int group) {
     return ((group - 1) * 2) + 1;
 }
 
+#if 0
 // Parses the subexpression name pointed to by pattern, creates a
 // subexpression name lookup entry, and adds it to the subexpression name list.
 // Returns 1 on success, 0 on out of memory, and -1 if the name is malformed.
@@ -4706,6 +4742,7 @@ int regexSubroutineIdxCall(regex_build_t *build, const char **pattern) {
 
     return subroutine->id;
 }
+#endif
 
 /////////////////////////////////////////////////////////////////////////////
 // Lexer - tokenizes the pattern into a token list (infix form)
@@ -4719,6 +4756,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
     const char *str;
     unsigned int flags;
     regex_token_t *subroutine;
+    regex_subroutine_t *routine_entry;
     eRegexCompileStatus_t status;
     int subexpr = 0;
     int named;
@@ -4828,11 +4866,16 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                                 if(named || (flags & REGEX_TOKEN_FLAG_COMPOUND)) {
                                     return eCompileConflictingAttrs;
                                 }
-                                if(!_parseCheckNextPatternChar(&(tokenizer->pattern), '<')) {
+                                if(_parseCheckIdentifier(tokenizer->pattern, '<', '>', &str, &len) != eRegexPatternIdOk) {
                                     return eCompileMalformedSubExprName;
                                 }
-                                if((index = regexSubroutineIdxEntryCreate(build, tokenizer, &(tokenizer->pattern))) <= 0) {
-                                    return (index == 0 ? eCompileOutOfMem : eCompileMalformedSubExprName);
+                                tokenizer->pattern += len + 2;
+                                if((index = _regexSubroutineIndexRegisterIntent(&(build->new_subroutine_index), NULL, str, len,
+                                                                                NULL, 0)) < 0) {
+                                    if(index == RE_SUBROUTINE_COLLISION) {
+                                        return eCompileSubroutineNameCollision;
+                                    }
+                                    return eCompileOutOfMem;
                                 }
                                 flags |= REGEX_TOKEN_FLAG_SUBROUTINE | REGEX_TOKEN_FLAG_NOCAPTURE;
                             } else {
@@ -4883,25 +4926,31 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                         continue;
 
                     default: // Unexpected meta character
+                        INTERNAL_ERROR("unexpected meta char cleared parser");
                         return eCompileInternalError;
                 }
 
             case eRegexPatternMetaClass:
                 switch(c.c) {
                     case 'R': // subroutine call
-                        if((index = regexSubroutineIdxGetIndex(build, str, len)) <= 0) {
+                        printf("\\R{%*.*s} (%d)\n", len, len, str, len);
+                        if((routine_entry = _regexSubroutineIndexEntryGet(&(build->new_subroutine_index), NULL, str, len, -1)) == NULL) {
                             return eCompileUnknownSubroutine;
                         }
-                        if(!_regexCreateTokenCall(build, tokenizer, index)) {
+                        if(!_regexCreateTokenCall(build, tokenizer, routine_entry->id)) {
+                            printf("failed to generate token call\n");
                             return eCompileOutOfMem;
                         }
                         continue;
                     case 'X': // full unicode glyph (base + markers)
                         // Represented by a micro NFA
                         subroutine = NULL;
+                        // TODO
+#if 0
                         if((status = regexSubroutineGenerateFromPattern(build, tokenizer, &(tokenizer->tokens), &subroutine, "\\p{M}\\p{M}*", NULL, 0, NULL)) != eCompileOk) {
                             return status;
                         }
+#endif
                         continue;
                     case 'B': // explicit byte
                         if(!_regexCreateTokenByte(build, tokenizer)) {
@@ -4946,9 +4995,15 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                 if(_regexRegUnicodeCharClassGet(str, len) == NULL) {
                     return eCompileUnknownUnicodeClass;
                 }
+#if 0
                 if(!parseUnicodeClassAndCreateToken(build, tokenizer, &status, str, len, ((c.c == 'P') ? 1 : 0), &(tokenizer->tokens))) {
                     return status;
                 }
+#else
+                if(!_parseCharClassAndCreateToken(build, tokenizer, NULL, str, len, ((c.c == 'P') ? 1 : 0))) {
+                    return tokenizer->status;
+                }
+#endif
                 continue;
 
             case eRegexPatternChar:
@@ -5247,6 +5302,7 @@ eRegexCompileStatus_t regexOperatorApply(regex_build_t *build, regex_token_t **o
                 break;
 
             default:
+                INTERNAL_ERROR("unexpected operator in shunting yard");
                 return eCompileInternalError;
         }
     }
@@ -5262,7 +5318,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
                                                 int sub_expression, unsigned int group_flags) {
     regex_token_t *token = NULL, *routine, *operators = NULL;
     regex_token_t *operands = NULL, *subexpr;
-    regex_subroutines_t *subindex;
+    regex_subroutine_t *subroutine;
     eRegexCompileStatus_t status;
     regex_tokenizer_t tokenizer;
     int group_num;
@@ -5281,6 +5337,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
     while((token = regexTokenStackPop(tokens)) != NULL) {
         switch(token->tokenType) {
             default:
+                INTERNAL_ERROR("unknown token found in shunting yard");
                 return eCompileInternalError;
             case eTokenCharLiteral:
             case eTokenCharClass:
@@ -5312,20 +5369,21 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
                 // Generate the sub sequence pattern, and tie it into the current pattern
                 // with an eTokenCall
                 subexpr = NULL;
-                if((subindex = regexSubroutineIdxGet(build, token->sub_index)) == NULL) {
+                if((subroutine = _regexSubroutineIndexEntryGet(&(build->new_subroutine_index), NULL, NULL, 0, token->sub_index)) == NULL) {
+                    INTERNAL_ERROR("failed to find subroutine for call in shunting yard");
                     SET_YARD_RESULT(eCompileInternalError);
                 }
-                if(!subindex->infixed) {
-                    routine = subindex->tokens;
+                if(!subroutine->infixed) {
+                    routine = subroutine->tokens;
                     if((status = regexShuntingYardFragment(build, &(routine), &subexpr,
                                                            REGEX_SHUNTING_YARD_NO_CAPTURE,
                                                            REGEX_TOKEN_FLAG_SUBROUTINE)) != eCompileOk) {
                         SET_YARD_RESULT(status);
                     }
-                    subindex->tokens = subexpr;
-                    subindex->infixed = 1;
+                    subroutine->tokens = subexpr;
+                    subroutine->infixed = 1;
                 }
-                token->out_b = subindex->tokens;
+                token->out_b = subroutine->tokens;
                 if(!regexOperatorLiteralCreate(build, &operands, token)) {
                     SET_YARD_RESULT(eCompileOutOfMem);
                 }
@@ -5344,18 +5402,19 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
                     }
                 }
                 if(token->flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
-                    if((subindex = regexSubroutineIdxGet(build, token->sub_index)) == NULL) {
+                    if((subroutine = _regexSubroutineIndexEntryGet(&(build->new_subroutine_index), NULL, NULL, 0, token->sub_index)) == NULL) {
+                        INTERNAL_ERROR("failed to find subroutine for group in shunting yard");
                         SET_YARD_RESULT(eCompileInternalError);
                     }
-                    if(!subindex->infixed) {
+                    if(!subroutine->infixed) {
                         if((status = regexShuntingYardFragment(build, tokens, &subexpr,
                                                                group_num, token->flags)) != eCompileOk) {
                             SET_YARD_RESULT(status);
                         }
-                        subindex->tokens = subexpr;
-                        subindex->infixed = 1;
+                        subroutine->tokens = subexpr;
+                        subroutine->infixed = 1;
                     }
-                    token->out_b = subindex->tokens;
+                    token->out_b = subroutine->tokens;
                     token->tokenType = eTokenCall;
                     if(!regexOperatorLiteralCreate(build, &operands, token)) {
                         SET_YARD_RESULT(eCompileOutOfMem);
@@ -5389,6 +5448,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
                     goto ShuntingYardFailure;
                 }
                 if(operands->next != NULL) {
+                    INTERNAL_ERROR("failed to resolve all operands when closing group in shunting yard");
                     SET_YARD_RESULT(eCompileInternalError);
                 }
                 if(group_flags & REGEX_TOKEN_FLAG_SUBROUTINE) {
@@ -5411,6 +5471,7 @@ eRegexCompileStatus_t regexShuntingYardFragment(regex_build_t *build, regex_toke
         }
     } else {
         if(sub_expression != REGEX_SHUNTING_YARD_NO_PARENT) {
+            INTERNAL_ERROR("no parent for non subroutine in shunting yard");
             SET_YARD_RESULT(eCompileInternalError);
         }
 
@@ -6214,12 +6275,10 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
 
     if(!regexVMProgramGenerate(&build, tokenizer->tokens)) {
         regexVMBuildDestroy(&build);
-        regexSubroutineIdxFree(&build);
         ctx->vm = NULL;
         ctx->status = eCompileOutOfMem;
         return ctx->status;
     }
-    regexSubroutineIdxFree(&build);
     ctx->phase = ePhaseComplete;
 
     // Fixup the lookup tables
