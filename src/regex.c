@@ -3886,7 +3886,6 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                                 if(_parseCheckIdentifier(tokenizer->pattern, '<', '>', &str, &len) != eRegexPatternIdOk) {
                                     return eCompileMalformedSubExprName;
                                 }
-                                printf("register subroutine [%*.*s]\n", len, len, str);
                                 tokenizer->pattern += len + 2;
                                 if((index = _regexSubroutineIndexRegisterIntent(&(build->new_subroutine_index), NULL, str, len,
                                                                                 NULL, 0)) < 0) {
@@ -3895,7 +3894,6 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                                     }
                                     return eCompileOutOfMem;
                                 }
-                                printf("sub %d\n", index);
                                 flags |= RE_TOKEN_FLAG_SUBROUTINE | RE_TOKEN_FLAG_NO_CAPTURE;
                             } else {
                                 return eCompileUnsupportedMeta;
@@ -3956,7 +3954,6 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
                             return eCompileUnknownSubroutine;
                         }
                         if(!_regexCreateTokenCall(build, tokenizer, routine_entry->id)) {
-                            printf("failed to generate token call\n");
                             return eCompileOutOfMem;
                         }
                         continue;
@@ -5757,7 +5754,6 @@ eRegexEvalResult regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, 
                         return eEvalInternalError;
                     case REGEX_VM_FLAG_START_OF_LINE:
                         if(!eval->start_of_line) {
-                            printf("not start of line? %d\n", eval->start_of_line);
                             return eEvalNoMatch;
                         }
                         thread->pc++;
