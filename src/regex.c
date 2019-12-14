@@ -287,8 +287,8 @@ Regex VM Bytecode (v8 - in development)
         eTokenCall              A       program counter
         eTokenReturn            B
         eTokenByte              C
-        eTokenUtf8Literal       D       encoding, bits spread across operands
-        <reserved>              E
+        eTokenAssertion         D       type specifier
+        eTokenUtf8Literal       E       encoding, bits spread across operands
         <reserved>              F
 
     Note about eTokenCharLiteral:
@@ -1677,12 +1677,12 @@ int regexGetOperatorArity(regex_token_t *token) {
 
 // Forward declarations of the unicode property classes
 
-typedef struct mojo_unicode_class_s mojo_unicode_class_t;
-struct mojo_unicode_class_s {
-    const char *abbreviation;
-    const char *property;
+typedef struct regex_char_class_s regex_char_class_t;
+struct regex_char_class_s {
+    const char *alias;
+    const char *name;
     const char *class_string;
-    mojo_unicode_class_t *next;
+    regex_char_class_t *next;
 };
 
 const char _uax_db_Mark[];
@@ -1693,7 +1693,7 @@ const char _uax_db_Uppercase_Letter[];
 const char _uax_db_Lowercase_Letter[];
 const char _uax_db_Letter[];
 
-mojo_unicode_class_t _uax_db_default_import_table[] = {
+regex_char_class_t _regex_char_class_default_import_table[] = {
         {"M", "Mark", _uax_db_Mark, NULL},
         {"N", "Number", _uax_db_Number, NULL},
         {"P", "Punctuation", _uax_db_Punctuation, NULL},
@@ -1704,7 +1704,7 @@ mojo_unicode_class_t _uax_db_default_import_table[] = {
         {NULL, NULL, NULL, NULL}
 };
 
-mojo_unicode_class_t _subroutine_test = {
+regex_char_class_t _subroutine_test = {
     NULL, "test",
     "A-Za-z\\uA000-\\uA0FF",
     //"A-Za-z\\u0123-\\u0138\\uA000-\\uA0FF",
@@ -1712,23 +1712,23 @@ mojo_unicode_class_t _subroutine_test = {
 };
 
 static int _regex_unicode_table_initialized = 0;
-mojo_unicode_class_t *_regex_unicode_charclass_table = NULL;
+regex_char_class_t *_regex_unicode_charclass_table = NULL;
 
-int regexRegUnicodeCharClassAdd(mojo_unicode_class_t *utf8class) {
-    mojo_unicode_class_t *walk;
+int regexRegUnicodeCharClassAdd(regex_char_class_t *utf8class) {
+    regex_char_class_t *walk;
 
     if((utf8class == NULL) || (utf8class->class_string == NULL)) {
         return 0;
     }
 
     for(walk = _regex_unicode_charclass_table; walk != NULL; walk = walk->next) {
-        if((utf8class->abbreviation != NULL) && (walk->abbreviation != NULL) &&
-           (!strcmp(utf8class->abbreviation, walk->abbreviation))) {
+        if((utf8class->alias != NULL) && (walk->alias != NULL) &&
+           (!strcmp(utf8class->alias, walk->alias))) {
             // A class with the same abbreviation has already been registered
             return 0;
         }
-        if((utf8class->property != NULL) && (walk->property != NULL) &&
-           (!strcmp(utf8class->property, walk->property))) {
+        if((utf8class->name != NULL) && (walk->name != NULL) &&
+           (!strcmp(utf8class->name, walk->name))) {
             // A class with the same property has already been registered
             return 0;
         }
@@ -1739,7 +1739,7 @@ int regexRegUnicodeCharClassAdd(mojo_unicode_class_t *utf8class) {
     return 1;
 }
 
-int regexRegUnicodeCharClassAddTable(mojo_unicode_class_t *utf8class) {
+int regexRegUnicodeCharClassAddTable(regex_char_class_t *utf8class) {
     int failed = 0;
 
     for(; (utf8class != NULL) && (utf8class->class_string != NULL); utf8class++) {
@@ -1754,22 +1754,22 @@ static int _regexRegUnicodeInitializeTable(void) {
     if(_regex_unicode_table_initialized) {
         return 1;
     }
-    return regexRegUnicodeCharClassAddTable(_uax_db_default_import_table);
+    return regexRegUnicodeCharClassAddTable(_regex_char_class_default_import_table);
 }
 
 static const char *_regexRegUnicodeCharClassGet(const char *classId, int len) {
-    mojo_unicode_class_t *walk;
+    regex_char_class_t *walk;
 
     if(len <= 0) {
         len = (int)strlen(classId);
     }
 
     for(walk = _regex_unicode_charclass_table; walk != NULL; walk = walk->next) {
-        if((walk->abbreviation != NULL) && (strlen(walk->abbreviation) == len) &&
-           (!strncmp(walk->abbreviation, classId, len))) {
+        if((walk->alias != NULL) && (strlen(walk->alias) == len) &&
+           (!strncmp(walk->alias, classId, len))) {
             return walk->class_string;
         }
-        if((strlen(walk->property) == len) && (!strncmp(walk->property, classId, len))) {
+        if((strlen(walk->name) == len) && (!strncmp(walk->name, classId, len))) {
             return walk->class_string;
         }
     }
@@ -1777,22 +1777,22 @@ static const char *_regexRegUnicodeCharClassGet(const char *classId, int len) {
 }
 
 static int _regexRegUnicodeCharClassLookup(const char *classId, int len, const char **name, const char **alias) {
-    mojo_unicode_class_t *walk;
+    regex_char_class_t *walk;
 
     if(len <= 0) {
         len = (int)strlen(classId);
     }
 
     for(walk = _regex_unicode_charclass_table; walk != NULL; walk = walk->next) {
-        if((walk->abbreviation != NULL) && (strlen(walk->abbreviation) == len) &&
-           (!strncmp(walk->abbreviation, classId, len))) {
-            *name = walk->property;
-            *alias = walk->abbreviation;
+        if((walk->alias != NULL) && (strlen(walk->alias) == len) &&
+           (!strncmp(walk->alias, classId, len))) {
+            *name = walk->name;
+            *alias = walk->alias;
             return 1;
         }
-        if((strlen(walk->property) == len) && (!strncmp(walk->property, classId, len))) {
-            *name = walk->property;
-            *alias = walk->abbreviation;
+        if((strlen(walk->name) == len) && (!strncmp(walk->name, classId, len))) {
+            *name = walk->name;
+            *alias = walk->alias;
             return 1;
         }
     }
@@ -1800,11 +1800,11 @@ static int _regexRegUnicodeCharClassLookup(const char *classId, int len, const c
 }
 
 void regexRegUnicodeCharClassRemove(const char *classId) {
-    mojo_unicode_class_t *entry, *last = NULL;
+    regex_char_class_t *entry, *last = NULL;
 
     for(entry = _regex_unicode_charclass_table; entry != NULL; entry = entry->next) {
-        if(((entry->abbreviation != NULL) && (!strcmp(entry->abbreviation, classId))) ||
-           (!strcmp(entry->property, classId))) {
+        if(((entry->alias != NULL) && (!strcmp(entry->alias, classId))) ||
+           (!strcmp(entry->name, classId))) {
             break;
         }
         last = entry;
