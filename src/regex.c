@@ -1387,7 +1387,7 @@ typedef enum {
 typedef void (*regexTokenDetailPrint_t)(FILE *fp, regex_token_t *token);
 typedef void (*regexTokenVMInstrPrint_t)(FILE *fp, regex_vm_t *vm, unsigned int oper_a, unsigned int oper_b);
 
-void regexEmitCharClassBitmap(FILE *fp, const unsigned int *bitmap);
+void regexCharClassBitmapEmit(FILE *fp, const unsigned int *bitmap);
 void regexEmitEscapedStr(FILE *fp, const char *str, int len);
 
 const unsigned int *regexVMClassTableEntryGet(regex_vm_t *vm, int class_table_id);
@@ -1401,7 +1401,7 @@ void regexPrintVMCharClass(FILE *fp, regex_vm_t *vm, int class_idx) {
     if((bitmap = regexVMClassTableEntryGet(vm, class_idx)) == NULL) {
         fprintf(fp, "index %d was null", class_idx);
     } else {
-        regexEmitCharClassBitmap(fp, bitmap);
+        regexCharClassBitmapEmit(fp, bitmap);
     }
 }
 
@@ -1432,7 +1432,7 @@ void regexPrinter_eTokenCharLiteral(FILE *fp, regex_token_t *token) {
 
 void regexPrinter_eTokenCharClass(FILE *fp, regex_token_t *token) {
     fputc('[', fp);
-    regexEmitCharClassBitmap(stdout, token->bitmap);
+    regexCharClassBitmapEmit(stdout, token->bitmap);
     fputc(']', fp);
 }
 
@@ -1444,7 +1444,7 @@ void regexPrinter_eTokenStringLiteral(FILE *fp, regex_token_t *token) {
 
 void regexPrinter_eTokenUtf8Class(FILE *fp, regex_token_t *token) {
     fputc('[', fp);
-    regexEmitCharClassBitmap(fp, token->bitmap);
+    regexCharClassBitmapEmit(fp, token->bitmap);
     fputc(']', fp);
 }
 
@@ -2326,7 +2326,7 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, const char **i
 static int _parseCheckNextPatternChar(const char **pattern, char c) {
     parseChar_t pc;
 
-    pc = _parseGetNextPatternChar(pattern, NULL, NULL);
+    pc = _parseGetNextPatternChar(pattern, 0, NULL, NULL);
     if(!_parsePatternIsValid(&pc)) {
         return 0;
     }
@@ -2641,7 +2641,7 @@ static int _parseGetPatternStrLen(const char **pattern) {
     parseChar_t c;
 
     for(;;) {
-        c = _parseGetNextPatternChar(&ptr, NULL, NULL);
+        c = _parseGetNextPatternChar(&ptr, 0, NULL, NULL);
         switch(c.state) {
             case eRegexPatternEnd:
             case eRegexPatternMetaChar:
@@ -2683,7 +2683,7 @@ static char *_parseGetPatternStr(const char **pattern, int len, int size) {
     ptr = str;
 
     for(; len; len--) {
-        c = _parseGetNextPatternChar(pattern, NULL, NULL);
+        c = _parseGetNextPatternChar(pattern, 0, NULL, NULL);
         _parsePatternCharAdvance(pattern, &c);
         if(c.state == eRegexPatternUnicode) {
             for(k = _parseUtf8EncodingByteLen(c.c); k; k--) {
@@ -3077,7 +3077,7 @@ int utf8ClassBitmapCheck(const unsigned int *bitmap, int pos) {
 //
 /////////////////////////////////////////////////////////////////////////////
 
-void regexEmitCharClassBitmap(FILE *fp, const unsigned int *bitmap) {
+void regexCharClassBitmapEmit(FILE *fp, const unsigned int *bitmap) {
     int k;
     int run;
 
@@ -3598,7 +3598,7 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t
 
     memset(bitmap, 0, 32);
 
-    c = _parseGetNextPatternChar(&(active->pattern), NULL, NULL);
+    c = _parseGetNextPatternChar(&(active->pattern), 0, NULL, NULL);
     active->position = (int)(orig_pattern - active->pattern);
     if(_parsePatternIsValid(&c)) {
         _parsePatternCharAdvance(&(active->pattern), &c);
@@ -3610,7 +3610,7 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t
 
     if(c.state == eRegexPatternMetaChar && c.c == '^') {
         invert = 1;
-        c = _parseGetNextPatternChar(&(active->pattern), NULL, NULL);
+        c = _parseGetNextPatternChar(&(active->pattern), 0, NULL, NULL);
         active->position = (int)(orig_pattern - active->pattern);
         if(_parsePatternIsValid(&c)) {
             _parsePatternCharAdvance(&(active->pattern), &c);
@@ -3691,7 +3691,7 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, regex_tokenizer_t
                 active->status = eCompileCharClassIncomplete;
                 return 0;
         }
-        c = _parseGetNextPatternChar(&(active->pattern), NULL, NULL);
+        c = _parseGetNextPatternChar(&(active->pattern), 0, NULL, NULL);
         active->position = (int)(orig_pattern - active->pattern);
         if(_parsePatternIsValid(&c)) {
             _parsePatternCharAdvance(&(active->pattern), &c);
@@ -3786,7 +3786,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build,
     for(; *(tokenizer->pattern) != '\0';) {
         // Get the next character in the pattern. The helper function assists
         // in disambiguating escaped characters.
-        c = _parseGetNextPatternChar(&(tokenizer->pattern), &str, &len);
+        c = _parseGetNextPatternChar(&(tokenizer->pattern), 0, &str, &len);
         if(_parsePatternIsValid(&c)) {
             _parsePatternCharAdvance(&(tokenizer->pattern), &c);
         }
@@ -4590,7 +4590,7 @@ void regexVMStringTableFree(regex_vm_t *vm) {
 
 // Class table //////////////////////////////////////////////////////////////
 
-int regexVMClassTableEntryAdd(regex_build_t *build, const unsigned int *bitmap) {
+int regexVMCharClassTableEntryAdd(regex_build_t *build, const unsigned int *bitmap) {
     return regexStrTableEntryAdd((char ***)&(build->vm->class_table),
                                  &(build->vm->class_tbl_size),
                                 32, (char *)bitmap, NULL,
@@ -4828,7 +4828,7 @@ int regexVMProgramGenerateInstr(regex_build_t *build, regex_token_t *token, rege
             }
             break;
         case eTokenCharClass:
-            if((idx_a = regexVMClassTableEntryAdd(build, token->bitmap)) == -1) {
+            if((idx_a = regexVMCharClassTableEntryAdd(build, token->bitmap)) == -1) {
                 return 0;
             }
             break;
