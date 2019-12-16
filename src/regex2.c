@@ -520,6 +520,7 @@ struct regex_build_s {
     regex_token_t *tokens;
     eRegexCompileStatus_t status;
     regex_pattern_t *pattern;
+    regex_vm_t *vm;
 };
 
 regex_build_ctx_t *regexBuildContextCreate(void);
@@ -585,6 +586,7 @@ static regex_subroutine_t *_regexSubroutineIndexEntryGet(regex_subroutine_index_
                                                          const char *prefix,
                                                          const char *name, size_t len,
                                                          int id);
+static const char *_regexGroupTableEntryGet(regex_build_ctx_t *build_ctx, int group_num, int *len);
 
 void _reMetaTokEmit_eTokenCharLiteral(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
     fprintf(fp, "'%c',%03d%s",
@@ -594,7 +596,9 @@ void _reMetaTokEmit_eTokenCharLiteral(FILE *fp, regex_build_ctx_t *build_ctx, re
 }
 
 void _reMetaTokEmit_eTokenCharClass(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    fputc('[', fp);
     regexCharClassBitmapEmit(fp, token->bitmap);
+    fputc(']', fp);
 }
 
 void _reMetaTokEmit_eTokenStringLiteral(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
@@ -616,7 +620,7 @@ void _reMetaTokEmit_eTokenMatch(FILE *fp, regex_build_ctx_t *build_ctx, regex_to
 }
 
 void _reMetaTokEmit_eTokenUtf8Class(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
-
+    // TODO
 }
 
 void _reMetaTokEmit_eTokenCall(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
@@ -646,7 +650,7 @@ void _reMetaTokEmit_eTokenAssertion(FILE *fp, regex_build_ctx_t *build_ctx, rege
 }
 
 void _reMetaTokEmit_eTokenUtf8Literal(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
-
+    // TODO
 }
 
 void _reMetaTokEmit_eTokenRange(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
@@ -663,7 +667,38 @@ void _reMetaTokEmit_eTokenRange(FILE *fp, regex_build_ctx_t *build_ctx, regex_to
 }
 
 void _reMetaTokEmit_eTokenSubExprStart(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    const char *name;
+    regex_subroutine_t *routine;
+    int len;
 
+    fprintf(fp, "%d", token->group);
+    if(token->flags & RE_TOK_FLAG_COMPOUND) {
+        fputs(":compound", fp);
+    }
+    if(token->flags & RE_TOK_FLAG_SUBROUTINE) {
+        fprintf(fp, ":subroutine %d", token->sub_index);
+        if((routine = _regexSubroutineIndexEntryGet(&(build_ctx->subroutine_index), NULL, NULL, 0, token->sub_index)) != NULL) {
+            if((routine->name != NULL) || (routine->alias != NULL)) {
+                fputc('(', fp);
+                if(routine->name != NULL) {
+                    fputs(routine->name, fp);
+                    if(routine->alias != NULL) {
+                        fputc(':', fp);
+                    }
+                }
+                if(routine->alias != NULL) {
+                    fputs(routine->alias, fp);
+                }
+                fputc(')', fp);
+            }
+        }
+    }
+    if(token->flags & RE_TOK_FLAG_NO_CAPTURE) {
+        fputs(":no_capture", fp);
+    }
+    if((name = _regexGroupTableEntryGet(build_ctx, token->group, &len)) != NULL) {
+        fprintf(fp, ":named(%s)", name);
+    }
 }
 
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
@@ -687,7 +722,7 @@ void _reMetaVMEmit_eTokenCharLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsig
 }
 
 void _reMetaVMEmit_eTokenCharClass(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-
+    // TODO
 }
 
 void _reMetaVMEmit_eTokenStringLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
@@ -728,7 +763,7 @@ void _reMetaVMEmit_eTokenSave(FILE *fp, regex_vm_t *vm, int opcode, unsigned int
 }
 
 void _reMetaVMEmit_eTokenUtf8Class(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-
+    // TODO
 }
 
 void _reMetaVMEmit_eTokenCall(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
@@ -746,7 +781,7 @@ void _reMetaVMEmit_eTokenAssertion(FILE *fp, regex_vm_t *vm, int opcode, unsigne
 }
 
 void _reMetaVMEmit_eTokenUtf8Literal(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-
+    // TODO
 }
 
 
@@ -806,25 +841,43 @@ int regexVerifyTokenDetails(void) {
             (_regexTokenDetails[k].token == k));
 }
 
-void regexTokenStrEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+// detail 1 - address
+// detail 2 - concatenation
+// detail 3 - pc
+void regexTokenStrEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token, int detail) {
+    if(detail) {
+        fprintf(fp, "0%4.4X:", (unsigned int)(((uintptr_t)token) & 0xFFFFu));
+    }
     if(token == NULL) {
-        fprintf(fp, "0x0000:NULL()[]");
+        fprintf(fp, "NULL(");
     } else if((token->tokenType < eTokenFirstToken) || (token->tokenType >= eTokenUnknown)) {
-        fprintf(fp, "0x%4.4X:INVALID(%d)[%d]", (((uintptr_t)token) & 0xFFFFu), token->tokenType, token->pc);
+        fprintf(fp, "INVALID(%d", token->tokenType);
     } else {
-        fprintf(fp, "0x%4.4X:%s(", (((uintptr_t)token) & 0xFFFFu),
-                _regexTokenDetails[token->tokenType].name);
-        if(_regexTokenDetails[token->tokenType].emitToken != NULL) {
-            _regexTokenDetails[token->tokenType].emitToken(fp, build_ctx, token);
+        if((detail > 1) || (token->tokenType != eTokenConcatenation)) {
+            fprintf(fp, "%s(", _regexTokenDetails[token->tokenType].name);
+            if(_regexTokenDetails[token->tokenType].emitToken != NULL) {
+                _regexTokenDetails[token->tokenType].emitToken(fp, build_ctx, token);
+            }
         }
-        fprintf(fp ,")[%d]", token->pc);
+    }
+    if((detail > 1) || (token->tokenType != eTokenConcatenation)) {
+        fputc(')', fp);
+    }
+    if(detail > 2) {
+        if(token == NULL) {
+            fputs("[]", fp);
+        } else {
+            fprintf(fp, "[%d]", token->pc);
+        }
     }
 }
 
-void regexTokenStrStackEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+void regexTokenStrStackEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token, int detail) {
     for(; token != NULL; token = token->next) {
-        regexTokenStrEmit(fp, build_ctx, token);
-        fputc('\n', fp);
+        regexTokenStrEmit(fp, build_ctx, token, detail);
+        if((detail > 1) || (token->tokenType != eTokenConcatenation)) {
+            fputc('\n', fp);
+        }
     }
 }
 
@@ -1421,6 +1474,10 @@ static int _regexSubroutineIndexRegisterIntent(regex_subroutine_index_t *index, 
 /////////////////////////////////////////////////////////////////////////////
 
 static void _regexPtrListFree(regex_build_t *build, regex_ptrlist_t *list);
+void regexVMStringTableFree(regex_vm_t *vm);
+void regexVMClassTableFree(regex_vm_t *vm);
+void regexVMUtf8TableFree(regex_vm_t *vm);
+void regexVMGroupTableFree(regex_vm_t *vm);
 
 regex_build_ctx_t *regexBuildContextCreate(void) {
     regex_build_ctx_t *build_ctx;
@@ -1466,6 +1523,22 @@ void regexBuildContextDestroy(regex_build_ctx_t *build_ctx) {
     }
 }
 
+int regexBuildVMInit(regex_build_t *build) {
+    if((build->vm = _regexAlloc(sizeof(regex_vm_t), _regexMemContext)) == NULL) {
+        return 0;
+    }
+    build->vm->vm_version = REGEX_VM_MACHINE_VERSION;
+    return 1;
+}
+
+void regexBuildVMFree(regex_vm_t *vm) {
+    regexVMStringTableFree(vm);
+    regexVMClassTableFree(vm);
+    regexVMUtf8TableFree(vm);
+    regexVMGroupTableFree(vm);
+    _regexDealloc(vm, _regexMemContext);
+}
+
 regex_build_t *regexBuilderCreate(regex_build_ctx_t *build_ctx) {
     regex_build_t *build;
 
@@ -1483,6 +1556,9 @@ regex_build_t *regexBuilderInit(regex_build_ctx_t *build_ctx, regex_build_t *bui
         return NULL;
     }
     memset(build, 0, sizeof(regex_build_t));
+    if(!regexBuildVMInit(build)) {
+        return NULL;
+    }
     build->build_ctx = build_ctx;
     return build;
 }
@@ -1922,7 +1998,12 @@ static int _regexCreateTokenSubExprEnd(regex_build_t *build) {
 }
 
 static int _regexGroupTableEntryAdd(regex_build_t *build, const char *str, int len, int group_num) {
-    return _regexStrTableEntryAdd(&(build->build_ctx->group_table), len, (unsigned char *)str, 0, NULL) >= 0;
+    int idx = _regexStrTableEntryAdd(&(build->build_ctx->group_table), len, (unsigned char *)str, 0, NULL);
+    return idx >= 0;
+}
+
+static const char *_regexGroupTableEntryGet(regex_build_ctx_t *build_ctx, int group_num, int *len) {
+    return (char *)_regexStrTableEntryGet(&(build_ctx->group_table), group_num, len);
 }
 
 // The subexpression group number is derived from it's pattern order. This
@@ -2437,17 +2518,16 @@ static parse_str_t _parseGetPatternStrLen(const char **pattern) {
             case eRegexPatternChar:
             case eRegexPatternEscapedChar:
                 count.characters++;
+                count.bytes++;
                 break;
 
             case eRegexPatternUnicode:
                 count.characters++;
-                count.bytes += _parseUtf8EncodingByteLen(c.c) - 1;
+                count.bytes += _parseUtf8EncodingByteLen(c.c);
                 break;
 
             case eRegexPatternInvalid:
             case eRegexPatternInvalidEscape:
-                count.characters = -1;
-                count.bytes = -1;
                 return count;
 
         }
@@ -2721,8 +2801,8 @@ int _parseCreateUtf8Range(regex_build_t *build, regex_utf8_range_t **sequence, i
             last = walk;
         }
         last->next = range;
-        return 1;
     }
+    return 1;
 }
 
 typedef enum {
@@ -2790,7 +2870,7 @@ static int _regexUtf8SegmentInit(regex_utf8_segment_t *segment, int codepoint) {
 }
 
 static int _regexUtf8SegmentGenerate(regex_build_t *build, regex_utf8_segment_t *segment) {
-
+    return 0;
 }
 
 // Returns a segment of a utf8 codepoint range for conversion into a char class.
@@ -3227,10 +3307,10 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                         // Grouped subexpression, complex operator, resolves to a compound operand
                         // Speculative subexpression number. If non-capturing, will NOT actually
                         // increase the group count.
-                        subexpr = build->build_ctx->group_count + 1;
+                        subexpr = build->build_ctx->group_count;
                         flags = 0;
                         named = 0;
-                        index = 0;
+                        index = -1;
                         // Check for group meta modifiers
                         while(*(build->pattern->pattern) == '?') {
                             build->pattern->pattern++;
@@ -3247,9 +3327,9 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                                 }
                                 build->pattern->pattern += len + 2;
                                 if(!_regexGroupTableEntryAdd(build, str, len, subexpr)) {
-                                    printf("yo\n");
                                     return eCompileOutOfMem;
                                 }
+                                printf("Group: (%d)[%*.*s]\n", subexpr, len, len, str);
                                 named = 1;
                             } else if(_parseCheckNextPatternChar(&(build->pattern->pattern), ':')) {
                                 // Non-capturing subexpression
@@ -3280,6 +3360,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                                     return eCompileOutOfMem;
                                 }
                                 flags |= RE_TOK_FLAG_SUBROUTINE | RE_TOK_FLAG_NO_CAPTURE;
+                                printf("Subroutine: %d\n", subexpr);
                             } else {
                                 return eCompileUnsupportedMeta;
                             }
@@ -3289,9 +3370,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                                 return eCompileOutOfMem;
                             }
                         }
-                        if(!(flags & (RE_TOK_FLAG_NO_CAPTURE | RE_TOK_FLAG_SUBROUTINE))) {
-                            build->build_ctx->group_count++;
-                        }
+                        build->build_ctx->group_count++;
                         if(!_regexCreateTokenSubExprStart(build, subexpr, index, (int)(flags & RE_TOK_FLAG_COMPOUND), (int)(flags & RE_TOK_FLAG_NO_CAPTURE))) {
                             return eCompileOutOfMem;
                         }
@@ -3701,7 +3780,7 @@ eRegexCompileStatus_t regexOperatorApply(regex_build_t *build, regex_token_t **o
 
 static void _regexEmitNFA(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token, int indent) {
     fprintf(fp, "%*.*s", indent * 4, indent * 4, "");
-    regexTokenStrEmit(fp, build_ctx, token);
+    regexTokenStrEmit(fp, build_ctx, token, 3);
     fputc('\n', fp);
     if(token->out_a != NULL) {
         fprintf(fp, "%*.*s  (a)\n", indent * 4, indent * 4, "");
@@ -3719,7 +3798,7 @@ static void _regexEmitNFA(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t 
 
 static void _regexEmitTokenStream(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
     while(token != NULL) {
-        regexTokenStrEmit(stdout, build_ctx, token);
+        regexTokenStrEmit(stdout, build_ctx, token, 3);
         fputc('\n', fp);
         token = token->next;
     }
@@ -4416,20 +4495,9 @@ int regexVMProgramUnanchoredPrefix(regex_build_t *build, regex_vm_t *vm) {
     return 1;
 }
 
-int regexVMBuildInit(regex_build_t *build, regex_vm_t **vm) {
-    if((*vm = _regexAlloc(sizeof(regex_vm_t), _regexMemContext)) == NULL) {
-        return 0;
-    }
-    (*vm)->vm_version = REGEX_VM_MACHINE_VERSION;
-    return 1;
-}
-
 int regexVMProgramGenerate(regex_build_t *build, regex_vm_t **vm) {
     regex_token_t *token = build->tokens;
 
-    if(!regexVMBuildInit(build, vm)) {
-        return 0;
-    }
     if(!regexVMProgramUnanchoredPrefix(build, *vm)) {
         return 0;
     }
@@ -4459,16 +4527,7 @@ int regexVMProgramGenerate(regex_build_t *build, regex_vm_t **vm) {
     return 1;
 }
 
-void regexVMFree(regex_vm_t *vm) {
-    regexVMStringTableFree(vm);
-    regexVMClassTableFree(vm);
-    regexVMUtf8TableFree(vm);
-    regexVMGroupTableFree(vm);
-    _regexDealloc(vm, _regexMemContext);
-}
-
-void regexVMBuildDestroy(regex_build_t *build, regex_vm_t *vm) {
-    regexVMFree(vm);
+void regexVMBuildDestroy(regex_build_t *build) {
     regexVMGenPathFree(build, 0);
     regexVMPatchListFree(NULL, build->build_ctx->patch_list);
     build->build_ctx->patch_list = NULL;
@@ -4649,7 +4708,7 @@ eRegexCompileStatus_t regexCompile(regex_compile_ctx_t *ctx, const char *pattern
     regexBuildPatternPop(&build);
 
     // TODO - remove debug emit
-    regexTokenStrStackEmit(stdout, &build_ctx, build.tokens);
+    regexTokenStrStackEmit(stdout, &build_ctx, build.tokens, 0);
 
     // Next, convert the infix form of the regular expression to postfix form,
     // and derive an NFA representation. We accomplish this using the shunting
