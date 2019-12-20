@@ -252,9 +252,9 @@ struct regex_vm_s {
     int utf8_tbl_size;              // number of bitmaps in the utf8 table
     char **group_table;             // table of subexpression group names
     int group_tbl_size;             // number of groups in the group table
+    int sub_name_tbl_size;          // always include, for VM compatability even when not compiled in
 #ifdef MOJO_REGEX_VM_DEBUG
     regex_vm_sub_names_t *sub_name_table;
-    int sub_name_tbl_size;
 #endif // MOJO_REGEX_VM_DEBUG
 };
 
@@ -1284,15 +1284,15 @@ const char _uax_db_Uppercase_Letter[];
 const char _uax_db_Lowercase_Letter[];
 const char _uax_db_Letter[];
 
-typedef struct regex_char_class_s regex_char_class_t;
-struct regex_char_class_s {
+typedef struct regex_unicode_class_s regex_unicode_class_t;
+struct regex_unicode_class_s {
     const char *alias;
     const char *name;
     const char *class_string;
-    regex_char_class_t *next;
+    regex_unicode_class_t *next;
 };
 
-regex_char_class_t _regex_char_class_default_import_table[] = {
+regex_unicode_class_t _regex_char_class_default_import_table[] = {
         {"M", "Mark", _uax_db_Mark, NULL},
         {"N", "Number", _uax_db_Number, NULL},
         {"P", "Punctuation", _uax_db_Punctuation, NULL},
@@ -1303,7 +1303,7 @@ regex_char_class_t _regex_char_class_default_import_table[] = {
         {NULL, NULL, NULL, NULL}
 };
 
-regex_char_class_t _subroutine_test = {
+regex_unicode_class_t _subroutine_test = {
         NULL, "test",
         "A-Za-z\\uA000-\\uA0FF",
         //"A-Za-z\\u0123-\\u0138\\uA000-\\uA0FF",
@@ -1311,10 +1311,10 @@ regex_char_class_t _subroutine_test = {
 };
 
 static int _regex_unicode_table_initialized = 0;
-regex_char_class_t *_regex_unicode_charclass_table = NULL;
+regex_unicode_class_t *_regex_unicode_charclass_table = NULL;
 
-int regexRegUnicodeCharClassAdd(regex_char_class_t *utf8class) {
-    regex_char_class_t *walk;
+int regexRegUnicodeCharClassAdd(regex_unicode_class_t *utf8class) {
+    regex_unicode_class_t *walk;
 
     if((utf8class == NULL) || (utf8class->class_string == NULL)) {
         return 0;
@@ -1338,7 +1338,7 @@ int regexRegUnicodeCharClassAdd(regex_char_class_t *utf8class) {
     return 1;
 }
 
-int regexRegUnicodeCharClassAddTable(regex_char_class_t *utf8class) {
+int regexRegUnicodeCharClassAddTable(regex_unicode_class_t *utf8class) {
     int failed = 0;
 
     for(; (utf8class != NULL) && (utf8class->class_string != NULL); utf8class++) {
@@ -1357,7 +1357,7 @@ static int _regexRegUnicodeInitializeTable(void) {
 }
 
 static const char *_regexRegUnicodeCharClassGet(const char *classId, int len) {
-    regex_char_class_t *walk;
+    regex_unicode_class_t *walk;
 
     if(len <= 0) {
         len = (int)strlen(classId);
@@ -1376,7 +1376,7 @@ static const char *_regexRegUnicodeCharClassGet(const char *classId, int len) {
 }
 
 static int _regexRegUnicodeCharClassLookup(const char *classId, int len, const char **name, const char **alias) {
-    regex_char_class_t *walk;
+    regex_unicode_class_t *walk;
 
     if(len <= 0) {
         len = (int)strlen(classId);
@@ -1399,7 +1399,7 @@ static int _regexRegUnicodeCharClassLookup(const char *classId, int len, const c
 }
 
 void regexRegUnicodeCharClassRemove(const char *classId) {
-    regex_char_class_t *entry, *last = NULL;
+    regex_unicode_class_t *entry, *last = NULL;
 
     for(entry = _regex_unicode_charclass_table; entry != NULL; entry = entry->next) {
         if(((entry->alias != NULL) && (!strcmp(entry->alias, classId))) ||
