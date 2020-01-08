@@ -188,12 +188,25 @@ Regex VM Bytecode (v9 - in development)
 
 ///////////////////////////////////////////////////////////////////////////*/
 
+// Build the main test driver stub
 #define MOJO_REGEX_TEST_MAIN
+
+// Build the regex compilation support features of the API
 #define MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+// Build the VM source generation features of the API
 #define MOJO_REGEX_VM_SOURCE_GENERATION
+
+// Include debug diagnostic support in the generated VM image
 #define MOJO_REGEX_VM_DEBUG
+
+// Build the regex evaluation features of the API
 #define MOJO_REGEX_EVALUATE_IMPLEMENTATION
+
+// Include unicode (explicit UTF8) support
 #define MOJO_REGEX_UNICODE
+
+// Build the implementation (if not defined, simply declares symbols)
 #define MOJO_REGEX_IMPLEMENTATION
 
 #include <stdio.h>
@@ -221,8 +234,14 @@ Regex VM Bytecode (v9 - in development)
 #   define MOJO_REGEX_COMPILE_IMPLEMENTATION
 #endif
 
-#if defined(MOJO_REGEX_COMPILE_IMPLEMENTATION) || defined(MOJO_REGEX_VM_DEBUG)
+#if defined(MOJO_REGEX_COMPILE_IMPLEMENTATION) || defined(MOJO_REGEX_VM_DEBUG) || defined(MOJO_REGEX_EVALUATE_IMPLEMENTATION)
+// Build features relevant to compilation and evaluation
 #   define MOJO_REGEX_COMMON_IMPLEMENTATION
+#endif
+
+#if defined(MOJO_REGEX_COMPILE_IMPLEMENTATION) || defined(MOJO_REGEX_VM_DEBUG)
+// Build features relevant to compilation, and debug diagnostics
+#   define MOJO_REGEX_DEBUG_IMPLEMENTATION
 #endif
 
 /////////////////////////////////////////////////////////////////////////////
@@ -255,6 +274,8 @@ struct regex_vm_s {
     int utf8_tbl_size;              // number of bitmaps in the utf8 table
     char **group_table;             // table of subexpression group names
     int group_tbl_size;             // number of groups in the group table
+    int max_call_depth;             // maximum number of nested subroutine calls
+    int max_nested_ranges;          // maximum number of simultaneously nested range quantifiers
     int sub_name_tbl_size;          // always include, for VM compatability even when not compiled in
 #ifdef MOJO_REGEX_VM_DEBUG
     regex_vm_sub_names_t *sub_name_table;
@@ -344,8 +365,22 @@ struct regex_unicode_class_s {
     regex_unicode_class_t *next;
 };
 
+// Adds a unicode property class to the global property class table. Returns 1
+// on success, or 0 if the "alias" or "name" have already been registered.
 int regexRegUnicodeCharClassAdd(regex_unicode_class_t *utf8class);
+
+// Adds an array of unicode property classes to the gloval property class
+// table. Note that the "next" pointer will be overwritten for each entry, the
+// global table will reference the entry memory (do NOT deallocate until you've
+// removed the class from the global table), and the function will read entries
+// until it reaches one with BOTH "alias" AND "name" equal to NULL. This
+// function wraps regexRegUnicodeChasClassAdd(), and short circuits on the first
+// failure.
 int regexRegUnicodeCharClassAddTable(regex_unicode_class_t *utf8class);
+
+// Removes the requested unicode property class from the global property class
+// table. classId is checked against both "alias" and "name", and removes the
+// first match found.
 void regexRegUnicodeCharClassRemove(const char *classId);
 
 // Token flags //////////////////////////////////////////////////////////////
@@ -430,32 +465,63 @@ struct regex_token_s {
     regex_token_t *next;
 };
 
-typedef struct regex_expr_s regex_expr_t;
-struct regex_expr_s {
-    regex_token_t *tokens;
-    regex_token_t *operators;
-    regex_expr_t *parent;
-};
+typedef enum {
+    eReExprSuccess,
+    eReExprEmpty,
+    eReExprUnclosed,
+    eReExprUnusedOperators,
+    eReExprUnusedOperands
+} eReExprStatus_t;
 
 typedef struct regex_build_ctx_s regex_build_ctx_t;
-struct regex_build_ctx_s {
-    regex_token_t *token_pool;
-    regex_ptrlist_t *ptrlist_pool;
-    regex_expr_t *expr_pool;
 
-    regex_vm_t *vm;
+typedef struct regex_expr_s regex_expr_t;
+struct regex_expr_s {
+    regex_build_ctx_t *context;
+    regex_token_t *tokens;
+    regex_token_t *operators;
+    int inline_expr;
+    int open_groups;
+    regex_expr_t *parent;
 };
 
 typedef struct regex_pattern_s regex_pattern_t;
 struct regex_pattern_s {
     const char *pattern;
-    const char *base_pattern;
+    const char *base;
     int pos;
     int len;
     regex_pattern_t *parent;
 };
 
+typedef struct regex_sub_s regex_sub_t;
+struct regex_sub_s {
+    char *name;
+    int index;
+    regex_token_t *expr;
+    regex_sub_t *next;
+};
+
 typedef struct regex_build_s regex_build_t;
+
+struct regex_build_ctx_s {
+    unsigned int flags;
+
+    regex_token_t *token_pool;
+    regex_ptrlist_t *ptrlist_pool;
+    regex_expr_t *expr_pool;
+    regex_pattern_t *pattern_pool;
+    regex_build_t *build_pool;
+    regex_sub_t *sub_pool;
+
+    int next_sub;
+    regex_sub_t *subroutines;
+
+    regex_token_t *expr;
+
+    regex_vm_t *vm;
+};
+
 struct regex_build_s {
     regex_build_ctx_t *context;
     regex_expr_t *expr;
@@ -463,11 +529,375 @@ struct regex_build_s {
     eRegexCompileStatus_t status;
 };
 
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
+#ifdef MOJO_REGEX_EVALUATE_IMPLEMENTATION
+
+typedef struct regex_compound_s regex_compound_t;
+struct regex_compound_s {
+    int subexpr;
+    const char *start;
+    const char *end;
+    regex_compound_t *next;
+};
+
+typedef struct regex_thread_s regex_thread_t;
+struct regex_thread_s {
+    unsigned int pc;
+    int pos;
+    int *callstack;
+    regex_thread_t *next;
+    regex_compound_t *compound;
+    const char **subexprs;
+    char _buffer[0];
+};
+
+typedef struct regex_eval_s regex_eval_t;
+struct regex_eval_s {
+    const char *sp;
+    int start_of_line;
+    int len;
+    int pos;
+    regex_thread_t *thread;
+    regex_thread_t *queue;
+    regex_vm_t *vm;
+    const char **subexprs;
+
+    regex_compound_t *compound_pool;
+    regex_thread_t *thread_pool;
+#ifdef MOJO_REGEX_VM_DEBUG
+    FILE *debug;
+#endif // MOJO_REGEX_VM_DEBUG
+};
+
+typedef enum {
+    eEvalStackOverrun = -3,
+    eEvalInternalError = -2,
+    eEvalOutOfMem = -1,
+    eEvalNoMatch = 0,
+    eEvalMatch = 1,
+    eEvalContinue = 2
+} eReEvalResult;
+
+#endif // MOJO_REGEX_EVALUATE_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+/////////////////////////////////////////////////////////////////////////////
+// Regex token meta details
+/////////////////////////////////////////////////////////////////////////////
+
+typedef enum {
+    ePriorityNone,
+    ePriorityLow,
+    ePriorityMedium,
+    ePriorityHigh
+} eRegexTokenPriority_t;
+
+typedef enum {
+    eReTokNotTerminal = 0,
+    eReTokTerminal,
+    eReTokPreceeding,
+    eReTokNotPreceeding
+} eRegexTokenTerminality_t;
+
+// Emit token details (compilation only) ////////////////////////////////////
+
+typedef void (*regexMetaTokenEmit_t)(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+
+#define RE_META_TOK_EMIT_N(token)   NULL
+#define RE_META_TOK_EMIT_Y(token)   _reMetaTokEmit_ ## token
+#define RE_META_TOK_EMIT(unique,token)  RE_META_TOK_EMIT_ ## unique(token)
+
+void _reMetaTokEmit_eTokenCharLiteral(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+void _reMetaTokEmit_eTokenCharClass(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+void _reMetaTokEmit_eTokenStringLiteral(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+void _reMetaTokEmit_eTokenCharAny(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+void _reMetaTokEmit_eTokenMatch(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+void _reMetaTokEmit_eTokenUtf8Class(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+void _reMetaTokEmit_eTokenCall(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+void _reMetaTokEmit_eTokenAssertion(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+void _reMetaTokEmit_eTokenUtf8Literal(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+void _reMetaTokEmit_eTokenRange(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+void _reMetaTokEmit_eTokenSubExprStart(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+void _reMetaTokEmit_eTokenSave(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
+
+// Emit VM instruction details (compilation and evaluation, debug only) /////
+
+typedef void (*regexMetaVMInstrEmit_t)(FILE *fp, regex_vm_t *vm, int opcode,
+                                       unsigned int operand_a, unsigned int operand_b);
+
+#define RE_META_VM_EMIT_N(token)    NULL
+#define RE_META_VM_EMIT_Y(token)    _reMetaVMEmit_ ## token
+#define RE_META_VM_EMIT(unique,token)  RE_META_VM_EMIT_ ## unique(token)
+
+void _reMetaVMEmit_eTokenCharLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenCharClass(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenStringLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenCharAny(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenMatch(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenSplit(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenJmp(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenSave(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenUtf8Class(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenCall(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenAssertion(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenUtf8Literal(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+// eTokenReturn and eTokenByte have no additional VM metadata to display
+
+#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#ifdef MOJO_REGEX_EVALUATE_IMPLEMENTATION
+
+// Process the VM instruction (evaluation handler) //////////////////////////
+
+typedef eReEvalResult (*regexVMInstr_t)(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+
+#define RE_META_VM_INSTR_N(token)   NULL
+#define RE_META_VM_INSTR_Y(token)   _reVMInstr_ ## token
+#define RE_META_VM_INSTR(unique,token)     RE_META_VM_INSTR_ ## unique(token)
+
+eReEvalResult _reVMInstr_eTokenCharLiteral(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenCharClass(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenStringLiteral(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenCharAny(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenMatch(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenSplit(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenJmp(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenSave(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenUtf8Class(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenCall(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenReturn(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenByte(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenAssertion(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenUtf8Literal(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult _reVMInstr_eTokenRange(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+
+#else // !MOJO_REGEX_EVALUATE_IMPLEMENTATION
+
+#define RE_META_VM_INSTR(unique,token)     NULL
+
+#endif // MOJO_REGEX_EVALUATE_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
+
+// Token meta details table /////////////////////////////////////////////////
+
+typedef struct regex_token_detail_s regex_token_detail_t;
+struct regex_token_detail_s {
+    eRegexToken_t token;
+    int textAdvance;
+    regexVMInstr_t handleInstr;
+#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#ifdef MOJO_REGEX_DEBUG_IMPLEMENTATION
+    const char *name;
+    const char *instr;
+    regexMetaVMInstrEmit_t emitVMInstr;
+#endif // MOJO_REGEX_DEBUG_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
+    regexMetaTokenEmit_t emitToken;
+    eRegexTokenPriority_t priority;
+    eRegexTokenTerminality_t terminal;
+    int arity;
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
+};
+#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+
+#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
+
+#ifndef MOJO_REGEX_COMPILE_IMPLEMENTATION
+#   define RE_TOK_DETAIL(token,advance,handleV,instr,emitV,emitT,priority,terminal,arity) \
+        {token, advance, RE_RE_META_VM_INSTR(handleV,token), #token, instr, RE_META_VM_EMIT(emitV,token)}
+#else // MOJO_REGEX_COMPILE_IMPLEMENTATION
+#   define RE_TOK_DETAIL(token,advance,handleV,instr,emitV,emitT,priority,terminal,arity) \
+        {token, advance, RE_META_VM_INSTR(handleV,token), #token, instr, \
+        RE_META_VM_EMIT(emitV,token), RE_META_TOK_EMIT(emitT,token), \
+        ePriority ## priority, terminal, arity}
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+#define RE_TOK_DETAIL_END RE_TOK_DETAIL(eTokenUnknown, 0, N, "<unknown>", N, N, None, eReTokNotTerminal, 0)
+
+//  Detail                              VM text  VM                   VM    Tok
+//  Table         Token                 advance  hndlr  VM instr      Emit  Emit  Priority  Terminal            Arity
+// -------------  --------------------  -------  -----  ------------  ----  ----  --------  --------            -----
+regex_token_detail_t _regexTokenDetails[] = {
+    RE_TOK_DETAIL(eTokenCharLiteral,    1,       Y,     "char",       Y,    Y,    None,     eReTokTerminal,     1),
+    RE_TOK_DETAIL(eTokenCharClass,      1,       Y,     "class",      Y,    Y,    None,     eReTokTerminal,     0),
+    RE_TOK_DETAIL(eTokenStringLiteral,  1,       Y,     "string",     Y,    Y,    None,     eReTokTerminal,     0),
+    RE_TOK_DETAIL(eTokenCharAny,        1,       Y,     "anychar",    Y,    Y,    None,     eReTokTerminal,     0),
+    RE_TOK_DETAIL(eTokenMatch,          0,       Y,     "match",      Y,    Y,    None,     eReTokNotTerminal,  0),
+    RE_TOK_DETAIL(eTokenSplit,          0,       Y,     "split",      Y,    N,    None,     eReTokNotTerminal,  0),
+    RE_TOK_DETAIL(eTokenJmp,            0,       Y,     "jmp",        Y,    N,    None,     eReTokNotTerminal,  0),
+    RE_TOK_DETAIL(eTokenSave,           0,       Y,     "save",       Y,    Y,    None,     eReTokNotTerminal,  0),
+    RE_TOK_DETAIL(eTokenUtf8Class,      1,       Y,     "utf8class",  Y,    Y,    None,     eReTokTerminal,     0),
+    RE_TOK_DETAIL(eTokenCall,           0,       Y,     "call",       Y,    Y,    None,     eReTokTerminal,     0),
+    RE_TOK_DETAIL(eTokenReturn,         0,       Y,     "return",     N,    N,    None,     eReTokTerminal,     0),
+    RE_TOK_DETAIL(eTokenByte,           1,       Y,     "byte",       N,    N,    None,     eReTokTerminal,     0),
+    RE_TOK_DETAIL(eTokenAssertion,      0,       Y,     "assertion",  Y,    Y,    None,     eReTokTerminal,     0),
+    RE_TOK_DETAIL(eTokenUtf8Literal,    1,       Y,     "utf8literal",Y,    Y,    None,     eReTokTerminal,     0),
+    RE_TOK_DETAIL(eTokenRange,          0,       Y,     "range",      N,    Y,    High,     eReTokPreceeding,   1),
+#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
+    RE_TOK_DETAIL(eTokenConcatenation,  0,       N,     NULL,         N,    N,    Medium,   eReTokNotTerminal,  2),
+    RE_TOK_DETAIL(eTokenAlternative,    0,       N,     NULL,         N,    N,    Medium,   eReTokNotTerminal,  2),
+    RE_TOK_DETAIL(eTokenZeroOrOne,      0,       N,     NULL,         N,    N,    High,     eReTokPreceeding,   1),
+    RE_TOK_DETAIL(eTokenZeroOrMany,     0,       N,     NULL,         N,    N,    High,     eReTokPreceeding,   1),
+    RE_TOK_DETAIL(eTokenOneOrMany,      0,       N,     NULL,         N,    N,    High,     eReTokPreceeding,   1),
+    RE_TOK_DETAIL(eTokenSubExprStart,   0,       N,     NULL,         N,    Y,    Low,      eReTokNotPreceeding,0),
+    RE_TOK_DETAIL(eTokenSubExprEnd,     0,       N,     NULL,         N,    N,    Low,      eReTokPreceeding,   0),
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
+    RE_TOK_DETAIL_END
+};
+#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+
+#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+// Sanity check to ensure that the token table values are properly aligned.
+// If any tokens are not stored at the table index of the token enumeration
+// value, then the table is mis-aligned (developer error), and should be
+// corrected before continuing (hard exit).
+int regexVerifyTokenDetails(void);
+
+// Diagnostic output functions, to enumerate some aspect of the expression state.
+
+// Emits the stringified details of a single token:
+//    1        2                   3               4    5
+// 0x####:eTokenName(token specific attributes){0x####}{0x####}[##]
+//
+//     1: the token struct 2 byte address suffix
+//     2: the token enum name
+//     3: token specific attributes (paren delimited)
+//     4: addresses of linked DFA (a & b) nodes
+//     5: program counter for the token
+//
+// details:
+//     0: only emit the token and attrs, exclude concat nodes
+//     1: emit addr, token, and attrs, exclude concat nodes
+//     2: emit addr, token, and attrs, and include concat nodes
+//     3: emit addr, token, attrs, and program counter, and include concat nodes
+//     4: emit addr, token, attrs, DFA links, and include concat nodes
+int regexTokenStrEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token, int detail);
+
+// Emits the stringified details of a sequence of tokens (using regexTokenStrEmit)
+// Note: this emits the un-sequenced node chain (NOT the DFA chain)
+void regexTokenStrStackEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token, int detail);
+
+// Walks a token stack/tree, and sets all PC entries equal to val
+void regexTokenWalkTree(regex_token_t *token, int val);
+
+// Emits the stringified details of a DFA fragment.
+// Note: this emits the sequenced node chains (NOT the un-sequences token stack)
+void regexTokenStrDFAEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
+
+#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
+
+// Emits a single VM instruction in stringified form
+void regexVMInstrEmit(FILE *fp, regex_vm_t *vm, int pc);
+
+#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+// Determines whether a given token is a terminal operand. Used when comparing
+// two adjacent tokens, the preceeding flag indicates whether the token being
+// checked is leftmost.
+int regexTokenIsTerminal(regex_token_t *token, int preceeding);
+
+// Token priority when applying operators to operands in the shunting yard
+eRegexTokenPriority_t regexGetTokenTypePriority(eRegexToken_t tokenType);
+
+// Operator arity (number of tokens that the operator functions on) in the
+// shunting yard
+int regexGetOperatorArity(regex_token_t *token);
+
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+// Token handling functions /////////////////////////////////////////////////
+
+regex_ptrlist_t *_regexPtrlistCreate(regex_build_ctx_t *context, regex_token_t *token, eRePtrListType_t type);
+regex_ptrlist_t _regexPtrlistAppend(regex_ptrlist_t *list_a, regex_ptrlist_t *list_b);
+int _regexPtrlistPatch(regex_build_ctx_t *context, regex_ptrlist_t **list, regex_token_t *token, int no_jumps);
+void _regexPtrlistFree(regex_build_ctx_t *context, regex_ptrlist_t *list);
+
+regex_token_t *_regexTokenAlloc(regex_build_ctx_t *context, eRegexToken_t tokenType,
+                                const char *str, const unsigned int *bitmap,
+                                int len);
+void _regexTokenDestroy(regex_build_ctx_t *context, regex_token_t *token, int full_stack);
+
+regex_token_t *_regexTokenBaseCreate(regex_build_ctx_t *context, eRegexToken_t tokenType,
+                                     const char *str, const unsigned int *bitmap,
+                                     int len);
+int regexBuildConcatChar(regex_build_t *build, int c, int invert);
+int regexBuildConcatCharClass(regex_build_t *build, unsigned int *bitmap);
+int regexBuildConcatString(regex_build_t *build, const char *str, int len);
+int regexBuildConcatCharAny(regex_build_t *build, int dot_all);
+int regexBuildConcatUtf8Class(regex_build_t *build, int lead_bytes, int mid_high, int mid_low, int invert, unsigned int *bitmap);
+int regexBuildConcatCall(regex_build_t *build, int sub_index);
+int regexBuildConcatByte(regex_build_t *build);
+int regexBuildConcatAssertion(regex_build_t *build, int assertion);
+int regexBuildConcatUtf8Literal(regex_build_t *build, int c, int invert);
+
+int regexBuildGroupStart(regex_build_t *build, const char *name, int name_len,
+                         int no_capture, int compound, const char *subroutine, int sub_len);
+int regexBuildGroupEnd(regex_build_t *build);
+
+int regexBuildWrapSubexpression(regex_build_t *build, , const char *name, int name_len,
+                                int no_capture, int compound, const char *subroutine, int sub_len);
+
+typedef enum {
+    eReQuantifyZeroOrOne,
+    eReQuantifyZeroOrMany,
+    eReQuantifyOneOrMany
+} eReQuantifier_t;
+
+int regexBuildQuantify(regex_build_t *build, eReQuantifier_t quantifier);
+int regexBuildRange(regex_build_t *build, int min, int max);
+
+// Token stream handling functions //////////////////////////////////////////
+
+
+
+
+
+regex_build_ctx_t *regexBuildContextCreate(unsigned int flags);
+void regexBuildContextDestroy(regex_build_ctx_t *context);
+
+int regexExprCreate(regex_build_t *build, int is_inline);
+void regexExprDestroy(regex_expr_t *expr);
+
+int regexPatternCreate(regex_build_t *build, const char *pattern, int len);
+int regexPatternDestroy(regex_build_t *build);
+
 regex_build_t *regexBuildCreate(regex_build_ctx_t *context);
-void regexBuildDestroy(regex_build_t *build);
-regex_expr_t *regexExprCreate(regex_build_t *build);
-int regexExprFinalize(regex_expr_t *expr);
-void regexExprDestroy(regex_build_ctx_t *context, regex_expr_t *expr);
+void regexBuildDestroy(regex_build_t *context);
+
+
+
+
+regex_build_t *regexCompile(const char *pattern, unsigned int flags);
+
+
+
+
+
+
+
+regex_vm_t *regexBuildContextVMGet(regex_build_ctx_t *build);
+
+
+eReExprStatus_t regexExprFinalize(regex_expr_t *expr);
+
+int regexBuildSubexprNextIndexGet(regex_build_t *build);
+int regexBuildSubexprName(regex_build_t *build, int index, const char *name);
+int regexBuildSubexprSet(regex_build_t *build, int index, regex_token_t *tokens);
+
+int regexBuildExprSet(regex_build_t *build);
+int regexBuildExprSubroutine(regex_build_t *build, int index, const char *name);
+
+
+
+
 int regexBuildFinalize(regex_build_t *build);
 
 regex_pattern_t *regexPatternCreate(const char *pattern);
@@ -519,153 +949,18 @@ const char *regexVMSubNameEntryGet(regex_vm_t *vm, int pc);
 const char *regexVMSubAliasEntryGet(regex_vm_t *vm, int pc);
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
 
-#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
-typedef enum {
-    ePriorityNone,
-    ePriorityLow,
-    ePriorityMedium,
-    ePriorityHigh
-} eRegexTokenPriority_t;
 
-typedef enum {
-    eReTokNotTerminal = 0,
-    eReTokTerminal,
-    eReTokPreceeding,
-    eReTokNotPreceeding
-} eRegexTokenTerminality_t;
 
-typedef void (*regexMetaTokenEmit_t)(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
-#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
-typedef void (*regexMetaVMInstrEmit_t)(FILE *fp, regex_vm_t *vm, int opcode,
-                                       unsigned int operand_a, unsigned int operand_b);
 
-typedef struct regex_token_detail_s regex_token_detail_t;
-struct regex_token_detail_s {
-    eRegexToken_t token;
-    const char *name;
-    const char *instr;
-    regexMetaVMInstrEmit_t emitVMInstr;
-#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
-#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
-    regexMetaTokenEmit_t emitToken;
-    eRegexTokenPriority_t priority;
-    eRegexTokenTerminality_t terminal;
-    int arity;
-#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
-#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
-};
-#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
-#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
-#define RE_META_TOK_EMIT_N(token)   NULL
-#define RE_META_TOK_EMIT_Y(token)   _reMetaTokEmit_ ## token
-#define RE_META_TOK_EMIT(unique,token)  RE_META_TOK_EMIT_ ## unique(token)
 
-// token emitters ///////////////////////////////////////////////////////////
 
-void _reMetaTokEmit_eTokenCharLiteral(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void _reMetaTokEmit_eTokenCharClass(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void _reMetaTokEmit_eTokenStringLiteral(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void _reMetaTokEmit_eTokenCharAny(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void _reMetaTokEmit_eTokenMatch(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void _reMetaTokEmit_eTokenUtf8Class(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void _reMetaTokEmit_eTokenCall(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void _reMetaTokEmit_eTokenAssertion(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void _reMetaTokEmit_eTokenUtf8Literal(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void _reMetaTokEmit_eTokenRange(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void _reMetaTokEmit_eTokenSubExprStart(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void _reMetaTokEmit_eTokenSave(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
 
-#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
-#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
 
-#define RE_META_VM_EMIT_N(token)    NULL
-#define RE_META_VM_EMIT_Y(token)    _reMetaVMEmit_ ## token
-#define RE_META_VM_EMIT(unique,token)  RE_META_VM_EMIT_ ## unique(token)
 
-void _reMetaVMEmit_eTokenCharLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenCharClass(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenStringLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenCharAny(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenMatch(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenSplit(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenJmp(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenSave(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenUtf8Class(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenCall(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenAssertion(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenUtf8Literal(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-// eTokenReturn and eTokenByte have no additional VM metadata to display
 
-#ifndef MOJO_REGEX_COMPILE_IMPLEMENTATION
-#   define RE_TOK_DETAIL(token,instr,emitV,emitT,priority,terminal,arity) \
-        {token, #token, instr, RE_META_VM_EMIT(emitV,token)}
-#else // MOJO_REGEX_COMPILE_IMPLEMENTATION
-#   define RE_TOK_DETAIL(token,instr,emitV,emitT,priority,terminal,arity) \
-        {token, #token, instr, RE_META_VM_EMIT(emitV,token), \
-        RE_META_TOK_EMIT(emitT,token), \
-        ePriority ## priority, terminal, arity}
-#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 
-#define RE_TOK_DETAIL_END RE_TOK_DETAIL(eTokenUnknown, "<unknown>", N, N, None, eReTokNotTerminal, 0)
-
-//  Detail        Token                 VM Instr      VM    Tok   Priority  Terminal            Arity
-//  Table         --------------------  ------------  ----  ----  --------  --------            -----
-regex_token_detail_t _regexTokenDetails[] = {
-        RE_TOK_DETAIL(eTokenCharLiteral,    "char",       Y,    Y,    None,     eReTokTerminal,     1),
-        RE_TOK_DETAIL(eTokenCharClass,      "class",      Y,    Y,    None,     eReTokTerminal,     0),
-        RE_TOK_DETAIL(eTokenStringLiteral,  "string",     Y,    Y,    None,     eReTokTerminal,     0),
-        RE_TOK_DETAIL(eTokenCharAny,        "anychar",    Y,    Y,    None,     eReTokTerminal,     0),
-        RE_TOK_DETAIL(eTokenMatch,          "match",      Y,    Y,    None,     eReTokNotTerminal,  0),
-        RE_TOK_DETAIL(eTokenSplit,          "split",      Y,    N,    None,     eReTokNotTerminal,  0),
-        RE_TOK_DETAIL(eTokenJmp,            "jmp",        Y,    N,    None,     eReTokNotTerminal,  0),
-        RE_TOK_DETAIL(eTokenSave,           "save",       Y,    Y,    None,     eReTokNotTerminal,  0),
-        RE_TOK_DETAIL(eTokenUtf8Class,      "utf8class",  Y,    Y,    None,     eReTokTerminal,     0),
-        RE_TOK_DETAIL(eTokenCall,           "call",       Y,    Y,    None,     eReTokTerminal,     0),
-        RE_TOK_DETAIL(eTokenReturn,         "return",     N,    N,    None,     eReTokTerminal,     0),
-        RE_TOK_DETAIL(eTokenByte,           "byte",       N,    N,    None,     eReTokTerminal,     0),
-        RE_TOK_DETAIL(eTokenAssertion,      "assertion",  Y,    Y,    None,     eReTokTerminal,     0),
-        RE_TOK_DETAIL(eTokenUtf8Literal,    "utf8literal",Y,    Y,    None,     eReTokTerminal,     0),
-#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
-#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
-        RE_TOK_DETAIL(eTokenConcatenation,  NULL,         N,    N,    Medium,   eReTokNotTerminal,  2),
-        RE_TOK_DETAIL(eTokenAlternative,    NULL,         N,    N,    Medium,   eReTokNotTerminal,  2),
-        RE_TOK_DETAIL(eTokenZeroOrOne,      NULL,         N,    N,    High,     eReTokPreceeding,   1),
-        RE_TOK_DETAIL(eTokenZeroOrMany,     NULL,         N,    N,    High,     eReTokPreceeding,   1),
-        RE_TOK_DETAIL(eTokenOneOrMany,      NULL,         N,    N,    High,     eReTokPreceeding,   1),
-        RE_TOK_DETAIL(eTokenRange,          NULL,         N,    Y,    High,     eReTokPreceeding,   1),
-        RE_TOK_DETAIL(eTokenSubExprStart,   NULL,         N,    Y,    Low,      eReTokNotPreceeding,0),
-        RE_TOK_DETAIL(eTokenSubExprEnd,     NULL,         N,    N,    Low,      eReTokPreceeding,   0),
-#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
-#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
-        RE_TOK_DETAIL_END
-};
-#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
-#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
-
-int regexVerifyTokenDetails(void);
-// detail: 1 - address, 2 - concatenation, 3 - pc, 4 - DFA pointers
-int regexTokenStrEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token, int detail);
-void regexTokenStrStackEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token, int detail);
-void regexTokenWalkTree(regex_token_t *token, int val);
-void regexTokenStrDFAEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
-void regexVMInstrEmit(FILE *fp, regex_vm_t *vm, int pc);
-
-// Determines whether a given token is a terminal operand. Used when comparing
-// two adjacent tokens, the preceeding flag indicates whether the token being
-// checked is leftmost.
-int regexTokenIsTerminal(regex_token_t *token, int preceeding);
-
-// Token priority when applying operators to operands in the shunting yard
-eRegexTokenPriority_t regexGetTokenTypePriority(eRegexToken_t tokenType);
-
-// Operator arity (number of tokens that the operator functions on) in the
-// shunting yard
-int regexGetOperatorArity(regex_token_t *token);
-
-#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 
 /////////////////////////////////////////////////////////////////////////////
 #ifdef MOJO_REGEX_IMPLEMENTATION
@@ -956,6 +1251,389 @@ void regexRegUnicodeCharClassRemove(const char *classId) {
         last->next = entry->next;
     }
 }
+
+/////////////////////////////////////////////////////////////////////////////
+// Regex token details emit handlers
+/////////////////////////////////////////////////////////////////////////////
+
+void _reMetaTokEmit_eTokenCharLiteral(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+void _reMetaTokEmit_eTokenCharClass(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+void _reMetaTokEmit_eTokenStringLiteral(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+void _reMetaTokEmit_eTokenCharAny(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+void _reMetaTokEmit_eTokenMatch(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+void _reMetaTokEmit_eTokenUtf8Class(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+void _reMetaTokEmit_eTokenCall(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+void _reMetaTokEmit_eTokenAssertion(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+void _reMetaTokEmit_eTokenUtf8Literal(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+void _reMetaTokEmit_eTokenRange(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+void _reMetaTokEmit_eTokenSubExprStart(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+void _reMetaTokEmit_eTokenSave(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Regex token details VM instruction emit handlers
+/////////////////////////////////////////////////////////////////////////////
+
+void _reMetaVMEmit_eTokenCharLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+void _reMetaVMEmit_eTokenCharClass(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+void _reMetaVMEmit_eTokenStringLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+void _reMetaVMEmit_eTokenCharAny(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+void _reMetaVMEmit_eTokenMatch(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+void _reMetaVMEmit_eTokenSplit(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+void _reMetaVMEmit_eTokenJmp(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+void _reMetaVMEmit_eTokenSave(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+void _reMetaVMEmit_eTokenUtf8Class(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+void _reMetaVMEmit_eTokenCall(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+void _reMetaVMEmit_eTokenAssertion(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+void _reMetaVMEmit_eTokenUtf8Literal(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+    // TODO
+}
+
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
+
+/////////////////////////////////////////////////////////////////////////////
+// Regex token details VM instruction evaluation handlers
+/////////////////////////////////////////////////////////////////////////////
+
+eReEvalResult _reVMInstr_eTokenCharLiteral(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenCharClass(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenStringLiteral(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenCharAny(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenMatch(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenSplit(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenJmp(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenSave(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenUtf8Class(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenCall(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenReturn(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenByte(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenAssertion(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenUtf8Literal(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+eReEvalResult _reVMInstr_eTokenRange(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+    // TODO
+    return eEvalNoMatch;
+}
+
+#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+/////////////////////////////////////////////////////////////////////////////
+// Regex token details meta handler functions
+/////////////////////////////////////////////////////////////////////////////
+
+int regexVerifyTokenDetails(void) {
+    // TODO
+    return 0;
+}
+
+int regexTokenStrEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token, int detail) {
+    // TODO
+    return 0;
+}
+
+void regexTokenStrStackEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token, int detail) {
+    // TODO
+}
+
+void regexTokenWalkTree(regex_token_t *token, int val) {
+    // TODO
+}
+
+void regexTokenStrDFAEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token) {
+    // TODO
+}
+
+#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
+
+void regexVMInstrEmit(FILE *fp, regex_vm_t *vm, int pc) {
+    // TODO
+}
+
+#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
+    // TODO
+    return 0;
+}
+
+eRegexTokenPriority_t regexGetTokenTypePriority(eRegexToken_t tokenType) {
+    // TODO
+    return 0;
+}
+
+int regexGetOperatorArity(regex_token_t *token) {
+    // TODO
+    return 0;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Regex compilation handling functions
+/////////////////////////////////////////////////////////////////////////////
+
+regex_build_ctx_t *regexBuildContextCreate(unsigned int flags) {
+    regex_build_ctx_t *context;
+
+    if((context = _regexAlloc(sizeof(regex_build_ctx_t), _regexMemContext)) == NULL) {
+        return NULL;
+    }
+    context->flags = flags;
+
+    return context;
+}
+
+void regexBuildContextDestroy(regex_build_ctx_t *context) {
+    if(context == NULL) {
+        return;
+    }
+    _regexDealloc(context, _regexMemContext);
+}
+
+int regexExprCreate(regex_build_t *build, int is_inline) {
+    regex_expr_t *expr;
+
+    if((build->context != NULL) && (build->context->expr_pool != NULL)) {
+        expr = build->context->expr_pool;
+        build->context->expr_pool = expr->parent;
+        memset(expr, 0, sizeof(regex_expr_t));
+    } else {
+        if((expr = _regexAlloc(sizeof(regex_expr_t), _regexMemContext)) == NULL) {
+            return 0;
+        }
+    }
+    expr->inline_expr = is_inline;
+    expr->context = build->context;
+    expr->parent = build->expr;
+    build->expr = expr;
+    return 1;
+}
+
+void regexExprDestroy(regex_expr_t *expr) {
+    if(expr->context != NULL) {
+        expr->parent = expr->context->expr_pool;
+        expr->context->expr_pool = expr;
+    } else {
+        _regexDealloc(expr, _regexMemContext);
+    }
+}
+
+int regexPatternCreate(regex_build_t *build, const char *pattern, int len) {
+    regex_pattern_t *pat;
+
+    if((build->context != NULL) && (build->context->pattern_pool != NULL)) {
+        pat = build->context->pattern_pool;
+        build->context->pattern_pool = pat->parent;
+        memset(pat, 0, sizeof(regex_pattern_t));
+    } else {
+        if((pat = _regexAlloc(sizeof(regex_pattern_t), _regexMemContext)) == NULL) {
+            return 0;
+        }
+    }
+    pat->pattern = pattern;
+    pat->base = pattern;
+    pat->len = (int)((len == RE_STR_NULL_TERM) ? strlen(pattern) : len);
+    pat->parent = build->pattern;
+    build->pattern = pat;
+    return 1;
+}
+
+int regexPatternDestroy(regex_build_t *build) {
+    regex_pattern_t *pattern;
+
+    if(build->pattern == NULL) {
+        return 0;
+    }
+    pattern = build->pattern;
+    build->pattern = pattern->parent;
+    if(build->context != NULL) {
+        pattern->parent = build->context->pattern_pool;
+        build->context->pattern_pool = pattern;
+    } else {
+        _regexDealloc(pattern, _regexMemContext);
+    }
+}
+
+regex_build_t *regexBuildCreate(regex_build_ctx_t *context) {
+    regex_build_t *build;
+
+    if((build = _regexAlloc(sizeof(regex_build_t), _regexMemContext)) == NULL) {
+        return NULL;
+    }
+    build->context = context;
+    return build;
+}
+
+void regexBuildDestroy(regex_build_t *build) {
+    regex_expr_t *next_expr, *expr;
+    regex_pattern_t *next_pattern, *pattern;
+
+    for(expr = build->expr; expr != NULL; expr = next_expr) {
+        next_expr = expr->parent;
+        regexExprDestroy(expr);
+    }
+    while(build->pattern != NULL) {
+        regexPatternDestroy(build);
+    }
+    if(build->context == NULL) {
+        _regexDealloc(build, _regexMemContext);
+    }
+}
+
+regex_build_t *regexCompile(const char *pattern, unsigned int flags) {
+    regex_build_t *build;
+    regex_build_ctx_t *context;
+
+    if((build = _regexAlloc(sizeof(regex_build_t), _regexMemContext)) == NULL) {
+        return NULL;
+    }
+
+    if((context = regexBuildContextCreate(flags)) == NULL) {
+        build->status = eCompileOutOfMem;
+        return build;
+    }
+    build->context = context;
+
+    if(!regexPatternCreate(build, pattern, RE_STR_NULL_TERM)) {
+        build->status = eCompileOutOfMem;
+        return build;
+    }
+
+    // TODO
+
+    return build;
+}
+
+
+
+
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+
 
 /////////////////////////////////////////////////////////////////////////////
 // VM image management functions

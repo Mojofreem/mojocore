@@ -615,3 +615,56 @@ int regexBuildGroupWrap(regex_build_ctx_t *context, regex_build_t *build, int no
 int regexBuildQuantify(regex_build_ctx_t *context, regex_build_t *build, eReBuildQuantifier_t quantifier, int min, int max);
 int regexBuildFinalize(regex_build_ctx_t *context, regex_build_t *build);
 
+#if 0
+
+workflows:
+
+    api -> dfa
+    pattern -> dfa
+    class -> [node ->] dfa
+    sub -> dfa
+
+    api
+        immediate error
+        unbalanced
+    pattern
+        positional
+        subroutine (external)
+            reference is invalid
+        class (internal)
+        class (external)
+
+    pattern
+
+
+    api - immediate
+    pattern - context
+            pattern
+            position
+            reason
+            class
+                class string
+                position
+                reason
+    subroutine - context
+            pattern
+            position
+            reason
+            class
+                class string
+                position
+                reason
+
+
+    any expression MAY reference:
+        subroutines
+
+
+/*
+
+
+
+
+*/
+
+#endif // 0
