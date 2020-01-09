@@ -36,7 +36,7 @@ Regex VM Bytecode (v9 - in development)
         eTokenByte              B
         eTokenAssertion         C       type specifier
         eTokenUtf8Literal       D       encoding, bits spread across operands
-        <reserved>              E
+        eTokenRange             E       min/max                 program counter
         <reserved>              F
 
     Note about eTokenCharLiteral:
@@ -112,12 +112,13 @@ Regex VM Bytecode (v9 - in development)
 
     Note about eTokenCall:
         This instruction allows common repeating sequences to be factored out
-        into a subroutine. The evaluation implementation is limited to an
-        effective call depth of 5 (to limit thread overhead), so nested calls
-        are limited. The initial design consideration for this feature was
+        into a subroutine. The initial design consideration for this feature was
         to reduce overhead when using unicode character classes, as they
         consist of a generated sub-pattern in and of themselves, due to the
         large and distributed range of branching byte sequence dependencies.
+        Circular calls are not valid, and will result in a compilation failure.
+        The maximum call depth is calculated during compilation, and retained
+        in the VM structure (for creating the per eval thread call stack).
 
     Note about eTokenReturn:
         This instruction returns to the next consecutive instruction following
@@ -171,6 +172,30 @@ Regex VM Bytecode (v9 - in development)
         high two bits (Num) represent the byte encoding (0 - 1 byte, 1 - 2
         byte, 2 - 3 byte, and 3 - 4 byte). The inverse bit (I) will match any
         character other than the one specified.
+
+    Note about eTokenRange:
+
+       +-------------------------------+-------------------------------+
+       |  3                   2        '          1                    |
+       |1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6'5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0|
+       +-------------------------------+-------------------------------+
+       |                              1'                               |
+       |F E D C B A 9 8 7 6 5 4 3 2 1 0'F E D C B A 9 8 7 6 5 4 3 2 1 0|
+       +-------------+-------------+---+-----------------------+-------+
+       |  31 ... 25  |  24 ... 18  |          17 ... 4         | 3...0 |
+       +-------------+-------------+---------------------------+-------+
+       |     min     |     max     |      program counter      |4bit op|
+       +-------------+-------------+---------------------------+-------+
+
+        This instruction implements the range quantifier. The min/max values
+        are encoded in operand A, and operand B encodes the program counter
+        for the initial pattern being quantified. Min/max use 7 bits. Min of
+        0 indicates the pattern is optional, max of 0 indicates that the pattern
+        has no maximum limit. When min is been reached, but max has not, the
+        instruction behaves like a split, creating a thread to continue to the
+        next instruction, while the current thread attempts another iteration
+        of the pattern. When max has been reached, evaluation continues to the
+        next instruction.
 
 ///////////////////////////////////////////////////////////////////////////*/
 
@@ -241,11 +266,64 @@ struct regex_vm_s {
     int utf8_tbl_size;              // number of bitmaps in the utf8 table
     char **group_table;             // table of subexpression group names
     int group_tbl_size;             // number of groups in the group table
+    int max_call_depth;             // maximum subroutine call depth
+    int max_range_nest_depth;       // maximum number of nested range quantifiers
     int sub_name_tbl_size;          // always include, for VM compatability even when not compiled in
 #ifdef MOJO_REGEX_VM_DEBUG
     regex_vm_sub_names_t *sub_name_table;
 #endif // MOJO_REGEX_VM_DEBUG
 };
+
+#ifdef MOJO_REGEX_EVALUATE_IMPLEMENTATION
+
+typedef struct regex_match_s regex_match_t;
+struct regex_match_s {
+    const char *text;
+    int len;
+    const char *pos;
+    regex_vm_t *vm;
+    const char **subexprs;
+    const char ***compound;
+    const char _buffer[0];
+};
+
+typedef struct regex_compound_s regex_compound_t;
+struct regex_compound_s {
+    int subexpr;
+    const char *start;
+    const char *end;
+    regex_compound_t *next;
+};
+
+typedef struct regex_thread_s regex_thread_t;
+struct regex_thread_s {
+    unsigned int pc;
+    int pos;
+    int *callstack;
+    regex_thread_t *next;
+    regex_compound_t *compound;
+    const char **;
+    unsigned char _buffer[0];
+};
+
+typedef struct regex_eval_s regex_eval_t;
+struct regex_eval_s {
+    const char *sp;
+    int start_of_line;
+    int len;
+    int pos;
+    regex_thread_t *thread;
+    regex_thread_t *queue;
+    regex_vm_t *vm;
+    const char **subexprs;
+    regex_compound_t *compound_pool;
+    regex_thread_t *pool;
+#ifdef MOJO_REGEX_VM_DEBUG
+    FILE *debug;
+#endif // MOJO_REGEX_VM_DEBUG
+};
+
+#endif // MOJO_REGEX_EVALUATE_IMPLEMENTATION
 
 // Global memory allocator prototypes. If you change these, be sure and do so
 // BEFORE calling any API functions, or memory management may end up in an
@@ -263,8 +341,8 @@ void regexSetMemoryAllocators(regexMemAllocator_t alloc,
 
 typedef enum {
     // The first tokens map directly to VM opcodes
-            eTokenFirstToken = 0,
-    eTokenCharLiteral = 0,      // 0
+    eTokenFirstToken = 0,
+    eTokenCharLiteral = 0,  // 0
     eTokenCharClass,
     eTokenStringLiteral,
     eTokenCharAny,
@@ -278,14 +356,14 @@ typedef enum {
     eTokenByte,
     eTokenAssertion,
     eTokenUtf8Literal,
+    eTokenRange,
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
     // The remaining tokens are abstractions, and reduce down to the above VM opcodes
-            eTokenConcatenation,
+    eTokenConcatenation,
     eTokenAlternative,
     eTokenZeroOrOne,
     eTokenZeroOrMany,
     eTokenOneOrMany,
-    eTokenRange,
     eTokenSubExprStart,     // 20
     eTokenSubExprEnd,
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
@@ -449,6 +527,73 @@ struct regex_build_s {
     eRegexCompileStatus_t status;
 };
 
+typedef struct regex_builder_s regex_builder_t;
+struct regex_builder_s {
+    regex_build_ctx_t *context;
+    regex_token_t *operands;
+    regex_token_t *operators;
+    regex_pattern_t pattern;
+    regex_builder_t *parent;
+};
+
+typedef enum {
+
+} eReBuilderErr_t;
+
+/*
+
+build ctx
+    builder
+        pattern
+        subroutine
+        token stream
+
+
+
+*/
+eReBuilderErr_t regexCompile(regex_build_ctx_t **context, const char *pattern, int len, unsigned int flags);
+regex_vm_t *regexBuildVMClaim(regex_build_ctx_t *context);
+regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchored);
+void regexMatchFree(regex_match_t *match);
+
+regex_build_ctx_t *regexBuildCreate(void);
+void regexBuildDestroy(regex_build_ctx_t *context);
+
+int regexVMCreate(regex_build_ctx_t *context);
+void regexVMDestroy(regex_vm_t *vm);
+
+int regexBuildVMGenerate(regex_build_ctx_t *context);
+
+regex_builder_t *regexBuilderCreate(regex_build_ctx_t *context);
+void regexBuilderDestroy(regex_builder_t *builder);
+
+int regexBuilderBuild(regex_builder_t *builder);
+eReBuilderErr_t regexBuilderTokenizer(regex_builder_t *builder, const char *pattern);
+eReBuilderErr_t regexBuilderAddToken(regex_builder_t *builder, regex_token_t *token);
+eReBuilderErr_t regexBuilderAddCharLiteral(regex_builder_t *builder, int c, int invert);
+eReBuilderErr_t regexBuilderAddCharClass(regex_builder_t *builder, const char *cls, int len);
+eReBuilderErr_t regexBuilderAddStringLiteral(regex_builder_t *builder, const char *str, int len);
+eReBuilderErr_t regexBuilderAddCharAny(regex_builder_t *builder);
+eReBuilderErr_t regexBuilderAddNamedClass(regex_builder_t *builder, const char *name, int len);
+eReBuilderErr_t regexBuilderAddCall(regex_builder_t *builder, const char *name);
+eReBuilderErr_t regexBuilderAddByte(regex_builder_t *builder);
+eReBuilderErr_t regexBuilderAddAssertion(regex_builder_t *builder, int assertion);
+eReBuilderErr_t regexBuilderAddGroupStart(regex_builder_t *builder, const char *name, int len,
+                                          const char *subroutine, int sub_len, int no_capture, int compound);
+eReBuilderErr_t regexBuilderAddGroupEnd(regex_builder_t *builder);
+eReBuilderErr_t regexBuilderAddBuilder(regex_builder_t *builder, regex_builder_t *src);
+eReBuilderErr_t regexBuilderConcatenate(regex_builder_t *builder);
+eReBuilderErr_t regexBuilderAlternative(regex_builder_t *builder);
+eReBuilderErr_t regexBuilderQuantify(regex_builder_t *builder, regex_token_t *token);
+eReBuilderErr_t regexBuilderQuantifyRange(regex_builder_t *builder, int min, int max);
+eReBuilderErr_t regexBuilderQuantifyZeroOrOne(regex_builder_t *builder);
+eReBuilderErr_t regexBuilderQuantifyZeroOrMany(regex_builder_t *builder);
+eReBuilderErr_t regexBuilderQuantifyOneOrMany(regex_builder_t *builder);
+eReBuilderErr_t regexBuilderWrap(regex_builder_t *builder, const char *name, int name_len,
+                                 const char *subroutine, int sub_len, int no_capture, int compound);
+
+
+
 regex_build_t *regexBuildCreate(regex_build_ctx_t *context);
 void regexBuildDestroy(regex_build_t *build);
 regex_expr_t *regexExprCreate(regex_build_t *build);
@@ -583,6 +728,7 @@ void _reMetaVMEmit_eTokenUtf8Class(FILE *fp, regex_vm_t *vm, int opcode, unsigne
 void _reMetaVMEmit_eTokenCall(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
 void _reMetaVMEmit_eTokenAssertion(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
 void _reMetaVMEmit_eTokenUtf8Literal(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenRange(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
 // eTokenReturn and eTokenByte have no additional VM metadata to display
 
 #ifndef MOJO_REGEX_COMPILE_IMPLEMENTATION
@@ -614,6 +760,7 @@ regex_token_detail_t _regexTokenDetails[] = {
         RE_TOK_DETAIL(eTokenByte,           "byte",       N,    N,    None,     eReTokTerminal,     0),
         RE_TOK_DETAIL(eTokenAssertion,      "assertion",  Y,    Y,    None,     eReTokTerminal,     0),
         RE_TOK_DETAIL(eTokenUtf8Literal,    "utf8literal",Y,    Y,    None,     eReTokTerminal,     0),
+        RE_TOK_DETAIL(eTokenRange,          "range",      Y,    Y,    High,     eReTokPreceeding,   1),
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
         RE_TOK_DETAIL(eTokenConcatenation,  NULL,         N,    N,    Medium,   eReTokNotTerminal,  2),
@@ -621,7 +768,6 @@ regex_token_detail_t _regexTokenDetails[] = {
         RE_TOK_DETAIL(eTokenZeroOrOne,      NULL,         N,    N,    High,     eReTokPreceeding,   1),
         RE_TOK_DETAIL(eTokenZeroOrMany,     NULL,         N,    N,    High,     eReTokPreceeding,   1),
         RE_TOK_DETAIL(eTokenOneOrMany,      NULL,         N,    N,    High,     eReTokPreceeding,   1),
-        RE_TOK_DETAIL(eTokenRange,          NULL,         N,    Y,    High,     eReTokPreceeding,   1),
         RE_TOK_DETAIL(eTokenSubExprStart,   NULL,         N,    Y,    Low,      eReTokNotPreceeding,0),
         RE_TOK_DETAIL(eTokenSubExprEnd,     NULL,         N,    N,    Low,      eReTokPreceeding,   0),
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
@@ -743,10 +889,10 @@ static char *_regexPrefixedStrdup(const char *prefix, const char *str, int len) 
 }
 
 // Performs a comparison of str_a against str_b, with optionally specified lengths.
-// If the string lengths are unequal, then the comparison will never much, but
-// may still be used to order the strings. If either length == RE_STR_NULL_TERM
-// (-1), then the associated string will be measured using strlen(). Comparison
-// is performed using memcmp, allowing inline null characters in the comparison.
+// If the string lengths are unequal, then the comparison will never match. If
+// either length == RE_STR_NULL_TERM (-1), then the associated string will be
+// measured using strlen(). Comparison is performed using memcmp, allowing
+// inline null characters in the comparison.
 static int _regexStrncmp(const unsigned char *str_a, int len_a,
                          const unsigned char *str_b, int len_b) {
     if((str_a == NULL) || (str_b == NULL)) {
@@ -804,7 +950,7 @@ static int _regexPrefixedStrncmp(const unsigned char *prefix,
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
 /////////////////////////////////////////////////////////////////////////////
-// Character class registration functions
+// (global) Character class registration functions
 /////////////////////////////////////////////////////////////////////////////
 
 // Forward declarations of the unicode property classes
@@ -816,7 +962,7 @@ const char _uax_db_Uppercase_Letter[];
 const char _uax_db_Lowercase_Letter[];
 const char _uax_db_Letter[];
 
-regex_unicode_class_t _regex_char_class_default_import_table[] = {
+static regex_unicode_class_t _regex_char_class_default_import_table[] = {
         {"M", "Mark", _uax_db_Mark, NULL},
         {"N", "Number", _uax_db_Number, NULL},
         {"P", "Punctuation", _uax_db_Punctuation, NULL},
@@ -827,7 +973,7 @@ regex_unicode_class_t _regex_char_class_default_import_table[] = {
         {NULL, NULL, NULL, NULL}
 };
 
-regex_unicode_class_t _subroutine_test = {
+static regex_unicode_class_t _subroutine_test = {
         NULL, "test",
         "A-Za-z\\uA000-\\uA0FF",
         //"A-Za-z\\u0123-\\u0138\\uA000-\\uA0FF",
@@ -835,7 +981,7 @@ regex_unicode_class_t _subroutine_test = {
 };
 
 static int _regex_unicode_table_initialized = 0;
-regex_unicode_class_t *_regex_unicode_charclass_table = NULL;
+static regex_unicode_class_t *_regex_unicode_charclass_table = NULL;
 
 int regexRegUnicodeCharClassAdd(regex_unicode_class_t *utf8class) {
     regex_unicode_class_t *walk;
