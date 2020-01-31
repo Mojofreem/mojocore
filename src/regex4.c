@@ -126,7 +126,7 @@ Regex VM Bytecode (v9 - in development)
 
     Note about eTokenByte:
         This instruction explicitly matches any single byte. This differs
-        from both eTokenCharAny in that it always matches newline, and always
+        from eTokenCharAny in that it both always matches newline, and always
         matches a single byte.
 
     Note about eTokenAssertion:
@@ -275,8 +275,10 @@ struct regex_vm_s {
     char **group_table;             // table of subexpression group names
     int group_tbl_size;             // number of groups in the group table
     int max_call_depth;             // maximum number of nested subroutine calls
+                                    // represents the evaluation thread call stack size
     int max_nested_ranges;          // maximum number of simultaneously nested range quantifiers
-    int sub_name_tbl_size;          // always include, for VM compatability even when not compiled in
+                                    // represents the evaluation thread range stack size
+    int sub_name_tbl_size;          // always include, for VM compatibility even when not compiled in
 #ifdef MOJO_REGEX_VM_DEBUG
     regex_vm_sub_names_t *sub_name_table;
 #endif // MOJO_REGEX_VM_DEBUG
@@ -762,7 +764,7 @@ int regexVerifyTokenDetails(void);
 // Diagnostic output functions, to enumerate some aspect of the expression state.
 
 // Emits the stringified details of a single token:
-//    1        2                   3               4    5
+//    1        2                   3               4            5
 // 0x####:eTokenName(token specific attributes){0x####}{0x####}[##]
 //
 //     1: the token struct 2 byte address suffix
@@ -787,7 +789,7 @@ void regexTokenStrStackEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_
 void regexTokenWalkTree(regex_token_t *token, int val);
 
 // Emits the stringified details of a DFA fragment.
-// Note: this emits the sequenced node chains (NOT the un-sequences token stack)
+// Note: this emits the sequenced node chains (NOT the un-sequenced token stack)
 void regexTokenStrDFAEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
 
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
@@ -874,7 +876,9 @@ void regexBuildDestroy(regex_build_t *context);
 
 
 
-
+// Compiles a regex pattern into a VM image, and provides a status value. If the
+// compilation failed, then sufficient context for a detailed diagnostic error
+// response is included in lieu of the VM.
 regex_build_t *regexCompile(const char *pattern, unsigned int flags);
 
 
