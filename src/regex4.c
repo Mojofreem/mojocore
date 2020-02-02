@@ -1107,6 +1107,13 @@ static int _regexPrefixedStrncmp(const unsigned char *prefix,
 /////////////////////////////////////////////////////////////////////////////
 
 // Forward declarations of the unicode property classes
+
+// TODO - inline the base utf8 props classes to ensure this is a true single file library
+//#define MOJO_RE_INLINE_UTF8_PROPS
+#ifndef MOJO_RE_INLINE_UTF8_PROPS
+#include "utf8_props.h"
+#else // MOJO_RE_INLINE_UTF8_PROPS
+
 const char _uax_db_Mark[];
 const char _uax_db_Number[];
 const char _uax_db_Punctuation[];
@@ -1125,6 +1132,8 @@ regex_unicode_class_t _regex_char_class_default_import_table[] = {
         {"L", "Letter", _uax_db_Letter, NULL},
         {NULL, NULL, NULL, NULL}
 };
+
+#endif // MOJO_RE_INLINE_UTF8_PROPS
 
 regex_unicode_class_t _subroutine_test = {
         NULL, "test",
@@ -2641,15 +2650,9 @@ const char *regexVMSubAliasEntryGet(regex_vm_t *vm, int pc) {
 // These property classes were generated from the unicode database by the
 // extract_unicode_props.py script
 
-// TODO - replace these stripped down placeholders with the actual unicode property classes
+// TODO - inline the base utf8 property classes, so that this is a true single file library
 
-const char _uax_db_Mark[] = "\\u05BF\\u05C7\\u0670\\u0711\\u07FD\\u09BC\\u09D7";
-const char _uax_db_Number[] = "\\u00B9\\u2070\\u2CFD\\u3007\\u{10341}";
-const char _uax_db_Punctuation[] = "\\u005F\\u007B\\u007D\\u00A1\\u00A7\\u00AB";
-const char _uax_db_Separator[] = "\\u0020\\u00A0\\u1680\\u202F\\u205F\\u3000";
-const char _uax_db_Uppercase_Letter[] = "\\u0100\\u0102\\u0104\\u0106\\u0108";
-const char _uax_db_Lowercase_Letter[] = "\\u00B5\\u0101\\u0103\\u0105\\u0107";
-const char _uax_db_Letter[] = "\\u00AA\\u00B5\\u00BA\\u02EC\\u02EE\\u037F";
+#include "utf8_props.c"
 
 #endif // MOJO_REGEX_UNICODE
 

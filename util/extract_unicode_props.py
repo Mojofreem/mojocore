@@ -4,6 +4,7 @@ import os.path
 from itertools import groupby
 from functools import reduce
 
+# regex_unicode_class_t _regex_char_class_default_import_table
 
 UAX_DERIVED_GENERAL_CATEGORY = 'DerivedGeneralCategory.txt'
 UAX_DERIVED_CORE_PROPERTIES = 'DerivedCoreProperties.txt'
@@ -345,8 +346,9 @@ def list_details(categories, scripts):
             print()
 
 
-def generate_prefix(fp):
+def emit_prefix(fp):
     print('''/////////////////////////////////////////////////////////////////////////////
+//
 // This file was automatically generated from the UAX unicode database via the
 // extract_unicode_props.py script
 //
@@ -356,7 +358,66 @@ def generate_prefix(fp):
 '''.format(' '.join([os.path.basename(sys.argv[0])] + sys.argv[1:])), file=fp)
 
 
-def generate_source(categories, scripts, properties, script_names, header, source):
+def emit_barrier(fp, name, lead):
+    if lead:
+        print('#ifndef {}'.format(name), file=fp)
+        print('#define {}\n'.format(name), file=fp)
+    else:
+        print('\n#endif // {}'.format(name), file=fp)
+
+
+def emit_table_declaration(fp, table, groups):
+    print('''
+/////////////////////////////////////////////////////////////////////////////
+//
+// This generated table includes the UAX DB definitions for:
+//''', file=fp)
+    longest = 0
+    for group in groups:
+        if len(group[1]) > longest:
+            longest = len(group[1])
+    for group in groups:
+        if group[0] is not None:
+            print("//     {} {} {}".format(group[1], '.' * ((longest - len(group[1])) + 2), group[0]), file=fp)
+        else:
+            print("//     {}".format(group[1]), file=fp)
+    print('''//
+/////////////////////////////////////////////////////////////////////////////
+''', file=fp)
+    print('extern regex_unicode_class_t *{};'.format(table), file=fp)
+
+
+def emit_table_definition(fp, table, groups):
+    print('regex_unicode_class_t _{}[] = {}'.format(table, '{'), file=fp)
+
+    for group in groups:
+        surround = '' if group[0] is None else '"'
+        print('    {{{}{}{}, "{}", _uax_db_{}, NULL}},'.format(surround,
+                                                               group[0] if group[0] is not None else 'NULL',
+                                                               surround, group[1], group[1]), file=fp)
+
+    print('    {NULL, NULL, NULL, NULL}', file=fp)
+
+    print('};\n', file=fp)
+    print('regex_unicode_class_t *{} = _{};'.format(table, table), file=fp)
+
+
+def emit_table_struct_definition(fp):
+    print('''#ifndef regex_unicode_class_t
+typedef struct regex_unicode_class_s regex_unicode_class_t;
+#endif // regex_unicode_class_t
+
+#ifndef regex_unicode_class_s
+struct regex_unicode_class_s {
+    const char *abbreviation;
+    const char *property;
+    const char *class_string;
+    regex_unicode_class_t *next;
+};
+#endif // regex_unicode_class_s''', file=fp)
+
+
+def generate_source(categories, scripts, properties, script_names, header, source, barrier, table):
     if header is None and source is None:
         return True
 
@@ -383,38 +444,11 @@ def generate_source(categories, scripts, properties, script_names, header, sourc
         print("Generating header file [{}]...".format(header))
         try:
             with open(header, 'wt') as fp:
-                generate_prefix(fp)
-                print('''#ifndef _MOJOCORE_UAX_DB_DEFINITIONS_
-#define _MOJOCORE_UAX_DB_DEFINITIONS_
-
-#ifndef mojo_unicode_class_t
-typedef struct mojo_unicode_class_s mojo_unicode_class_t;
-#endif // mojo_unicode_class_t
-
-#ifndef mojo_unicode_class_s
-struct mojo_unicode_class_s {
-    const char *abbreviation;
-    const char *property;
-    const char *class_string;
-    mojo_unicode_class_t *next;
-};
-#endif // mojo_unicode_class_s
-
-''', file=fp)
-                for group in groups:
-                    print('extern const char _uax_db_{}[];'.format(group[1]), file=fp)
-
-                print('\nmojo_unicode_class_t uax_db_import_table[] = {', file=fp)
-
-                for group in groups:
-                    surround = '' if group[0] is None else '"'
-                    print('    {{{}{}{}, "{}", _uax_db_{}, NULL}},'.format(surround,
-                                                                     group[0] if group[0] is not None else 'NULL',
-                                                                     surround, group[1], group[1]), file=fp)
-
-                print('    {NULL, NULL, NULL, NULL}', file=fp)
-
-                print('};\n\n#endif // _MOJOCORE_UAX_DB_DEFINITIONS_', file=fp)
+                emit_prefix(fp)
+                emit_barrier(fp, barrier, lead=True)
+                emit_table_struct_definition(fp)
+                emit_table_declaration(fp, table, groups)
+                emit_barrier(fp, barrier, lead=False)
         except Exception as ex:
             eprint("ERROR: Unable to write header file [{}] output: {}".format(header, str(ex)))
             return False
@@ -423,12 +457,13 @@ struct mojo_unicode_class_s {
         print("Generating source file [{}]...".format(source))
         try:
             with open(source, 'wt') as fp:
-                generate_prefix(fp)
+                emit_prefix(fp)
                 for group in groups:
                     lead = 'const char _uax_db_{}[] = '.format(group[1])
                     print(lead, end='', file=fp)
                     group[2].generate_source_string(fp, MAX_LINE_LEN, len(lead))
                     print('', file=fp)
+                emit_table_definition(fp, table, groups)
         except Exception as ex:
             eprint("ERROR: Unable to write source file [{}] output: {}".format(source, str(ex)))
             return False
@@ -445,6 +480,12 @@ def parser_script():
     parser.add_argument('-s', '--source', type=str, action='store', default=None,
                         dest='source', metavar='FILE',
                         help='C style source file to generate for the parsed data')
+    parser.add_argument('-b', '--barrier', type=str, action='store', default='_REGEX_UAX_DB_DEFINITIONS_',
+                        dest='barrier', metavar='NAME',
+                        help='C include barrier definition name')
+    parser.add_argument('-t', '--table', type=str, action='store', default='_regex_char_class_import_table',
+                        dest='table', metavar='NAME',
+                        help='Symbol name for the generated property class table')
     parser.add_argument('-p', '--property', type=str, action='append',
                         metavar='PROP', dest='properties', default=[],
                         help='Unicode property class to parse')
@@ -483,7 +524,7 @@ def parser_script():
     if args.listing:
         list_details(categories, scripts)
 
-    if not generate_source(categories, scripts, args.properties, args.scripts, args.header, args.source):
+    if not generate_source(categories, scripts, args.properties, args.scripts, args.header, args.source, args.barrier, args.table):
         return False
 
     return True
