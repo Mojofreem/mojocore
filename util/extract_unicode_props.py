@@ -345,6 +345,17 @@ def list_details(categories, scripts):
             print()
 
 
+def generate_prefix(fp):
+    print('''/////////////////////////////////////////////////////////////////////////////
+// This file was automatically generated from the UAX unicode database via the
+// extract_unicode_props.py script
+//
+// Invocation: {}
+//
+/////////////////////////////////////////////////////////////////////////////
+'''.format(' '.join([os.path.basename(sys.argv[0])] + sys.argv[1:])), file=fp)
+
+
 def generate_source(categories, scripts, properties, script_names, header, source):
     if header is None and source is None:
         return True
@@ -372,10 +383,8 @@ def generate_source(categories, scripts, properties, script_names, header, sourc
         print("Generating header file [{}]...".format(header))
         try:
             with open(header, 'wt') as fp:
-                print('''// This file was automatically generated from the UAX unicode database
-// via the extract_unicode_props.py script
-
-#ifndef _MOJOCORE_UAX_DB_DEFINITIONS_
+                generate_prefix(fp)
+                print('''#ifndef _MOJOCORE_UAX_DB_DEFINITIONS_
 #define _MOJOCORE_UAX_DB_DEFINITIONS_
 
 #ifndef mojo_unicode_class_t
@@ -389,7 +398,7 @@ struct mojo_unicode_class_s {
     const char *class_string;
     mojo_unicode_class_t *next;
 };
-#endif // mojo_unicode_class_s        
+#endif // mojo_unicode_class_s
 
 ''', file=fp)
                 for group in groups:
@@ -414,6 +423,7 @@ struct mojo_unicode_class_s {
         print("Generating source file [{}]...".format(source))
         try:
             with open(source, 'wt') as fp:
+                generate_prefix(fp)
                 for group in groups:
                     lead = 'const char _uax_db_{}[] = '.format(group[1])
                     print(lead, end='', file=fp)
