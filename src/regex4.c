@@ -110,6 +110,24 @@ Regex VM Bytecode (v9 - in development)
         10 - 4 byte encoding, seperate leading high byte (midhigh, midlow, low)
         11 - unused
 
+        Rationale: prior to this instruction, a UTF8 class was constructed
+        using multiple eTokenSplits and eTokenCharLiterals. This compound
+        instruction can help reduce instruction count. Trivialized example:
+
+        AB,AC,DE
+
+        split -> D -> [E] -------+-+--> match
+          |                      ^ ^
+          +-> A -> split -> [B] -+ |               9 instructions
+                     |             |    (splits incur a jmp penalty to converge)
+                     +-> [C] ------+
+
+        split -> D[E] -------+-+--> match
+          |                  ^ ^
+          +-> split -> A[B] -+ |                  7 instructions
+                |              |
+                +-> A[C] ------+
+
     Note about eTokenCall:
         This instruction allows common repeating sequences to be factored out
         into a subroutine. The evaluation implementation is limited to an
@@ -349,6 +367,7 @@ typedef enum {
     eCompileConflictingAttrs,
     eCompileUnknownSubroutine,
     eCompileSubroutineNameCollision,
+    eCompileMissingPattern,
     eCompileInternalError
 } eRegexCompileStatus_t;
 
@@ -366,6 +385,15 @@ struct regex_unicode_class_s {
     const char *class_string;
     regex_unicode_class_t *next;
 };
+
+#define RE_FLAG_DOT_ALL     0x1u
+
+#define META_CLASS_DIGITS_PATTERN           "0-9"
+#define META_CLASS_INV_DIGITS_PATTERN       "^0-9"
+#define META_CLASS_WHITESPACE_PATTERN       " \\t\\f\\v\\r"
+#define META_CLASS_INV_WHITESPACE_PATTERN   "^ \\t\\f\\v\\r"
+#define META_CLASS_WORD_PATTERN             "a-zA-Z0-9_"
+#define META_CLASS_INV_WORD_PATTERN         "^a-zA-Z0-9_"
 
 // Adds a unicode property class to the global property class table. Returns 1
 // on success, or 0 if the "alias" or "name" have already been registered.
@@ -402,7 +430,7 @@ void regexRegUnicodeCharClassRemove(const char *classId);
 
 // Parses a utf8 encoded string sequence, and returns the codepoint value.
 // Returns -1 if the str is not a multibyte utf8 encoded sequence.
-int parseUtf8DecodeSequence(const char *str);
+int _parseUtf8DecodeSequence(const char *str);
 
 // Token flags //////////////////////////////////////////////////////////////
 
@@ -496,10 +524,13 @@ struct regex_token_s {
 
 typedef enum {
     eReExprSuccess,
+    eReExprOutOfMemory,
     eReExprEmpty,
     eReExprUnclosed,
     eReExprUnusedOperators,
-    eReExprUnusedOperands
+    eReExprUnusedOperands,
+    eReExprMissingOperand,
+    eReExprInternalError
 } eReExprStatus_t;
 
 typedef struct regex_build_ctx_s regex_build_ctx_t;
@@ -509,9 +540,11 @@ struct regex_expr_s {
     regex_build_ctx_t *context;
     regex_token_t *tokens;
     regex_token_t *operators;
-    int inline_expr;
     int open_groups;
-    regex_expr_t *parent;
+    union {
+        regex_expr_t *parent;
+        regex_expr_t *next;
+    };
 };
 
 typedef struct regex_pattern_s regex_pattern_t;
@@ -520,7 +553,10 @@ struct regex_pattern_s {
     const char *base;
     int pos;
     int len;
-    regex_pattern_t *parent;
+    union {
+        regex_pattern_t *parent;
+        regex_pattern_t *next;
+    };
 };
 
 typedef struct regex_sub_s regex_sub_t;
@@ -538,6 +574,8 @@ struct regex_build_ctx_s {
 
     regex_token_t *token_pool;
     regex_ptrlist_t *ptrlist_pool;
+    regex_pattern_t *pattern_pool;
+    regex_expr_t  *expr_pool;
 
     int next_sub;
     regex_sub_t *subroutines;
@@ -643,6 +681,21 @@ void _reMetaTokEmit_eTokenRange(FILE *fp, regex_build_ctx_t *build_ctx, regex_to
 void _reMetaTokEmit_eTokenSubExprStart(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
 void _reMetaTokEmit_eTokenSave(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
 
+// Apply operators to tokens in shunting yard implementation (compilation only)
+
+typedef int (*regexMetaApplyOperator_t)(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator);
+
+#define RE_META_IS_OPERATOR_N(token)    NULL
+#define RE_META_IS_OPERATOR_Y(token)    _reMetaApplyOp_ ## token
+#define RE_META_IS_OPERATOR(unique,token)   RE_META_IS_OPERATOR_ ## unique(token)
+
+int _reMetaApplyOp_eTokenRange(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator);
+int _reMetaApplyOp_eTokenConcatenation(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator);
+int _reMetaApplyOp_eTokenAlternative(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator);
+int _reMetaApplyOp_eTokenZeroOrOne(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator);
+int _reMetaApplyOp_eTokenZeroOrMany(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator);
+int _reMetaApplyOp_eTokenOneOrMany(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator);
+
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
 
@@ -720,6 +773,7 @@ struct regex_token_detail_s {
     regexMetaTokenEmit_t emitToken;
     eRegexTokenPriority_t priority;
     eRegexTokenTerminality_t terminal;
+    regexMetaApplyOperator_t operator;
     int arity;
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
@@ -727,45 +781,45 @@ struct regex_token_detail_s {
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
 
 #ifndef MOJO_REGEX_COMPILE_IMPLEMENTATION
-#   define RE_TOK_DETAIL(token,advance,handleV,instr,emitV,emitT,priority,terminal,arity) \
+#   define RE_TOK_DETAIL(token,advance,handleV,instr,emitV,emitT,priority,terminal,operator,arity) \
         {token, advance, RE_RE_META_VM_INSTR(handleV,token), #token, instr, RE_META_VM_EMIT(emitV,token)}
 #else // MOJO_REGEX_COMPILE_IMPLEMENTATION
-#   define RE_TOK_DETAIL(token,advance,handleV,instr,emitV,emitT,priority,terminal,arity) \
+#   define RE_TOK_DETAIL(token,advance,handleV,instr,emitV,emitT,priority,terminal,operator,arity) \
         {token, advance, RE_META_VM_INSTR(handleV,token), #token, instr, \
         RE_META_VM_EMIT(emitV,token), RE_META_TOK_EMIT(emitT,token), \
-        ePriority ## priority, terminal, arity}
+        ePriority ## priority, terminal, RE_META_IS_OPERATOR(operator,token), arity}
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 
-#define RE_TOK_DETAIL_END RE_TOK_DETAIL(eTokenUnknown, 0, N, "<unknown>", N, N, None, eReTokNotTerminal, 0)
+#define RE_TOK_DETAIL_END RE_TOK_DETAIL(eTokenUnknown, 0, N, "<unknown>", N, N, None, eReTokNotTerminal, N, 0)
 
-//  Detail                              VM text  VM                   VM    Tok
-//  Table         Token                 advance  hndlr  VM instr      Emit  Emit  Priority  Terminal            Arity
-// -------------  --------------------  -------  -----  ------------  ----  ----  --------  --------            -----
+//  Detail                              VM text  VM                   VM    Tok                                 Is
+//  Table         Token                 advance  hndlr  VM instr      Emit  Emit  Priority  Terminal            Operator  Arity
+// -------------  --------------------  -------  -----  ------------  ----  ----  --------  --------            --------  -----
 regex_token_detail_t _regexTokenDetails[] = {
-    RE_TOK_DETAIL(eTokenCharLiteral,    1,       Y,     "char",       Y,    Y,    None,     eReTokTerminal,     1),
-    RE_TOK_DETAIL(eTokenCharClass,      1,       Y,     "class",      Y,    Y,    None,     eReTokTerminal,     0),
-    RE_TOK_DETAIL(eTokenStringLiteral,  1,       Y,     "string",     Y,    Y,    None,     eReTokTerminal,     0),
-    RE_TOK_DETAIL(eTokenCharAny,        1,       Y,     "anychar",    Y,    Y,    None,     eReTokTerminal,     0),
-    RE_TOK_DETAIL(eTokenMatch,          0,       Y,     "match",      Y,    Y,    None,     eReTokNotTerminal,  0),
-    RE_TOK_DETAIL(eTokenSplit,          0,       Y,     "split",      Y,    N,    None,     eReTokNotTerminal,  0),
-    RE_TOK_DETAIL(eTokenJmp,            0,       Y,     "jmp",        Y,    N,    None,     eReTokNotTerminal,  0),
-    RE_TOK_DETAIL(eTokenSave,           0,       Y,     "save",       Y,    Y,    None,     eReTokNotTerminal,  0),
-    RE_TOK_DETAIL(eTokenUtf8Class,      1,       Y,     "utf8class",  Y,    Y,    None,     eReTokTerminal,     0),
-    RE_TOK_DETAIL(eTokenCall,           0,       Y,     "call",       Y,    Y,    None,     eReTokTerminal,     0),
-    RE_TOK_DETAIL(eTokenReturn,         0,       Y,     "return",     N,    N,    None,     eReTokTerminal,     0),
-    RE_TOK_DETAIL(eTokenByte,           1,       Y,     "byte",       N,    N,    None,     eReTokTerminal,     0),
-    RE_TOK_DETAIL(eTokenAssertion,      0,       Y,     "assertion",  Y,    Y,    None,     eReTokTerminal,     0),
-    RE_TOK_DETAIL(eTokenUtf8Literal,    1,       Y,     "utf8literal",Y,    Y,    None,     eReTokTerminal,     0),
-    RE_TOK_DETAIL(eTokenRange,          0,       Y,     "range",      N,    Y,    High,     eReTokPreceeding,   1),
+    RE_TOK_DETAIL(eTokenCharLiteral,    1,       Y,     "char",       Y,    Y,    None,     eReTokTerminal,     N,        0),
+    RE_TOK_DETAIL(eTokenCharClass,      1,       Y,     "class",      Y,    Y,    None,     eReTokTerminal,     N,        0),
+    RE_TOK_DETAIL(eTokenStringLiteral,  1,       Y,     "string",     Y,    Y,    None,     eReTokTerminal,     N,        0),
+    RE_TOK_DETAIL(eTokenCharAny,        1,       Y,     "anychar",    Y,    Y,    None,     eReTokTerminal,     N,        0),
+    RE_TOK_DETAIL(eTokenMatch,          0,       Y,     "match",      Y,    Y,    None,     eReTokNotTerminal,  N,        0),
+    RE_TOK_DETAIL(eTokenSplit,          0,       Y,     "split",      Y,    N,    None,     eReTokNotTerminal,  N,        0),
+    RE_TOK_DETAIL(eTokenJmp,            0,       Y,     "jmp",        Y,    N,    None,     eReTokNotTerminal,  N,        0),
+    RE_TOK_DETAIL(eTokenSave,           0,       Y,     "save",       Y,    Y,    None,     eReTokNotTerminal,  N,        0),
+    RE_TOK_DETAIL(eTokenUtf8Class,      1,       Y,     "utf8class",  Y,    Y,    None,     eReTokTerminal,     N,        0),
+    RE_TOK_DETAIL(eTokenCall,           0,       Y,     "call",       Y,    Y,    None,     eReTokTerminal,     N,        0),
+    RE_TOK_DETAIL(eTokenReturn,         0,       Y,     "return",     N,    N,    None,     eReTokTerminal,     N,        0),
+    RE_TOK_DETAIL(eTokenByte,           1,       Y,     "byte",       N,    N,    None,     eReTokTerminal,     N,        0),
+    RE_TOK_DETAIL(eTokenAssertion,      0,       Y,     "assertion",  Y,    Y,    None,     eReTokTerminal,     N,        0),
+    RE_TOK_DETAIL(eTokenUtf8Literal,    1,       Y,     "utf8literal",Y,    Y,    None,     eReTokTerminal,     N,        0),
+    RE_TOK_DETAIL(eTokenRange,          0,       Y,     "range",      N,    Y,    High,     eReTokPreceeding,   Y,        1),
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
-    RE_TOK_DETAIL(eTokenConcatenation,  0,       N,     NULL,         N,    N,    Medium,   eReTokNotTerminal,  2),
-    RE_TOK_DETAIL(eTokenAlternative,    0,       N,     NULL,         N,    N,    Medium,   eReTokNotTerminal,  2),
-    RE_TOK_DETAIL(eTokenZeroOrOne,      0,       N,     NULL,         N,    N,    High,     eReTokPreceeding,   1),
-    RE_TOK_DETAIL(eTokenZeroOrMany,     0,       N,     NULL,         N,    N,    High,     eReTokPreceeding,   1),
-    RE_TOK_DETAIL(eTokenOneOrMany,      0,       N,     NULL,         N,    N,    High,     eReTokPreceeding,   1),
-    RE_TOK_DETAIL(eTokenSubExprStart,   0,       N,     NULL,         N,    Y,    Low,      eReTokNotPreceeding,0),
-    RE_TOK_DETAIL(eTokenSubExprEnd,     0,       N,     NULL,         N,    N,    Low,      eReTokPreceeding,   0),
+    RE_TOK_DETAIL(eTokenConcatenation,  0,       N,     NULL,         N,    N,    Medium,   eReTokNotTerminal,  Y,        2),
+    RE_TOK_DETAIL(eTokenAlternative,    0,       N,     NULL,         N,    N,    Medium,   eReTokNotTerminal,  Y,        2),
+    RE_TOK_DETAIL(eTokenZeroOrOne,      0,       N,     NULL,         N,    N,    High,     eReTokPreceeding,   Y,        1),
+    RE_TOK_DETAIL(eTokenZeroOrMany,     0,       N,     NULL,         N,    N,    High,     eReTokPreceeding,   Y,        1),
+    RE_TOK_DETAIL(eTokenOneOrMany,      0,       N,     NULL,         N,    N,    High,     eReTokPreceeding,   Y,        1),
+    RE_TOK_DETAIL(eTokenSubExprStart,   0,       N,     NULL,         N,    Y,    Low,      eReTokNotPreceeding,N,        0),
+    RE_TOK_DETAIL(eTokenSubExprEnd,     0,       N,     NULL,         N,    N,    Low,      eReTokPreceeding,   N,        0),
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
     RE_TOK_DETAIL_END
@@ -871,7 +925,7 @@ regex_token_t *_regexTokenBaseCreate(regex_build_t *build, eRegexToken_t tokenTy
 
 int regexBuildConcatChar(regex_build_t *build, int c, int invert);
 int regexBuildConcatCharClass(regex_build_t *build, unsigned int *bitmap);
-int regexBuildConcatString(regex_build_t *build, char *str, int len);
+int regexBuildConcatString(regex_build_t *build, const char *str, int len);
 int regexBuildConcatCharAny(regex_build_t *build, int dot_all);
 int regexBuildConcatUtf8Class(regex_build_t *build, int lead_bytes, int mid_high, int mid_low, int invert, unsigned int *bitmap);
 int regexBuildConcatCall(regex_build_t *build, int sub_index);
@@ -898,6 +952,71 @@ int regexBuildAlternative(regex_build_t *build);
 
 // TODO: match, split, jmp, save, return
 
+// Pattern parsing handling functions ///////////////////////////////////////
+
+typedef enum {
+    eRegexPatternEnd = 0,           // Reached the end of the pattern string '\0'
+    eRegexPatternChar,              // A valid pattern character (0-256)
+    eRegexPatternUnicode,           // A unicode utf8 escaped character
+    eRegexPatternInvalid,           // An unknown escape value
+    eRegexPatternInvalidEscape,     // An invalid escape value (malformed)
+    eRegexPatternMetaChar,          // A metacharacter
+    eRegexPatternMetaClass,         // A meta-class (ie., \d, \s, \w)
+    eRegexPatternUnicodeMetaClass,  // A utf8 meta-class (ie., \p{...})
+    eRegexPatternEscapedChar        // An escaped character (literal metachar, C escapes)
+} eRegexPatternCharState_t;
+
+typedef struct parseChar_s parseChar_t;
+struct parseChar_s {
+    eRegexPatternCharState_t state; // identity of the parsed value
+    const char *ptr;    // pointer to the position in the pattern that the char was parsed from
+    int len;    // length of the parse value (for position advance)
+    int c;  // parsed character value
+};
+
+typedef enum {
+    eRegexPatternIdOk,
+    eRegexPatternIdMalformed,
+    eRegexPatternIdMissing
+} eRegexPatternId_t;
+
+typedef struct parse_str_s parse_str_t;
+struct parse_str_s {
+    int characters;
+    int bytes;
+};
+
+static int _parseIsHexDigit(char c);
+static int _parseHexValueGet(char c);
+static int _parseIsIdChar(char c);
+static int _parseHexValueStr(const char *str, int len, unsigned int *value);
+
+// Validates that pattern points to a valid range quantifier (ie., "{3,6}").
+// Returns 0 if false, or the length of the quantifier (excluding delimiters)
+// if true.
+static int _parseRangeQuantifier(const char *pattern, int *min, int *max);
+static void _parseCharEmit(FILE *fp, parseChar_t *pc);
+static int _parsePatternIsValid(parseChar_t *pc);
+static void _parsePatternCharAdvance(const char **pattern, parseChar_t *pc);
+static void _parsePatternCharBacktrack(const char **pattern, parseChar_t *pc);
+static int _parseCheckNextPatternChar(const char **pattern, char c);
+
+// Attempts to parse an identifier delimited by start and end. On success, sets
+// id to the position of the start of the identifier, and len to the total length
+// of the identifier. Note that len does NOT include the delimiters. Only
+// characters within the char class [A-Za-z0-9_-] are valid for the identifier.
+// Returns:
+//     eRegexPatternIdOk - an id was found
+//     eRegexPatternIdMissing - the start delimiter was NOT found
+//     eRegexPatternIdMalformed - the id contained invalid characters (not in
+//                      [A-Za-z0-9_-]), the end delimiter was missing, or the
+//                      delimiters were empty
+static eRegexPatternId_t _parseCheckIdentifier(const char *pattern,
+                                               int start, int end, const char **id, int *len);
+static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brace,
+                                            const char **id, int *len);
+static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build);
+
 // Token stream handling functions //////////////////////////////////////////
 
 regex_build_ctx_t *regexBuildContextCreate(unsigned int flags);
@@ -907,8 +1026,8 @@ regex_build_t *regexBuildCreate(regex_build_ctx_t *context);
 void regexBuildDestroy(regex_build_t *build);
 int regexBuildFinalize(regex_build_t *build);
 
-int regexExprCreate(regex_build_t *build, int is_inline);
-int _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token);;
+int regexExprCreate(regex_build_t *build);
+eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token);;
 eReExprStatus_t regexExprFinalize(regex_expr_t *expr);
 void regexExprDestroy(regex_expr_t *expr);
 
@@ -931,6 +1050,7 @@ int regexBuildExprSubroutine(regex_build_t *build, int index, const char *name);
 #endif // 0
 
 regex_vm_t *regexVMCreate(regex_build_t *build);
+int regexVMGenerate(regex_build_t *build);
 void regexVMDestroy(regex_vm_t *vm);
 int regexVMStringTableEntryAdd(regex_build_t *build, char *str, int len);
 int regexVMCharClassEntryAdd(regex_build_t *build, unsigned int *bitmap);
@@ -1226,9 +1346,21 @@ void regexRegUnicodeCharClassRemove(const char *classId) {
 // UTF8 handling support functions
 /////////////////////////////////////////////////////////////////////////////
 
+// Returns the number of bytes required to utf8 encode the codepoint c
+static int _parseUtf8EncodingByteLen(int c) {
+    if(c > 65535) {
+        return 4;
+    } else if(c >2047) {
+        return 3;
+    } else if(c > 127) {
+        return 2;
+    }
+    return 1;
+}
+
 // Parses a utf8 encoded string sequence, and returns the codepoint value.
 // Returns -1 if the str is not a multibyte utf8 encoded sequence.
-int parseUtf8DecodeSequence(const char *str) {
+int _parseUtf8DecodeSequence(const char *str) {
     if(((unsigned)str[0] & UTF8_TWO_BYTE_MASK) == UTF8_TWO_BYTE_PREFIX) {
         if(((unsigned)str[1] & UTF8_LOW_BYTE_MASK) == UTF8_LOW_BYTE_PREFIX) {
             // two byte utf8
@@ -1327,7 +1459,7 @@ static void _regexEscapedStrEmit(FILE *fp, const char *str, int len) {
     }
     for(k = 0; k < len; k++) {
         // Check for utf8 encoding
-        if((codepoint = parseUtf8DecodeSequence(str + k)) != -1) {
+        if((codepoint = _parseUtf8DecodeSequence(str + k)) != -1) {
             if(codepoint > 0xFFFF) {
                 k += 3;
                 fprintf(fp, "\\u{%04X}", codepoint);
@@ -1497,6 +1629,40 @@ void _reMetaTokEmit_eTokenSave(FILE *fp, regex_build_ctx_t *build_ctx, regex_tok
         fprintf(fp, ":named(%s)", name);
     }
 #endif
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Apply operators to tokens in shunting yard implementation (compilation only)
+/////////////////////////////////////////////////////////////////////////////
+
+int _reMetaApplyOp_eTokenRange(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
+    // TODO
+    return 0;
+}
+
+int _reMetaApplyOp_eTokenConcatenation(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
+    // TODO
+    return 0;
+}
+
+int _reMetaApplyOp_eTokenAlternative(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
+    // TODO
+    return 0;
+}
+
+int _reMetaApplyOp_eTokenZeroOrOne(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
+    // TODO
+    return 0;
+}
+
+int _reMetaApplyOp_eTokenZeroOrMany(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
+    // TODO
+    return 0;
+}
+
+int _reMetaApplyOp_eTokenOneOrMany(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
+    // TODO
+    return 0;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -2015,16 +2181,6 @@ void _regexTokenDestroy(regex_build_ctx_t *context, regex_token_t *token, int fu
     }
 }
 
-static void _regexPushOperand(regex_build_t *build, regex_token_t *token) {
-    token->next = build->expr->tokens;
-    build->expr->tokens = token;
-}
-
-static void _regexPushOperator(regex_build_t *build, regex_token_t *token) {
-    token->next = build->expr->operators;
-    build->expr->operators = token;
-}
-
 regex_token_t *_regexTokenBaseCreate(regex_build_t *build,
                                      eRegexToken_t tokenType,
                                      const void *str, const void *ptr,
@@ -2041,9 +2197,13 @@ regex_token_t *_regexTokenBaseCreate(regex_build_t *build,
             _regexTokenDestroy(build->context, token, 0);
             return NULL;
         }
-        _regexPushOperator(build, concat);
+        if(!_regexExprTokenPush(build->expr, concat)) {
+            return NULL;
+        }
     }
-    _regexPushOperand(build, token);
+    if(!_regexExprTokenPush(build->expr, token)) {
+        return NULL;
+    }
     return token;
 }
 
@@ -2063,8 +2223,13 @@ int regexBuildConcatCharClass(regex_build_t *build, unsigned int *bitmap) {
     return _regexTokenBaseCreate(build, eTokenCharClass, NULL, bitmap, 32) != NULL;
 }
 
-int regexBuildConcatString(regex_build_t *build, char *str, int len) {
-    return _regexTokenBaseCreate(build, eTokenStringLiteral, str, NULL, len) != NULL;
+int regexBuildConcatString(regex_build_t *build, const char *str, int len) {
+    char *ptr;
+
+    if((ptr = _regexStrdup(str, len)) == NULL) {
+        return 0;
+    }
+    return _regexTokenBaseCreate(build, eTokenStringLiteral, ptr, NULL, len) != NULL;
 }
 
 int regexBuildConcatCharAny(regex_build_t *build, int dot_all) {
@@ -2177,7 +2342,9 @@ int regexBuildQuantify(regex_build_t *build, eReQuantifier_t quantifier) {
     if((token = _regexAllocToken(build->context, type, NULL, NULL, 0)) == NULL) {
         return 0;
     }
-    _regexPushOperator(build, token);
+    if(!_regexExprTokenPush(build->expr, token)) {
+        return 0;
+    }
     return 1;
 }
 
@@ -2188,7 +2355,9 @@ int regexBuildRange(regex_build_t *build, int min, int max) {
     }
     token->min = min;
     token->max = max;
-    _regexPushOperator(build, token);
+    if(!_regexExprTokenPush(build->expr, token)) {
+        return 0;
+    }
     return 1;
 }
 
@@ -2198,11 +2367,791 @@ int _regexBuildAlternative(regex_build_t *build) {
     if((token = _regexAllocToken(build->context, eTokenAlternative, NULL, NULL, 0)) != NULL) {
         return 0;
     }
-    _regexPushOperator(build, token);
+    if(!_regexExprTokenPush(build->expr, token)) {
+        return 0;
+    }
     return 1;
 }
 
 // TODO: match, split, jump, save, return
+
+/////////////////////////////////////////////////////////////////////////////
+// Pattern parsing handler functions
+/////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////////////////////////////
+// Character parsing, assists with escaped chars
+/////////////////////////////////////////////////////////////////////////////
+
+static int _parseIsHexDigit(char c) {
+    return (((c >= 'a') && (c <= 'f')) ||   // a - f
+            ((c >= 'A') && (c <= 'F')) ||   // A - F
+            ((c >= '0') && (c <= '9')));    // 0 - 9
+}
+
+static int _parseHexValueGet(char c) {
+    if ((c >= 'a') && (c <= 'f')) {
+        return c - 'a' + 10;
+    } else if((c >= 'A') && (c <= 'F')) {
+        return c - 'A' + 10;
+    } else if((c >= '0') && (c <= '9')) {
+        return c - '0';
+    }
+    INTERNAL_ERROR("invalid call to _parseHexValueGet() - non hex digit");
+    return 0; // This should never be reached if c is a hex digit
+}
+
+static int _parseIsIdChar(char c) {
+    return (((c >= 'a') && (c <= 'z')) ||   // a - z
+            ((c >= 'A') && (c <= 'Z')) ||   // A - Z
+            ((c >= '0') && (c <= '9')) ||   // 0 - 9
+            (c == '_') || (c == '-'));      // _, -
+
+}
+
+static int _parseHexValueStr(const char *str, int len, unsigned int *value) {
+    unsigned int val = 0;
+    int cnt;
+
+    for(cnt = 0; len && _parseIsHexDigit(*str); len--, str++, cnt++) {
+        val *= 16;
+        val += _parseHexValueGet(*str);
+    }
+    *value = val;
+    return !len;
+}
+
+// Validates that pattern points to a valid range quantifier (ie., "{3,6}").
+// Returns 0 if false, or the length of the quantifier (excluding delimiters)
+// if true.
+static int _parseRangeQuantifier(const char *pattern, int *min, int *max) {
+    int k, val;
+
+    if(*pattern != '{') {
+        return 0;
+    }
+    for(k = 1, val = 0; ((pattern[k] != '\0') && (pattern[k] != ',') && (pattern[k] != '}') &&
+                         ((pattern[k] >= '0') && (pattern[k] <= '9'))); k++) {
+        val *= 10;
+        val += pattern[k] - '0';
+    }
+    if(pattern[k] != ',') {
+        return 0;
+    }
+    if(min != NULL) {
+        *min = val;
+    }
+    for(val = 0; ((pattern[k] != '\0') && (pattern[k] != '}') &&
+                  ((pattern[k] >= '0') && (pattern[k] <= '9'))); k++) {
+        val *= 10;
+        val += pattern[k] - '0';
+    }
+    if(pattern[k] != '}') {
+        return 0;
+    }
+    if(max != NULL) {
+        *max = val;
+    }
+    return k;
+}
+
+static void _parseCharEmit(FILE *fp, parseChar_t *pc) {
+    fputs("parseChar(", fp);
+    if((pc->c >= ' ') && (pc->c <= 127)) {
+        fprintf(fp, "'%c'", pc->c);
+    } else{
+        fputs("'-'", fp);
+    }
+    fprintf(fp, ":%03d:\"%*.*s\":", pc->c, pc->len, pc->len, pc->ptr);
+    switch(pc->state) {
+        case eRegexPatternEnd: fputs("end", fp); break;
+        case eRegexPatternChar: fputs("char", fp); break;
+        case eRegexPatternUnicode: fputs("unicode", fp); break;
+        case eRegexPatternInvalid: fputs("invalid", fp); break;
+        case eRegexPatternInvalidEscape: fputs("inv_esc", fp); break;
+        case eRegexPatternMetaChar: fputs("metachar", fp); break;
+        case eRegexPatternMetaClass: fputs("metaclass", fp); break;
+        case eRegexPatternUnicodeMetaClass: fputs("utf8meta", fp); break;
+        case eRegexPatternEscapedChar: fputs("esc_char", fp); break;
+    }
+    fputc(')', fp);
+    fflush(fp);
+}
+
+static int _parsePatternIsValid(parseChar_t *pc) {
+    switch(pc->state) {
+        case eRegexPatternEnd:
+        case eRegexPatternInvalid:
+        case eRegexPatternInvalidEscape:
+            return 0;
+        default:
+            return 1;
+    }
+}
+
+static void _parsePatternCharAdvance(const char **pattern, parseChar_t *pc) {
+    if(_parsePatternIsValid(pc)) {
+        (*pattern) += pc->len;
+    }
+}
+
+static void _parsePatternCharBacktrack(const char **pattern, parseChar_t *pc) {
+    if(_parsePatternIsValid(pc)) {
+        (*pattern) -= pc->len;
+    }
+}
+
+static int _parseCheckNextPatternChar(const char **pattern, char c) {
+    parseChar_t pc;
+
+    pc = _parseGetNextPatternChar(pattern, (c == '{' ? 1 : 0), NULL, NULL);
+    if(!_parsePatternIsValid(&pc)) {
+        return 0;
+    }
+    if((pc.c == '\0') || (pc.c != c)) {
+        return 0;
+    }
+    _parsePatternCharAdvance(pattern, &pc);
+    return 1;
+}
+
+// Attempts to parse an identifier delimited by start and end. On success, sets
+// id to the position of the start of the identifier, and len to the total length
+// of the identifier. Note that len does NOT include the delimiters. Only
+// characters within the char class [A-Za-z0-9_-] are valid for the identifier.
+// Returns:
+//     eRegexPatternIdOk - an id was found
+//     eRegexPatternIdMissing - the start delimiter was NOT found
+//     eRegexPatternIdMalformed - the id contained invalid characters (not in
+//                      [A-Za-z0-9_-]), the end delimiter was missing, or the
+//                      delimiters were empty
+static eRegexPatternId_t _parseCheckIdentifier(const char *pattern,
+                                               int start, int end, const char **id, int *len) {
+    int k;
+    const char *ptr = pattern;
+
+    if(!_parseCheckNextPatternChar(&ptr, (char)start)) {
+        return eRegexPatternIdMissing;
+    }
+    for(k = 0; _parseIsIdChar(ptr[k]) && (ptr[k] != end); k++);
+    if((k == 0) || (ptr[k] != end)) {
+        return eRegexPatternIdMalformed;
+    }
+    if(id != NULL) {
+        *id = ptr;
+    }
+    if(len != NULL) {
+        *len = k;
+    }
+    return eRegexPatternIdOk;
+}
+
+static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brace,
+                                            const char **id, int *len) {
+    parseChar_t result = {
+            .c = 0,
+            .ptr = *pattern,
+            .state = eRegexPatternInvalid,
+            .len = 1
+    };
+    eRegexPatternId_t id_status;
+    int size;
+    const char *ptr;
+
+    if(**pattern == '\0') {
+        result.state = eRegexPatternEnd;
+        return result;
+    }
+
+    if(**pattern == '\\') {
+        result.len = 2;
+        switch(*(*pattern + 1)) {
+            case '\0': // End of pattern string
+                result.state = eRegexPatternInvalid;
+                return result;
+
+            case 'p': // unicode class
+            case 'P': // unicode class (inverted)
+                if(_parseCheckIdentifier(*pattern + 2, '{', '}', id, &size) != eRegexPatternIdOk) {
+                    result.state = eRegexPatternInvalidEscape;
+                    return result;
+                }
+                if(len != NULL) {
+                    *len = size;
+                }
+                result.len = size + 4; // \p{size}
+                result.c = *(*pattern + 1);
+                result.state = eRegexPatternUnicodeMetaClass;
+                return result;
+
+            case 'd': // digit
+            case 'D': // non digit
+            case 's': // whitespace
+            case 'S': // non whitespace
+            case 'w': // word character
+            case 'W': // non word character
+            case 'B': // explicit byte match
+            case 'X': // full unicode glyph (base + markers)
+                result.state = eRegexPatternMetaClass;
+                result.c = *(*pattern + 1);
+                return result;
+
+            case 'R': // Subroutine call
+                if(_parseCheckIdentifier(*pattern + 2, '{', '}', id, &size) != eRegexPatternIdOk) {
+                    result.state = eRegexPatternInvalidEscape;
+                    return result;
+                }
+                if(len != NULL) {
+                    *len = size;
+                }
+                result.state = eRegexPatternMetaClass;
+                result.len = size + 4; // \R{size}
+                result.c = *(*pattern + 1);
+                return result;
+
+            case '0': result.c = '\0'; // null
+                result.state = eRegexPatternEscapedChar;
+                return result;
+            case 'a': result.c = '\a'; // alarm (bell)
+                result.state = eRegexPatternEscapedChar;
+                return result;
+            case 'b': result.c = '\b'; // backspace
+                result.state = eRegexPatternEscapedChar;
+                return result;
+            case 'e': result.c = '\x1B'; // escape
+                result.state = eRegexPatternEscapedChar;
+                return result;
+            case 'f': result.c = '\f'; // formfeed
+                result.state = eRegexPatternEscapedChar;
+                return result;
+            case 'n': result.c = '\n'; // newline
+                result.state = eRegexPatternEscapedChar;
+                return result;
+            case 'r': result.c = '\r'; // carraige return
+                result.state = eRegexPatternEscapedChar;
+                return result;
+            case 't': result.c = '\t'; // tab
+                result.state = eRegexPatternEscapedChar;
+                return result;
+            case '-': result.c = '-';  // escaped dash for character class ranges
+                result.state = eRegexPatternEscapedChar;
+                return result;
+            case 'v': result.c = '\v'; // vertical tab
+                result.state = eRegexPatternEscapedChar;
+                return result;
+
+            case 'u': // unicode codepoint (0 - 0x10FFFF)
+                if((id_status = _parseCheckIdentifier(*pattern + 2, '{', '}', &ptr, &size)) == eRegexPatternIdMalformed) {
+                    result.state = eRegexPatternInvalidEscape;
+                    return result;
+                } else if(id_status == eRegexPatternIdMissing) {
+                    if(!_parseHexValueStr(*pattern + 2, 4, (unsigned int *)(&result.c))) {
+                        result.state = eRegexPatternInvalidEscape;
+                        return result;
+                    }
+                    result.len = 6;
+                } else {
+                    if(!_parseHexValueStr(ptr, size, (unsigned int *)(&result.c))) {
+                        result.state = eRegexPatternInvalidEscape;
+                        return result;
+                    }
+                    result.len = size + 4;
+                }
+                result.state = eRegexPatternUnicode;
+                return result;
+
+            case 'x': // hexidecimal encoded byte
+                if(!_parseHexValueStr(*pattern + 2, 2, (unsigned int *)(&result.c))) {
+                    result.state = eRegexPatternInvalidEscape;
+                } else {
+                    result.len = 4;
+                    result.state = eRegexPatternEscapedChar;
+                }
+                return result;
+
+            case '\\':  // literal backslash
+            case '|':   // literal pipe
+            case '?':   // literal question mark
+            case '.':   // literal period
+            case '*':   // literal asterisk
+            case '^':   // literal caret
+            case '+':   // literal plus
+            case '(':   // literal open parenthesis
+            case '[':   // literal open bracket
+            case ')':   // literal close parenthesis
+            case '{':   // literal open brace
+            case '$':   // literal dollar sign
+                result.state = eRegexPatternEscapedChar;
+                result.c = *(*pattern + 1);
+                return result;
+
+            case '<': // start of word assertion
+            case '>': // end of word assertion
+                result.state = eRegexPatternMetaChar;
+                result.c = *(*pattern + 1);
+                return result;
+
+            default:
+                result.state = eRegexPatternInvalid;
+                return result;
+        }
+    }
+    switch(**pattern) {
+        case '|':   // alternation
+        case '?':   // zero or one
+        case '.':   // character (may be multi byte for UTF8)
+        case '*':   // zero or more (kleene)
+        case '^':   // start of line assertion
+        case '+':   // one or more
+        case '(':   // subexpression start
+        case '[':   // character class start
+        case ')':   // subexpression end
+        case '$':   // end of line assertion
+            result.c = **pattern;
+            result.state = eRegexPatternMetaChar;
+            return result;
+
+        case '{':   // range
+            if(allow_brace) {
+                result.c = '{';
+                result.state = eRegexPatternChar;
+                return result;
+            }
+
+            result.c = **pattern;
+            if((size = _parseRangeQuantifier(*pattern + 1, NULL, NULL)) == 0) {
+                result.state = eRegexPatternInvalidEscape;
+                return result;
+            }
+            size += 2; // include the delimiters, since we re-parse in the tokenizer
+            if(len != NULL) {
+                *len = size;
+            }
+            if(id != NULL) {
+                *id = *pattern + 1;
+            }
+            result.state = eRegexPatternMetaChar;
+            result.len = size;
+            return result;
+
+        default:
+            result.c = **pattern;
+            result.state = eRegexPatternChar;
+            return result;
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// String parsing and escape functions
+/////////////////////////////////////////////////////////////////////////////
+
+// _parseGetPatternStrLen determines the length in characters AND bytes to
+// represent a string in the pattern, including the number of additional bytes
+// needed to accommodate any utf8 encoded characters within the string. If the
+// string contains an invalid escape, both the character and byte counts are
+// set to -1.
+static parse_str_t _parseGetPatternStrLen(const char **pattern) {
+    const char *ptr = *pattern;
+    parse_str_t count = {.characters = 0, .bytes = 0};
+    parseChar_t c;
+
+    for(;;) {
+        c = _parseGetNextPatternChar(&ptr, 0, NULL, NULL);
+        switch(c.state) {
+            case eRegexPatternEnd:
+            case eRegexPatternMetaChar:
+            case eRegexPatternUnicodeMetaClass:
+            case eRegexPatternMetaClass:
+                return count;
+
+            case eRegexPatternChar:
+            case eRegexPatternEscapedChar:
+                count.characters++;
+                count.bytes++;
+                break;
+
+            case eRegexPatternUnicode:
+                count.characters++;
+                count.bytes += _parseUtf8EncodingByteLen(c.c);
+                break;
+
+            case eRegexPatternInvalid:
+            case eRegexPatternInvalidEscape:
+                return count;
+
+        }
+        _parsePatternCharAdvance(&ptr, &c);
+    }
+}
+
+// Allocates size + 1 bytes and decodes a string from pattern into the buffer.
+// Note: this function expects the len to have been pre-validated, and does NOT
+// recognize the null character, to allow it to be used as an actual value
+// within the string.
+static char *_parseGetPatternStr(const char **pattern, int len, int size) {
+    char *str, *ptr;
+    int k;
+    parseChar_t c;
+
+    if((str = _regexAlloc(size + 1, _regexMemContext)) == NULL) {
+        return NULL;
+    }
+    ptr = str;
+
+    for(; len; len--) {
+        c = _parseGetNextPatternChar(pattern, 0, NULL, NULL);
+        _parsePatternCharAdvance(pattern, &c);
+        if(c.state == eRegexPatternUnicode) {
+            for(k = _parseUtf8EncodingByteLen(c.c); k; k--) {
+                *ptr = (char)(((unsigned int)c.c >> (unsigned int)((k - 1) * 8)) & 0xFFu);
+                ptr++;
+            }
+        } else {
+            *ptr = (char)(c.c);
+            ptr++;
+        }
+    }
+    *ptr = '\0';
+    return str;
+}
+
+// Returns the escaped size of the character in str[0]. If stride is not NULL,
+// stride is set to the number bytes consumed (for multibyte utf8 encodings)
+int regexEscapeCharLen(const char *str, int *stride) {
+    int codepoint;
+
+    if((codepoint = _parseUtf8DecodeSequence(str)) != -1) {
+        // utf8 encoding
+        if(codepoint > 0xFFFFF) {
+            if(stride != NULL) { *stride = 4; }
+            return 10; // \u{######}
+        } else if(codepoint > 0xFFFF) {
+            if(stride != NULL) { *stride = 4; }
+            return 9; // \u{#####}
+        } else if(codepoint > 2047) {
+            if(stride != NULL) { *stride = 3; }
+            return 6; // \u####
+        } else if(codepoint > 127) {
+            if(stride != NULL) { *stride = 2; }
+            return 6; // \u####
+        }
+    }
+    if(stride != NULL) { *stride = 1; }
+    switch(*str) {
+        case '\0':
+        case '\a':
+        case '\b':
+        case '\x1b':
+        case '\f':
+        case '\n':
+        case '\r':
+        case '\t':
+        case '\v':
+            return 2;
+
+        default:
+            if((*str >= ' ') && (*str <= 127)) {
+                return 1;
+            }
+            return 4; // \x##
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Character class parsing handlers
+/////////////////////////////////////////////////////////////////////////////
+
+// Character class handling is performed with a bitmap mask of the character
+// ranges. For ASCII data, a single eTokenCharClass token represents a class,
+// with the character bitmap stored independently in the VM, allowing for
+// efficient reuse of the class pattern. For UTF8 data, a mini-DFA is generated
+// for the
+
+/////////////////////////////////////////////////////////////////////////////
+// Lexer - tokenizes the pattern
+/////////////////////////////////////////////////////////////////////////////
+
+static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
+    const char *class;
+    parseChar_t c;
+    parse_str_t str_count;
+    int len;
+    const char *str;
+    unsigned int flags;
+    regex_subroutine_t *routine;
+    int subexpr;
+    int named;
+    int index;
+
+    if(build->pattern == NULL) {
+        return eCompileMissingPattern;
+    }
+
+    // Parse the regex pattern into a sequence of tokens (operators and operands)
+    // The output of this stage is a sequence of lexical tokens in infix form
+
+    // Loop through the pattern until we've handled it all
+    for(; *(build->pattern->pattern) != '\0';) {
+        // Get the next character in the pattern. The helper function assists
+        // in disambiguating escaped characters.
+        c = _parseGetNextPatternChar(&(build->pattern->pattern), 0, &str, &len);
+
+        if(_parsePatternIsValid(&c)) {
+            _parsePatternCharAdvance(&(build->pattern->pattern), &c);
+        }
+
+        switch(c.state) {
+            case eRegexPatternEnd:
+                return eCompileOk;
+
+            case eRegexPatternInvalid:
+                return eCompileEscapeCharIncomplete;
+
+            case eRegexPatternInvalidEscape:
+                printf("invalid escape\n");
+                return eCompileInvalidEscapeChar;
+
+            case eRegexPatternMetaChar:
+                switch(c.c) {
+                    case '.': // Meta, any char
+                        if(!regexBuildConcatCharAny(build, (int)((unsigned)(build->context->flags) & RE_FLAG_DOT_ALL))) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    case '[': // Meta, char class
+                        if(!_parseCharClassAndCreateToken(build, NULL, NULL, 0, 0)) {
+                            return build->status;
+                        }
+                        continue;
+
+                    case '?': // Meta, zero or one quantifier
+                        if(!regexBuildQuantify(build, eReQuantifyZeroOrOne)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    case '*': // Meta, kleene star, zero or many quantifier
+                        if(!regexBuildQuantify(build, eReQuantifyZeroOrMany)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    case '+': // Meta, one or many quantifier
+                        if(!regexBuildQuantify(build, eReQuantifyOneOrMany)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    case '|': // Meta, alternative operator
+                        if(!_regexBuildAlternative(build)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    case '(':
+                        // Grouped subexpression, complex operator, resolves to a compound operand
+                        // Speculative subexpression number. If non-capturing, will NOT actually
+                        // increase the group count.
+                        subexpr = build->context->group_count;
+                        flags = 0;
+                        named = 0;
+                        index = -1;
+                        // Check for group meta modifiers
+                        while(*(build->pattern->pattern) == '?') {
+                            build->pattern->pattern++;
+                            if(_parseCheckNextPatternChar(&(build->pattern->pattern), 'i')) {
+                                // Case insensitive matching
+                                flags |= RE_TOK_FLAG_CASE_INS;
+                            } else if(_parseCheckNextPatternChar(&(build->pattern->pattern), 'P')) {
+                                // Named sub expression
+                                if(named || (flags & (RE_TOK_FLAG_SUBROUTINE | RE_TOK_FLAG_NO_CAPTURE))) {
+                                    return eCompileConflictingAttrs;
+                                }
+                                if(_parseCheckIdentifier(build->pattern->pattern, '<', '>', &str, &len) != eRegexPatternIdOk) {
+                                    return eCompileMalformedSubExprName;
+                                }
+                                build->pattern->pattern += len + 2;
+                                if(regexVMGroupTableEntryAdd(build, str, len, subexpr) < 0) {
+                                    return eCompileOutOfMem;
+                                }
+                                named = 1;
+                            } else if(_parseCheckNextPatternChar(&(build->pattern->pattern), ':')) {
+                                // Non-capturing subexpression
+                                if(named || (flags & (RE_TOK_FLAG_COMPOUND))) {
+                                    return eCompileConflictingAttrs;
+                                }
+                                flags |= RE_TOK_FLAG_NO_CAPTURE;
+                            } else if(_parseCheckNextPatternChar(&(build->pattern->pattern), '*')) {
+                                // Compound capturing subexpression
+                                if(flags & (RE_TOK_FLAG_NO_CAPTURE | RE_TOK_FLAG_SUBROUTINE)) {
+                                    return eCompileConflictingAttrs;
+                                }
+                                flags |= RE_TOK_FLAG_COMPOUND;
+                            } else if(_parseCheckNextPatternChar(&(build->pattern->pattern), 'R')) {
+                                // Named subroutine
+                                if(named || (flags & RE_TOK_FLAG_COMPOUND)) {
+                                    return eCompileConflictingAttrs;
+                                }
+                                if(_parseCheckIdentifier(build->pattern->pattern, '<', '>', &str, &len) != eRegexPatternIdOk) {
+                                    return eCompileMalformedSubExprName;
+                                }
+                                build->pattern->pattern += len + 2;
+                                if((index = _regexSubroutineIndexRegisterIntent(&(build->build_ctx->subroutine_index), NULL, str, len,
+                                                                                NULL, 0)) < 0) {
+                                    if(index == RE_SUBROUTINE_COLLISION) {
+                                        return eCompileSubroutineNameCollision;
+                                    }
+                                    return eCompileOutOfMem;
+                                }
+                                flags |= RE_TOK_FLAG_SUBROUTINE | RE_TOK_FLAG_NO_CAPTURE;
+                            } else {
+                                return eCompileUnsupportedMeta;
+                            }
+                        }
+                        if(!named) {
+                            if(regexVMGroupTableEntryAdd(build, NULL, 0, subexpr) < 0) {
+                                return eCompileOutOfMem;
+                            }
+                        }
+                        build->build_ctx->group_count++;
+                        if(!_regexCreateTokenSubExprStart(build, subexpr, index, (int)(flags & RE_TOK_FLAG_COMPOUND), (int)(flags & RE_TOK_FLAG_NO_CAPTURE))) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    case ')': // Meta, end of subexpression (group)
+                        if(!regexBuildGroupEnd(build)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    case '^': // Meta, assertion - start of line
+                        if(!regexBuildConcatAssertion(build, RE_TOK_FLAG_ASSERT_START_OF_LINE)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    case '$': // Meta, assertion - end of line
+                        if(!regexBuildConcatAssertion(build, RE_TOK_FLAG_ASSERT_END_OF_LINE)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    case '<': // Meta, assertion - start of word
+                        if(!regexBuildConcatAssertion(build, RE_TOK_FLAG_ASSERT_START_OF_WORD)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    case '>': // Meta, assertion - end of word
+                        if(!regexBuildConcatAssertion(build, RE_TOK_FLAG_ASSERT_END_OF_WORD)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    default: // Unexpected meta character
+                        INTERNAL_ERROR("unexpected meta char cleared parser");
+                        return eCompileInternalError;
+                }
+
+            case eRegexPatternMetaClass:
+                switch(c.c) {
+                    case 'R': // subroutine call
+                        if((routine = _regexSubroutineIndexEntryGet(&(build->build_ctx->subroutine_index), NULL, str, len, -1)) == NULL) {
+                            return eCompileUnknownSubroutine;
+                        }
+                        if(!regexBuildConcatCall(build, routine->id)) {
+                            return eCompileOutOfMem;
+                        }
+                        routine->is_ref = 1;
+                        continue;
+#ifdef MOJO_REGEX_UNICODE
+                    case 'X': // full unicode glyph (base + markers)
+                        if((routine = _regexSubroutineIndexEntryGet(&(build->build_ctx->subroutine_index), "meta", "glyph", len, -1)) == NULL) {
+                            INTERNAL_ERROR("glyph subroutine is missing");
+                            return eCompileUnknownSubroutine;
+                        }
+                        if(!regexBuildConcatCall(build, routine->id)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+#endif // MOJO_REGEX_UNICODE
+                    case 'B': // explicit byte
+                        if(!regexBuildConcatByte(build)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+                }
+                switch(c.c) {
+                    case 'd': // digit
+                        class = META_CLASS_DIGITS_PATTERN;
+                        break;
+                    case 'D': // non digit
+                        class = META_CLASS_INV_DIGITS_PATTERN;
+                        break;
+                    case 's': // whitespace
+                        class = META_CLASS_WHITESPACE_PATTERN;
+                        break;
+                    case 'S': // non whitespace
+                        class = META_CLASS_INV_WHITESPACE_PATTERN;
+                        break;
+                    case 'w': // word character
+                        class = META_CLASS_WORD_PATTERN;
+                        break;
+                    case 'W': // non word character
+                        class = META_CLASS_INV_WORD_PATTERN;
+                        break;
+                    default:
+                        return eCompileUnsupportedMeta;
+                }
+                if(!_parseCharClassAndCreateToken(build, class, NULL, 0, 0)) {
+                    return build->status;
+                }
+                continue;
+
+            case eRegexPatternUnicodeMetaClass:
+                if(_regexRegUnicodeCharClassGet(str, len) == NULL) {
+                    return eCompileUnknownUnicodeClass;
+                }
+                if(!_parseCharClassAndCreateToken(build, NULL, str, len, ((c.c == 'P') ? 1 : 0))) {
+                    return build->status;
+                }
+                continue;
+
+            case eRegexPatternChar:
+            case eRegexPatternUnicode:
+            case eRegexPatternEscapedChar:
+                // Operand, either character literal or string literal
+                _parsePatternCharBacktrack(&(build->pattern->pattern), &c);
+                str_count = _parseGetPatternStrLen(&(build->pattern->pattern));
+                if(str_count.characters == -1) {
+                    INTERNAL_ERROR("backtrack failed!");
+                    return eCompileEscapeCharIncomplete;
+                }
+                if(str_count.characters == 1) {
+                    _parsePatternCharAdvance(&(build->pattern->pattern), &c);
+                    if(str_count.bytes > 1) {
+                        if(!regexBuildConcatUtf8Literal(build, c.c, 0)) {
+                            return eCompileOutOfMem;
+                        }
+                    } else if(!regexBuildConcatChar(build, (char) (c.c), 0)) {
+                        return eCompileOutOfMem;
+                    }
+                } else {
+                    if((str = _parseGetPatternStr(&(build->pattern->pattern), str_count.characters,
+                                                  str_count.bytes)) == NULL) {
+                        return eCompileOutOfMem;
+                    }
+                    if(!regexBuildConcatString(build, str, str_count.bytes)) {
+                        return eCompileOutOfMem;
+                    }
+                }
+                continue;
+        }
+    }
+    return eCompileOk;
+}
 
 /////////////////////////////////////////////////////////////////////////////
 // Builder handling
@@ -2224,18 +3173,30 @@ regex_build_ctx_t *regexBuildContextCreate(unsigned int flags) {
 }
 
 void regexBuildContextDestroy(regex_build_ctx_t *context) {
-    regex_sub_t *sub, *next;
+    regex_sub_t *sub, *sub_next;
+    regex_pattern_t *pattern, *pattern_next;
+    regex_expr_t *expr, *expr_next;
 
     regexVMDestroy(context->vm);
+    for(expr = context->expr_pool; expr != NULL; expr = expr_next) {
+        expr_next = expr->next;
+        expr->context = NULL;
+        expr->next = NULL;
+        regexExprDestroy(expr);
+    }
     _regexTokenDestroy(NULL, context->token_pool, 1);
     _regexPtrlistFree(NULL, context->ptrlist_pool);
-    for(sub = context->subroutines; sub != NULL; sub = next) {
-        next = sub->next;
+    for(sub = context->subroutines; sub != NULL; sub = sub_next) {
+        sub_next = sub->next;
         if(sub->name != NULL) {
             _regexDealloc(sub->name, _regexMemContext);
         }
         _regexTokenDestroy(NULL, sub->expr, 1);
         _regexDealloc(sub, _regexMemContext);
+    }
+    for(pattern = context->pattern_pool; pattern != NULL; pattern = pattern_next) {
+        pattern_next = pattern->next;
+        _regexDealloc(pattern, _regexMemContext);
     }
     _regexDealloc(context, _regexMemContext);
 }
@@ -2249,20 +3210,19 @@ regex_build_t *regexBuildCreate(regex_build_ctx_t *context) {
         return NULL;
     }
     build->context = context;
+    if(!regexExprCreate(build)) {
+        build->status = eCompileOutOfMem;
+    }
     build->status = eCompileOk;
     return build;
 }
 
 void regexBuildDestroy(regex_build_t *build) {
-    // TODO
-#if 0
     if(build != NULL) {
-        while(build->pattern != NULL) {
-            regexBuildPatternPop(build);
-        }
+        while(regexPatternDestroy(build));
+        regexExprDestroy(build->expr);
         _regexDealloc(build, _regexMemContext);
     }
-#endif
 }
 
 int regexBuildFinalize(regex_build_t *build) {
@@ -2274,28 +3234,46 @@ int regexBuildFinalize(regex_build_t *build) {
 
 // Expression management functions //////////////////////////////////////////
 
-int regexExprCreate(regex_build_t *build, int is_inline) {
+int regexExprCreate(regex_build_t *build) {
     regex_expr_t *expr;
 
     if((build->context != NULL) && (build->context->expr_pool != NULL)) {
         expr = build->context->expr_pool;
-        build->context->expr_pool = expr->parent;
+        build->context->expr_pool = expr->next;
         memset(expr, 0, sizeof(regex_expr_t));
     } else {
         if((expr = _regexAlloc(sizeof(regex_expr_t), _regexMemContext)) == NULL) {
             return 0;
         }
     }
-    expr->inline_expr = is_inline;
     expr->context = build->context;
     expr->parent = build->expr;
     build->expr = expr;
     return 1;
 }
 
-int _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token) {
-    // TODO
-    return 0;
+eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token) {
+    if((expr == NULL) || (token == NULL)) {
+        INTERNAL_ERROR("NULL expr or token passed to _regexExprTokenPush");
+        return eReExprInternalError;
+    }
+    if((token->tokenType < 0) || (token->tokenType >= eTokenUnknown)) {
+        INTERNAL_ERROR("Invalid token (out of range) type passed to _regexExprTokenPush");
+        return eReExprInternalError;
+    }
+    if(_regexTokenDetails[token->tokenType].operator != NULL) {
+        while((expr->operators != NULL));
+
+        token->next = expr->operators;
+        expr->operators = token;
+    } else {
+        token->next = expr->tokens;
+        expr->tokens = token;
+        if((token->ptrlist = _regexPtrlistCreate(expr->context, token, eRePtrOutA)) == NULL) {
+            return eReExprOutOfMemory;
+        }
+    }
+    return eReExprSuccess;
 }
 
 eReExprStatus_t regexExprFinalize(regex_expr_t *expr) {
@@ -2304,8 +3282,13 @@ eReExprStatus_t regexExprFinalize(regex_expr_t *expr) {
 }
 
 void regexExprDestroy(regex_expr_t *expr) {
+    if(expr == NULL) {
+        return;
+    }
     if(expr->context != NULL) {
-        expr->parent = expr->context->expr_pool;
+        _regexTokenDestroy(expr->context, expr->tokens, 1);
+        _regexTokenDestroy(expr->context, expr->operators, 1);
+        expr->next = expr->context->expr_pool;
         expr->context->expr_pool = expr;
     } else {
         _regexDealloc(expr, _regexMemContext);
@@ -2319,7 +3302,7 @@ int regexPatternCreate(regex_build_t *build, const char *pattern, int len) {
 
     if((build->context != NULL) && (build->context->pattern_pool != NULL)) {
         pat = build->context->pattern_pool;
-        build->context->pattern_pool = pat->parent;
+        build->context->pattern_pool = pat->next;
         memset(pat, 0, sizeof(regex_pattern_t));
     } else {
         if((pat = _regexAlloc(sizeof(regex_pattern_t), _regexMemContext)) == NULL) {
@@ -2348,6 +3331,7 @@ int regexPatternDestroy(regex_build_t *build) {
     } else {
         _regexDealloc(pattern, _regexMemContext);
     }
+    return 1;
 }
 
 // Pattern compilation direct to VM convenience function ////////////////////
@@ -2356,29 +3340,39 @@ regex_build_t *regexCompile(const char *pattern, unsigned int flags) {
     regex_build_t *build;
     regex_build_ctx_t *context;
 
-    if((build = _regexAlloc(sizeof(regex_build_t), _regexMemContext)) == NULL) {
+    if((context = regexBuildContextCreate(flags)) == NULL) {
         return NULL;
     }
-
-    if((context = regexBuildContextCreate(flags)) == NULL) {
-        build->status = eCompileOutOfMem;
+    if((build = regexBuildCreate(context)) == NULL) {
+        _regexDealloc(context, _regexMemContext);
+        return NULL;
+    }
+    if(build->status != eCompileOk) {
         return build;
     }
-    build->context = context;
-
     if(!regexPatternCreate(build, pattern, RE_STR_NULL_TERM)) {
         build->status = eCompileOutOfMem;
         return build;
     }
 
-    // TODO
+    if(!regexBuildPatternProcess(build)) {
+        return build;
+    }
+
+    if(regexVMCreate(build) == NULL) {
+        return build;
+    }
+
+    regexVMGenerate(build);
 
     return build;
 }
 
 int regexBuildPatternProcess(regex_build_t *build) {
-    // TODO
-    return 0;
+    if((build->status = _regexTokenizePattern(build)) != eCompileOk) {
+        return 0;
+    }
+    return 1;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -2390,10 +3384,16 @@ regex_vm_t *regexVMCreate(regex_build_t *build) {
         return NULL;
     }
     if((build->context->vm = _regexAlloc(sizeof(regex_vm_t), _regexMemContext)) == NULL) {
+        build->status = eCompileOutOfMem;
         return NULL;
     }
     build->context->vm->vm_version = REGEX_VM_MACHINE_VERSION;
     return build->context->vm;
+}
+
+int regexVMGenerate(regex_build_t *build) {
+    // TODO
+    return 0;
 }
 
 void regexVMDestroy(regex_vm_t *vm) {
