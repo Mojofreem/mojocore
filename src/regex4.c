@@ -224,6 +224,9 @@ Regex VM Bytecode (v9 - in development)
 // Include unicode (explicit UTF8) support
 #define MOJO_REGEX_UNICODE
 
+// Cull redundant jmp instructions when building DFAs
+//#define MOJO_REGEX_EXPERIMENTAL_CULL_JMP
+
 // Build the implementation (if not defined, simply declares symbols)
 #define MOJO_REGEX_IMPLEMENTATION
 
@@ -567,6 +570,13 @@ struct regex_sub_s {
     regex_sub_t *next;
 };
 
+typedef struct regex_utf8_range_s regex_utf8_range_t;
+struct regex_utf8_range_s {
+    int start;
+    int end;
+    regex_utf8_range_t *next;
+};
+
 typedef struct regex_build_s regex_build_t;
 
 struct regex_build_ctx_s {
@@ -576,6 +586,7 @@ struct regex_build_ctx_s {
     regex_ptrlist_t *ptrlist_pool;
     regex_pattern_t *pattern_pool;
     regex_expr_t  *expr_pool;
+    regex_utf8_range_t *utf8_range_pool;
 
     int next_sub;
     regex_sub_t *subroutines;
@@ -917,6 +928,7 @@ void _regexPtrlistFree(regex_build_ctx_t *context, regex_ptrlist_t *list);
 regex_token_t *_regexTokenAlloc(regex_build_ctx_t *context, eRegexToken_t tokenType,
                                 const char *str, const unsigned int *bitmap,
                                 int len);
+void _regexTokenLoopBreaker(regex_token_t *token);
 void _regexTokenDestroy(regex_build_ctx_t *context, regex_token_t *token, int full_stack);
 
 regex_token_t *_regexTokenBaseCreate(regex_build_t *build, eRegexToken_t tokenType,
@@ -949,6 +961,8 @@ typedef enum {
 int regexBuildQuantify(regex_build_t *build, eReQuantifier_t quantifier);
 int regexBuildRange(regex_build_t *build, int min, int max);
 int regexBuildAlternative(regex_build_t *build);
+
+int regexCreateTokenJmp(regex_build_ctx_t *context, regex_token_t **token);
 
 // TODO: match, split, jmp, save, return
 
@@ -1015,6 +1029,34 @@ static eRegexPatternId_t _parseCheckIdentifier(const char *pattern,
                                                int start, int end, const char **id, int *len);
 static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brace,
                                             const char **id, int *len);
+
+static parse_str_t _parseGetPatternStrLen(const char **pattern);
+static char *_parseGetPatternStr(const char **pattern, int len, int size);
+int regexEscapeCharLen(const char *str, int *stride);
+
+typedef enum {
+    eReUtf8SegDoneRangeRemaining,
+    eReUtf8SegDoneNextRange,
+    eReUtf8SegKeepNextRange,
+} eReUtf8RangeSegment_t;
+
+typedef struct regex_utf8_segment_s regex_utf8_segment_t;
+struct regex_utf8_segment_s {
+    int bytes;
+    int high;
+    int midhigh;
+    int midlow;
+    unsigned int bitmap[2];
+};
+
+regex_utf8_range_t *_regexUtf8RangeCreate(regex_build_ctx_t *context, int start, int end);
+void _regexUtf8RangeDestroy(regex_build_ctx_t *context, regex_utf8_range_t *range, int free_all);
+int _parseCreateUtf8Range(regex_build_t *build, regex_utf8_range_t **sequence, int start, int end);
+static int _parseCharClassBitmapSet(regex_build_t *build, regex_utf8_range_t **range, unsigned int *bitmap, int c);
+static int _parseCharClassBitmapRangeSet(regex_build_t *build, regex_utf8_range_t **range, unsigned int *bitmap, int a, int b);
+static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class_pattern,
+                                         const char *name, int name_len, int invert);
+
 static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build);
 
 // Token stream handling functions //////////////////////////////////////////
@@ -1027,9 +1069,14 @@ void regexBuildDestroy(regex_build_t *build);
 int regexBuildFinalize(regex_build_t *build);
 
 int regexExprCreate(regex_build_t *build);
-eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token);;
-eReExprStatus_t regexExprFinalize(regex_expr_t *expr);
-void regexExprDestroy(regex_expr_t *expr);
+void _regexExprOperandPush(regex_expr_t *expr, regex_token_t *token);
+regex_token_t *_regexExprOperandPop(regex_expr_t *expr);
+void _regexExprOperatorPush(regex_expr_t *expr, regex_token_t *token);
+regex_token_t *_regexExprOperatorPop(regex_expr_t *expr);
+eReExprStatus_t _regexExprOperatorApply(regex_expr_t *expr);
+eReExprStatus_t _regexExprFinalize(regex_expr_t *expr);
+eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token);
+int regexExprDestroy(regex_build_t *build);
 
 int regexPatternCreate(regex_build_t *build, const char *pattern, int len);
 int regexPatternDestroy(regex_build_t *build);
@@ -1636,33 +1683,93 @@ void _reMetaTokEmit_eTokenSave(FILE *fp, regex_build_ctx_t *build_ctx, regex_tok
 /////////////////////////////////////////////////////////////////////////////
 
 int _reMetaApplyOp_eTokenRange(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
-    // TODO
+    // TODO - implement the range operator handler
+    INTERNAL_ERROR("range operator not yet implemented");
     return 0;
 }
 
 int _reMetaApplyOp_eTokenConcatenation(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
-    // TODO
-    return 0;
+    _regexTokenDestroy(expr->context, operator, 0);
+    _regexPtrlistPatch(expr->context, &(operand_a->ptrlist), operand_b, 0);
+    operand_a->ptrlist = operand_b->ptrlist;
+    operand_b->ptrlist = NULL;
+    _regexExprOperandPush(expr, operand_a);
+
+    return 1;
 }
 
 int _reMetaApplyOp_eTokenAlternative(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
-    // TODO
-    return 0;
+    regex_token_t *jmp = NULL;
+
+    if(!regexCreateTokenJmp(expr->context, &jmp)) {
+        return 0;
+    }
+
+#ifdef MOJO_REGEX_EXPERIMENTAL_CULL_JMP
+    if(regexPtrlistPatch(expr->context, &(operand_a->ptrlist), jmp, 1) == 0) {
+#else // !MOJO_REGEX_EXPERIMENTAL_CULL_JMP
+    if(_regexPtrlistPatch(expr->context, &(operand_a->ptrlist), jmp, 0) == 0) {
+#endif
+        // The jmp token was unused
+        _regexTokenDestroy(expr->context, jmp, 0);
+        operator->ptrlist = operand_a->ptrlist;
+        operand_a->ptrlist = NULL;
+    } else {
+        if((operator->ptrlist = _regexPtrlistCreate(expr->context, jmp, eRePtrOutA)) == NULL) {
+            return 0;
+        }
+    }
+    operator->tokenType = eTokenSplit;
+    operator->out_a = operand_a;
+    operator->out_b = operand_b;
+    operator->ptrlist = _regexPtrlistAppend(operator->ptrlist, operand_b->ptrlist);
+    operand_b->ptrlist = NULL;
+    _regexExprOperandPush(expr, operator);
+
+    return 1;
 }
 
 int _reMetaApplyOp_eTokenZeroOrOne(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
-    // TODO
-    return 0;
+    operator->tokenType = eTokenSplit;
+    operator->out_a = operand_a;
+    if((operator->ptrlist = _regexPtrlistCreate(expr->context, operator, eRePtrOutB)) == NULL) {
+        return 0;
+    }
+    operator->ptrlist = _regexPtrlistAppend(operand_a->ptrlist, operator->ptrlist);
+    operand_a->ptrlist = NULL;
+    _regexExprOperandPush(expr, operator);
+
+    return 1;
 }
 
 int _reMetaApplyOp_eTokenZeroOrMany(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
-    // TODO
-    return 0;
+    regex_token_t *jmp = NULL;
+
+    operator->tokenType = eTokenSplit;
+    operator->out_a = operand_a;
+    if((operator->ptrlist = _regexPtrlistCreate(expr->context, operator, eRePtrOutB)) == NULL) {
+        return 0;
+    }
+    if(!regexCreateTokenJmp(expr->context, &jmp)) {
+        return 0;
+    }
+    jmp->out_a = operator;
+    _regexPtrlistPatch(expr->context, &(operand_a->ptrlist), jmp, 0);
+    _regexExprOperandPush(expr, operator);
+
+    return 1;
 }
 
 int _reMetaApplyOp_eTokenOneOrMany(regex_expr_t *expr, regex_token_t *operand_a, regex_token_t *operand_b, regex_token_t *operator) {
-    // TODO
-    return 0;
+    operator->tokenType = eTokenSplit;
+    operator->out_a = operand_a;
+    _regexPtrlistPatch(expr->context, &(operand_a->ptrlist), operator, 0);
+    if((operand_a->ptrlist = _regexPtrlistCreate(expr->context, operator, eRePtrOutB)) == NULL) {
+        return 0;
+    }
+    _regexExprOperandPush(expr, operand_a);
+
+    return 1;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -2147,11 +2254,45 @@ regex_token_t *_regexAllocToken(regex_build_ctx_t *context, eRegexToken_t tokenT
     return token;
 }
 
+#define DEF_TOKEN_LOOP_SENTINAL     -2
+
+void _regexTokenLoopBreaker(regex_token_t *token) {
+    if((token == NULL) || (token->pc == DEF_TOKEN_LOOP_SENTINAL)) {
+        return;
+    }
+    token->pc = DEF_TOKEN_LOOP_SENTINAL;
+    if(token->next != NULL) {
+        if(token->next->pc == DEF_TOKEN_LOOP_SENTINAL) {
+            token->next = NULL;
+        } else {
+            _regexTokenLoopBreaker(token->next);
+        }
+    }
+    if(token->out_a != NULL) {
+        if(token->out_a->pc == DEF_TOKEN_LOOP_SENTINAL) {
+            token->out_a = NULL;
+        } else {
+            _regexTokenLoopBreaker(token->out_a);
+        }
+    }
+    if(token->out_b != NULL) {
+        if(token->out_b->pc == DEF_TOKEN_LOOP_SENTINAL) {
+            token->out_b = NULL;
+        } else {
+            _regexTokenLoopBreaker(token->out_b);
+        }
+    }
+}
+
 void _regexTokenDestroy(regex_build_ctx_t *context, regex_token_t *token, int full_stack) {
     regex_token_t *next;
 
     if(token == NULL) {
         return;
+    }
+
+    if(full_stack) {
+        _regexTokenLoopBreaker(token);
     }
 
     for(; token != NULL; token = next) {
@@ -2361,7 +2502,7 @@ int regexBuildRange(regex_build_t *build, int min, int max) {
     return 1;
 }
 
-int _regexBuildAlternative(regex_build_t *build) {
+int regexBuildAlternative(regex_build_t *build) {
     regex_token_t *token;
 
     if((token = _regexAllocToken(build->context, eTokenAlternative, NULL, NULL, 0)) != NULL) {
@@ -2373,7 +2514,15 @@ int _regexBuildAlternative(regex_build_t *build) {
     return 1;
 }
 
-// TODO: match, split, jump, save, return
+int regexCreateTokenJmp(regex_build_ctx_t *context, regex_token_t **token) {
+    if((*token = _regexAllocToken(context, eTokenJmp, NULL, NULL, 0)) == NULL) {
+        return 0;
+    }
+    return 1;
+}
+
+// TODO: match, split, save, return
+
 
 /////////////////////////////////////////////////////////////////////////////
 // Pattern parsing handler functions
@@ -2865,7 +3014,339 @@ int regexEscapeCharLen(const char *str, int *stride) {
 // ranges. For ASCII data, a single eTokenCharClass token represents a class,
 // with the character bitmap stored independently in the VM, allowing for
 // efficient reuse of the class pattern. For UTF8 data, a mini-DFA is generated
-// for the
+// for the codepoint ranges, using multiple splits to differentiate mid and high
+// bytes, and eTokenCharLiterals for the initial byte in 4 byte encodings. When
+// the VM is generated, UTF8 classes are factored out into subroutines.
+
+// For utf8 encoded characters, trailing bytes have 6 bits of character data,
+// as the leading bits identify the byte as part of a multibyte codepoint.
+// This simplifies the unicode char class table entries to only need 64 bits
+// (8 bytes) to represent each byte.
+
+// |  high byte  | midhigh byte| midlow byte | low byte |
+// | 4 byte lead | 3 byte lead | 2 byte lead | low byte |
+//                             |<---- 2 byte group ---->|
+//               |<------------ 3 byte group ---------->|
+// |<------------------ 4 byte group ------------------>|
+
+regex_utf8_range_t *_regexUtf8RangeCreate(regex_build_ctx_t *context, int start, int end) {
+    regex_utf8_range_t *range;
+
+    if((range = context->utf8_range_pool) == NULL) {
+        if((range = _regexAlloc(sizeof(regex_utf8_range_t), _regexMemContext)) == NULL) {
+            return NULL;
+        }
+    } else {
+        context->utf8_range_pool = range->next;
+    }
+    range->next = NULL;
+    range->start = start;
+    range->end = end;
+}
+
+void _regexUtf8RangeDestroy(regex_build_ctx_t *context, regex_utf8_range_t *range, int free_all) {
+    regex_utf8_range_t *next;
+
+    do {
+        next = range->next;
+        if(context != NULL) {
+            range->next = context->utf8_range_pool;
+            context->utf8_range_pool = range;
+        } else {
+            _regexDealloc(range, _regexMemContext);
+        }
+    } while((free_all) && (next != NULL));
+}
+
+int _parseCreateUtf8Range(regex_build_t *build, regex_utf8_range_t **sequence, int start, int end) {
+    regex_utf8_range_t *range, *walk, *last, *next;
+    int swap;
+
+    if(start > end) {
+        swap = start;
+        start = end;
+        end = swap;
+    }
+    if((range = _regexUtf8RangeCreate(build->context, start, end)) == NULL) {
+        return 0;
+    }
+
+    if(*sequence == NULL) {
+        *sequence = range;
+    } else {
+        if(end < (*sequence)->start) {
+            range->next = *sequence;
+            *sequence = range;
+            return 1;
+        }
+
+        for(walk = *sequence, last = NULL; walk != NULL; walk = walk->next) {
+            if(start <= walk->end) {
+                if(end >= start) {
+                    // The ranges overlap, merge them
+                    if(start < walk->start) {
+                        walk->start = start;
+                    }
+                    if(end > walk->end) {
+                        walk->end = end;
+                    }
+
+                    _regexUtf8RangeDestroy(build->context, range, 0);
+
+                    // Resolve any resultant range bridges
+                    range = walk;
+                    for(; walk != NULL; walk = next) {
+                        next = walk->next;
+                        if(range->end >= walk->start) {
+                            if(walk->end > range->end) {
+                                range->end = walk->end;
+                            }
+                            range->next = walk->next;
+                            _regexUtf8RangeDestroy(build->context, walk, 0);
+                        }
+                    }
+                    return 1;
+                }
+            } else {
+                if(last == NULL) {
+                    INTERNAL_ERROR("utf8 ranges out of sequence");
+                    return 0;
+                }
+                range->next = last->next;
+                last->next = range;
+                return 1;
+            }
+            last = walk;
+        }
+        // Logically, last will NEVER be NULL here, regardless of what the IDE claims
+        last->next = range;
+    }
+    return 1;
+}
+
+static int _parseCharClassBitmapSet(regex_build_t *build, regex_utf8_range_t **range, unsigned int *bitmap, int c) {
+    if((c > 127) && (range != NULL)) {
+        return _parseCreateUtf8Range(build, range, c, c);
+    }
+    bitmap[c / 32u] |= (1u << (c % 32u));
+    return 1;
+}
+
+static int _parseCharClassBitmapRangeSet(regex_build_t *build, regex_utf8_range_t **range, unsigned int *bitmap, int a, int b) {
+    if((b > 127) && (range != NULL)) {
+        return _parseCreateUtf8Range(build, range, a, b);
+    }
+    for(; a <= b; a++) {
+        bitmap[a / 32u] |= (1u << (a % 32u));
+    }
+    return 1;
+}
+
+// Parse a class pattern, and generate a eTokenCharClass or eTokenUtf8Class
+// sequence. By default, uses the pattern in tokenizer. If class_pattern is
+// defined, it will use it as the pattern instead of the tokenizer pattern. If
+// class_pattern and name are defined, then name will be associated with the
+// class_pattern in diagnostic output. If class_pattern is not defined, but
+// name is defined, then it is assumed that name is referencing a utf8 property
+// class, and an attempt will be made to lookup the class pattern in the
+// registered unicode classes.
+static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class_pattern,
+                                         const char *name, int name_len, int invert) {
+    unsigned int bitmap[8], *ptr;
+    parseChar_t c;
+    regex_utf8_range_t *utf8range = NULL;
+    int range = 0;
+    int last = 0;
+    int k;
+    regex_pattern_t pattern;
+    regex_subroutine_t *subroutine;
+    const char *sub_name;
+    const char *sub_alias;
+
+    if((name != NULL) && (class_pattern == NULL)) {
+        if((subroutine = _regexSubroutineIndexEntryGet(&(build->context->subroutine_index), "class:", name, name_len, -1)) != NULL) {
+            // Found the class in the subroutine index
+            if(!_regexCreateTokenCall(build, subroutine->id)) {
+                return 0;
+            }
+            return 1;
+        }
+        if((class_pattern = _regexRegUnicodeCharClassGet(name, name_len)) == NULL) {
+            build->status = eCompileUnknownUnicodeClass;
+            return 0;
+        }
+        if(!_regexRegUnicodeCharClassLookup(name, name_len, &sub_name, &sub_alias)) {
+            build->status = eCompileInternalError;
+            INTERNAL_ERROR("failed to retrieve utf8 char class");
+            return 0;
+        }
+        switch(_regexSubroutineIndexRegisterPattern(&(build->context->subroutine_index), "class:",
+                                                    sub_name, sub_alias, class_pattern)) {
+            case RE_SUBROUTINE_INVALID_CALL:
+                build->status = eCompileInternalError;
+                INTERNAL_ERROR("failed to register subroutine for utf8 char class");
+                return 0;
+            case RE_SUBROUTINE_COLLISION:
+                build->status = eCompileSubroutineNameCollision;
+                return 0;
+            case RE_SUBROUTINE_OUTOFMEM:
+                build->status = eCompileOutOfMem;
+                return 0;
+            default:
+                break;
+        }
+    }
+
+    if(class_pattern != NULL) {
+        if(!regexPatternCreate(build, class_pattern, RE_STR_NULL_TERM)) {
+            build->status = eCompileOutOfMem;
+            return 0;
+        }
+    }
+
+    memset(bitmap, 0, 32);
+
+    c = _parseGetNextPatternChar(&(build->pattern->pattern), 0, NULL, NULL);
+    if(_parsePatternIsValid(&c)) {
+        _parsePatternCharAdvance(&(build->pattern->pattern), &c);
+    }
+    if(c.state == eRegexPatternEnd) {
+        build->status = eCompileCharClassIncomplete;
+        return 0;
+    }
+
+    if(c.state == eRegexPatternMetaChar && c.c == '^') {
+        invert = 1;
+        c = _parseGetNextPatternChar(&(build->pattern->pattern), 0, NULL, NULL);
+        if(_parsePatternIsValid(&c)) {
+            _parsePatternCharAdvance(&(build->pattern->pattern), &c);
+        }
+    }
+
+    for(;;) {
+        switch(c.state) {
+            case eRegexPatternInvalid:
+                build->status = eCompileEscapeCharIncomplete;
+                return 0;
+
+            case eRegexPatternInvalidEscape:
+                build->status = eCompileInvalidEscapeChar;
+                return 0;
+
+            case eRegexPatternUnicode:
+                // intentional fall through
+
+            case eRegexPatternChar:
+                if(c.c == ']') {
+                    if(range == 2) {
+                        build->status = eCompileCharClassRangeIncomplete;
+                        return 0;
+                    }
+                    goto parseClassCompleted;
+                }
+                // intentional fall through
+
+            case eRegexPatternMetaChar:
+            case eRegexPatternEscapedChar:
+                if(range == 0) {
+                    last = c.c;
+                    if(!_parseCharClassBitmapSet(build, &utf8range, bitmap, last)) {
+                        build->status = eCompileOutOfMem;
+                        return 0;
+                    }
+                    range = 1;
+                } else if(range == 1) {
+                    if(c.state != eRegexPatternEscapedChar && c.c == '-') {
+                        range = 2;
+                    } else {
+                        last = c.c;
+                        if(!_parseCharClassBitmapSet(build, &utf8range, bitmap, last)) {
+                            build->status = eCompileOutOfMem;
+                            return 0;
+                        }
+                    }
+                } else {
+                    if(!_parseCharClassBitmapRangeSet(build, &utf8range, bitmap, last, c.c)) {
+                        build->status = eCompileOutOfMem;
+                        return 0;
+                    }
+                    range = 0;
+                }
+                break;
+
+            case eRegexPatternMetaClass:
+            case eRegexPatternUnicodeMetaClass:
+                build->status = eCompileInvalidEscapeChar;
+                return 0;
+
+            case eRegexPatternEnd:
+                if(range == 2) {
+                    build->status = eCompileCharClassRangeIncomplete;
+                    return 0;
+                }
+                if(class_pattern != NULL) {
+                    goto parseClassCompleted;
+                }
+                build->status = eCompileCharClassIncomplete;
+                return 0;
+        }
+        c = _parseGetNextPatternChar(&(build->pattern->pattern), 0, NULL, NULL);
+        if(_parsePatternIsValid(&c)) {
+            _parsePatternCharAdvance(&(build->pattern->pattern), &c);
+        }
+    }
+
+    parseClassCompleted:
+
+    build->status = eCompileOk;
+
+    if(utf8range != NULL) {
+        // Merge any entries in the single byte bitmap into the utf8 tree
+        for(k = 0; k < 256; k++) {
+            if(bitmap[k / 32u] & (1u << k % 32u)) {
+                if(!_parseCreateUtf8Range(build, &utf8range, k, k)) {
+                    build->status = eCompileOutOfMem;
+                    return 0;
+                }
+            }
+        }
+
+        if(!_regexUtf8SubroutineCreate(build, utf8range, name, name_len, invert)) {
+            _regexUtf8RangeDestroy(build->context, utf8range, 1);
+            return 0;
+        }
+
+        _regexUtf8RangeDestroy(build->context, utf8range, 1);
+    } else {
+        // Strictly single byte, use a regular char class only
+        if(invert) {
+            for(k = 0; k < 8; k++) {
+                bitmap[k] ^= (unsigned int)0xFFFFFFFFu;
+            }
+        }
+
+        if((ptr = _regexAlloc(32, _regexMemContext)) == NULL) {
+            build->status = eCompileOutOfMem;
+            return 0;
+        }
+        memcpy(ptr, bitmap, 32);
+
+        if(!regexBuildConcatCharClass(build, (unsigned int *)ptr)) {
+            build->status = eCompileOutOfMem;
+            return 0;
+        }
+
+        if(name != NULL) {
+            // TODO - associate the name with this class, for diagnostic output
+        }
+    }
+
+    if(class_pattern != NULL) {
+        regexPatternDestroy(build);
+    }
+
+    return 1;
+}
 
 /////////////////////////////////////////////////////////////////////////////
 // Lexer - tokenizes the pattern
@@ -2944,7 +3425,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                         continue;
 
                     case '|': // Meta, alternative operator
-                        if(!_regexBuildAlternative(build)) {
+                        if(!regexBuildAlternative(build)) {
                             return eCompileOutOfMem;
                         }
                         continue;
@@ -3182,7 +3663,7 @@ void regexBuildContextDestroy(regex_build_ctx_t *context) {
         expr_next = expr->next;
         expr->context = NULL;
         expr->next = NULL;
-        regexExprDestroy(expr);
+        _regexDealloc(expr, _regexMemContext);
     }
     _regexTokenDestroy(NULL, context->token_pool, 1);
     _regexPtrlistFree(NULL, context->ptrlist_pool);
@@ -3198,6 +3679,7 @@ void regexBuildContextDestroy(regex_build_ctx_t *context) {
         pattern_next = pattern->next;
         _regexDealloc(pattern, _regexMemContext);
     }
+    _regexUtf8RangeDestroy(NULL, context->utf8_range_pool, 1);
     _regexDealloc(context, _regexMemContext);
 }
 
@@ -3220,16 +3702,18 @@ regex_build_t *regexBuildCreate(regex_build_ctx_t *context) {
 void regexBuildDestroy(regex_build_t *build) {
     if(build != NULL) {
         while(regexPatternDestroy(build));
-        regexExprDestroy(build->expr);
+        while(regexExprDestroy(build));
         _regexDealloc(build, _regexMemContext);
     }
 }
 
 int regexBuildFinalize(regex_build_t *build) {
+    // TODO
     if(build == NULL) {
         return 0;
     }
-    return regexExprFinalize(build->expr);
+    //return regexExprOperatorApply(build->expr, 0);
+    return 0;
 }
 
 // Expression management functions //////////////////////////////////////////
@@ -3252,7 +3736,75 @@ int regexExprCreate(regex_build_t *build) {
     return 1;
 }
 
+void _regexExprOperandPush(regex_expr_t *expr, regex_token_t *token) {
+    token->next = expr->tokens;
+    expr->tokens = token;
+}
+
+regex_token_t *_regexExprOperandPop(regex_expr_t *expr) {
+    regex_token_t *token;
+
+    if((token = expr->tokens) != NULL) {
+        expr->tokens = token->next;
+        token->next = NULL;
+    }
+    return token;
+}
+
+void _regexExprOperatorPush(regex_expr_t *expr, regex_token_t *token) {
+    token->next = expr->operators;
+    expr->operators = token;
+}
+
+regex_token_t *_regexExprOperatorPop(regex_expr_t *expr) {
+    regex_token_t *token;
+
+    if((token = expr->operators) != NULL) {
+        expr->operators = token->next;
+        token->next = NULL;
+    }
+    return token;
+}
+
+eReExprStatus_t _regexExprOperatorApply(regex_expr_t *expr) {
+    regex_token_t *operand_a, *operand_b = NULL, *operator;
+
+    operator = _regexExprOperatorPop(expr);
+    if((operand_a = _regexExprOperandPop(expr)) == NULL) {
+        return eReExprMissingOperand;
+    }
+    if(_regexTokenDetails[operator->tokenType].arity > 1) {
+        operand_b = operand_a;
+        if((operand_a = _regexExprOperandPop(expr)) == NULL) {
+            return eReExprMissingOperand;
+        }
+    }
+    if(!_regexTokenDetails[operator->tokenType].operator(expr, operand_a, operand_b, operator)) {
+        return eReExprOutOfMemory;
+    }
+    return eReExprSuccess;
+}
+
+eReExprStatus_t _regexExprFinalize(regex_expr_t *expr) {
+    eReExprStatus_t status;
+
+    if(expr->tokens == NULL) {
+        return eReExprEmpty;
+    }
+    while(expr->operators != NULL) {
+        if((status = _regexExprOperatorApply(expr)) != eReExprSuccess) {
+            return status;
+        }
+    }
+    if(expr->tokens->next != NULL) {
+        return eReExprUnusedOperands;
+    }
+    return eReExprSuccess;
+}
+
 eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token) {
+    eReExprStatus_t status;
+
     if((expr == NULL) || (token == NULL)) {
         INTERNAL_ERROR("NULL expr or token passed to _regexExprTokenPush");
         return eReExprInternalError;
@@ -3262,13 +3814,16 @@ eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token) {
         return eReExprInternalError;
     }
     if(_regexTokenDetails[token->tokenType].operator != NULL) {
-        while((expr->operators != NULL));
-
-        token->next = expr->operators;
-        expr->operators = token;
+        while((expr->operators != NULL) &&
+              (_regexTokenDetails[expr->operators->tokenType].priority >=
+               _regexTokenDetails[token->tokenType].priority)) {
+            if((status = _regexExprOperatorApply(expr)) != eReExprSuccess) {
+                return status;
+            }
+        }
+        _regexExprOperatorPush(expr, token);
     } else {
-        token->next = expr->tokens;
-        expr->tokens = token;
+        _regexExprOperandPush(expr, token);
         if((token->ptrlist = _regexPtrlistCreate(expr->context, token, eRePtrOutA)) == NULL) {
             return eReExprOutOfMemory;
         }
@@ -3276,23 +3831,19 @@ eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token) {
     return eReExprSuccess;
 }
 
-eReExprStatus_t regexExprFinalize(regex_expr_t *expr) {
-    // TODO
-    return eReExprEmpty;
-}
+int regexExprDestroy(regex_build_t *build) {
+    regex_expr_t *parent = NULL;
 
-void regexExprDestroy(regex_expr_t *expr) {
-    if(expr == NULL) {
-        return;
+    if((build == NULL) || (build->expr == NULL)) {
+        return 0;
     }
-    if(expr->context != NULL) {
-        _regexTokenDestroy(expr->context, expr->tokens, 1);
-        _regexTokenDestroy(expr->context, expr->operators, 1);
-        expr->next = expr->context->expr_pool;
-        expr->context->expr_pool = expr;
-    } else {
-        _regexDealloc(expr, _regexMemContext);
-    }
+    parent = build->expr->parent;
+    _regexTokenDestroy(build->context, build->expr->tokens, 1);
+    _regexTokenDestroy(build->context, build->expr->operators, 1);
+    build->expr->next = build->context->expr_pool;
+    build->context->expr_pool = build->expr;
+    build->expr = parent;
+    return 1;
 }
 
 // Pattern management functions /////////////////////////////////////////////
@@ -3318,19 +3869,15 @@ int regexPatternCreate(regex_build_t *build, const char *pattern, int len) {
 }
 
 int regexPatternDestroy(regex_build_t *build) {
-    regex_pattern_t *pattern;
+    regex_pattern_t *parent;
 
-    if(build->pattern == NULL) {
+    if((build == NULL) || (build->pattern == NULL)) {
         return 0;
     }
-    pattern = build->pattern;
-    build->pattern = pattern->parent;
-    if(build->context != NULL) {
-        pattern->parent = build->context->pattern_pool;
-        build->context->pattern_pool = pattern;
-    } else {
-        _regexDealloc(pattern, _regexMemContext);
-    }
+    parent = build->pattern->parent;
+    build->pattern->next = build->context->pattern_pool;
+    build->context->pattern_pool = build->pattern;
+    build->pattern = parent;
     return 1;
 }
 
