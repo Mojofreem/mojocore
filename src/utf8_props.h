@@ -10,18 +10,19 @@
 #ifndef _REGEX_DEFAULT_UAX_DB_DEFINITIONS_
 #define _REGEX_DEFAULT_UAX_DB_DEFINITIONS_
 
-#ifndef regex_unicode_class_t
-typedef struct regex_unicode_class_s regex_unicode_class_t;
-#endif // regex_unicode_class_t
+#ifndef DEF_REGEX_UNICODE_CLASS
+#define DEF_REGEX_UNICODE_CLASS
 
-#ifndef regex_unicode_class_s
+typedef struct regex_unicode_class_s regex_unicode_class_t;
+
 struct regex_unicode_class_s {
     const char *abbreviation;
     const char *property;
     const char *class_string;
     regex_unicode_class_t *next;
 };
-#endif // regex_unicode_class_s
+
+#endif // DEF_REGEX_UNICODE_CLASS
 
 /////////////////////////////////////////////////////////////////////////////
 //

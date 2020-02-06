@@ -204,6 +204,15 @@ Regex VM Bytecode (v9 - in development)
         |  Min value  |  Max value  |      program counter      |4bit op|
         +-------------+-------------+---------------------------+-------+
 
+
+subroutines
+
+    create subroutine -> id
+    name subroutine (id, name)
+    alias subroutine (id, alias)
+    assign subroutine (id, expr)
+    get subroutine (name)
+
 ///////////////////////////////////////////////////////////////////////////*/
 
 // Build the main test driver stub
@@ -381,6 +390,9 @@ typedef enum {
     ePhaseComplete
 } eRegexCompilePhase_t;
 
+#ifndef DEF_REGEX_UNICODE_CLASS
+#define DEF_REGEX_UNICODE_CLASS
+
 typedef struct regex_unicode_class_s regex_unicode_class_t;
 struct regex_unicode_class_s {
     const char *alias;
@@ -388,6 +400,8 @@ struct regex_unicode_class_s {
     const char *class_string;
     regex_unicode_class_t *next;
 };
+
+#endif // DEF_REGEX_UNICODE_CLASS
 
 #define RE_FLAG_DOT_ALL     0x1u
 
@@ -397,6 +411,10 @@ struct regex_unicode_class_s {
 #define META_CLASS_INV_WHITESPACE_PATTERN   "^ \\t\\f\\v\\r"
 #define META_CLASS_WORD_PATTERN             "a-zA-Z0-9_"
 #define META_CLASS_INV_WORD_PATTERN         "^a-zA-Z0-9_"
+
+#define DEF_UNICODE_GLYPH_SUB_PREFIX    "meta:"
+#define DEF_UNICODE_GLYPH_SUB_NAME      "glyph"
+#define DEF_UTF8_CLASS_SUB_PREFIX       "class:"
 
 // Adds a unicode property class to the global property class table. Returns 1
 // on success, or 0 if the "alias" or "name" have already been registered.
@@ -437,13 +455,14 @@ int _parseUtf8DecodeSequence(const char *str);
 
 // Token flags //////////////////////////////////////////////////////////////
 
-#define RE_TOK_FLAG_CASE_INS                0x08u   // eTokenSubExpr
+#define RE_TOK_FLAG_CASE_INS                0x10u   // eTokenSubExpr
 #define RE_TOK_FLAG_INVERT                  0x01u   // eTokenCharLiteral, eTokenUtf8Class, eTokenUtf8Literal
 #define RE_TOK_FLAG_DOT_ALL                 0x01u   // eTokenCharAny
 #define RE_TOK_FLAG_END_OF_INPUT            0x01u   // eTokenMatch
 #define RE_TOK_FLAG_COMPOUND                0x01u   // eTokenSubExprStart, eTokenSave
 #define RE_TOK_FLAG_NO_CAPTURE              0x02u   // eTokenSubExprStart
-#define RE_TOK_FLAG_SUBROUTINE              0x04u   // eTokenSubExprStart
+#define RE_TOK_FLAG_NAMED                   0x04u   // eTokenSubExprStart
+#define RE_TOK_FLAG_SUBROUTINE              0x08u   // eTokenSubExprStart
 
 #define RE_TOK_FLAG_ASSERT_START_OF_LINE    0x01u   // eTokenAssertion
 #define RE_TOK_FLAG_ASSERT_END_OF_LINE      0x02u   // eTokenAssertion
@@ -496,11 +515,14 @@ struct regex_ptrlist_s {
 
 struct regex_token_s {
     eRegexToken_t tokenType;
-    int c; // eTokenCharLiteral, eTokenUtf8Literal, eTokenUtf8Class
+    union {
+        int c; // eTokenCharLiteral, eTokenUtf8Literal, eTokenUtf8Class
+        int group; // eTokenSubExprStart, eTokenSave
+    };
     union {
         char *str; // eTokenStrLiteral
         unsigned int *bitmap; // eTokenCharClass, eTokenUtf8Class
-        int group; // eTokenSubExprStart, eTokenSave
+        char *name; // eTokenSubExprStart
         int min; // eTokenRange
         int jump; // eTokenCharLiteral
     };
@@ -533,6 +555,8 @@ typedef enum {
     eReExprUnusedOperators,
     eReExprUnusedOperands,
     eReExprMissingOperand,
+    eReExprMissingOpen,
+    eReExprInvalidClose,
     eReExprInternalError
 } eReExprStatus_t;
 
@@ -565,6 +589,7 @@ struct regex_pattern_s {
 typedef struct regex_sub_s regex_sub_t;
 struct regex_sub_s {
     char *name;
+    char *alias;
     int index;
     regex_token_t *expr;
     regex_sub_t *next;
@@ -576,8 +601,6 @@ struct regex_utf8_range_s {
     int end;
     regex_utf8_range_t *next;
 };
-
-typedef struct regex_build_s regex_build_t;
 
 struct regex_build_ctx_s {
     unsigned int flags;
@@ -591,9 +614,12 @@ struct regex_build_ctx_s {
     int next_sub;
     regex_sub_t *subroutines;
 
+    int group_count;
+
     regex_vm_t *vm;
 };
 
+typedef struct regex_build_s regex_build_t;
 struct regex_build_s {
     regex_build_ctx_t *context;
     regex_expr_t *expr;
@@ -945,12 +971,12 @@ int regexBuildConcatByte(regex_build_t *build);
 int regexBuildConcatAssertion(regex_build_t *build, int assertion);
 int regexBuildConcatUtf8Literal(regex_build_t *build, int c, int invert);
 
-int regexBuildGroupStart(regex_build_t *build, const char *name, int name_len,
-                         int no_capture, int compound, const char *subroutine, int sub_len);
-int regexBuildGroupEnd(regex_build_t *build);
+int regexBuildGroupStart(regex_build_t *build, int expr_inline, const char *name, int name_len, int no_capture,
+                         int compound, int subroutine_index);
+eReExprStatus_t regexBuildGroupEnd(regex_build_t *build);
 
-int regexBuildWrapSubexpression(regex_build_t *build, const char *name, int name_len,
-                                int no_capture, int compound, const char *subroutine, int sub_len);
+eReExprStatus_t regexBuildWrapSubexpression(regex_build_t *build, const char *name, int name_len,
+                                            int no_capture, int compound, int subroutine, int index);
 
 typedef enum {
     eReQuantifyZeroOrOne,
@@ -1080,6 +1106,24 @@ int regexExprDestroy(regex_build_t *build);
 
 int regexPatternCreate(regex_build_t *build, const char *pattern, int len);
 int regexPatternDestroy(regex_build_t *build);
+
+typedef enum {
+    eReSubOk,
+    eReSubCollision,
+    eReSubMissingName,
+    eReSubMissingExpr,
+    eReSubOutOfMemory
+} eReSuboutineResult_t;
+
+int regexSubroutineCreate(regex_build_ctx_t *context);
+static regex_sub_t *_regexSubroutineGet(regex_build_ctx_t *context, int id);
+eReSuboutineResult_t regexSubroutineName(regex_build_ctx_t *context, int id, const char *prefix, const char *name, int len);
+eReSuboutineResult_t regexSubroutineAlias(regex_build_ctx_t *context, int id, const char *prefix, const char *alias, int len);
+int regexSubroutineLookup(regex_build_ctx_t *context, const char *prefix, const char *name, int len);
+eReSuboutineResult_t regexSubroutineExprSet(regex_build_ctx_t *context, int id, regex_token_t *tokens);
+eReSuboutineResult_t regexSubroutineRegister(regex_build_ctx_t *context, const char *prefix, const char *name, const char *alias,
+                                             regex_token_t *tokens);
+void regexSubroutineFreeAll(regex_build_ctx_t *context);
 
 // Compiles a regex pattern into a VM image, and provides a status value. If the
 // compilation failed, then sufficient context for a detailed diagnostic error
@@ -2227,7 +2271,7 @@ static void _regexPtrListDump(regex_ptrlist_t *list) {
 
 // Token assembly handlers //////////////////////////////////////////////////
 
-regex_token_t *_regexAllocToken(regex_build_ctx_t *context, eRegexToken_t tokenType,
+regex_token_t *_regexTokenAlloc(regex_build_ctx_t *context, eRegexToken_t tokenType,
                                 const char *str, const unsigned int *bitmap,
                                 int len) {
     regex_token_t *token;
@@ -2301,6 +2345,7 @@ void _regexTokenDestroy(regex_build_ctx_t *context, regex_token_t *token, int fu
             case eTokenCharClass:
             case eTokenStringLiteral:
             case eTokenUtf8Class:
+            case eTokenSubExprStart:
                 if(token->str != NULL) {
                     _regexDealloc((void *)(token->str), _regexMemContext);
                 }
@@ -2328,13 +2373,13 @@ regex_token_t *_regexTokenBaseCreate(regex_build_t *build,
                                      int len) {
     regex_token_t *token, *concat;
 
-    if((token = _regexAllocToken(build->context, tokenType, str, ptr, len)) == NULL) {
+    if((token = _regexTokenAlloc(build->context, tokenType, str, ptr, len)) == NULL) {
         return NULL;
     }
 
     if((build->expr->tokens != NULL) && regexTokenIsTerminal(token, 0) && regexTokenIsTerminal(build->expr->tokens, 1)) {
         // Two adjacent terminals have an implicit concatenation
-        if((concat = _regexAllocToken(build->context, eTokenConcatenation, NULL, NULL, 0)) == NULL) {
+        if((concat = _regexTokenAlloc(build->context, eTokenConcatenation, NULL, NULL, 0)) == NULL) {
             _regexTokenDestroy(build->context, token, 0);
             return NULL;
         }
@@ -2432,42 +2477,100 @@ int regexBuildConcatUtf8Literal(regex_build_t *build, int c, int invert) {
     return 1;
 }
 
-int regexBuildGroupStart(regex_build_t *build, const char *name, int name_len,
-                         int no_capture, int compound, const char *subroutine, int sub_len) {
-    // TODO
-#if 0
-    unsigned int flags = 0;
-
-    if(sub_index >= 0) {
-        flags |= RE_TOK_FLAG_SUBROUTINE;
-    }
-    if(compound) {
-        flags |= RE_TOK_FLAG_COMPOUND;
-    }
-    if(no_capture) {
-        flags |= RE_TOK_FLAG_NO_CAPTURE;
-    }
+int regexBuildGroupStart(regex_build_t *build, int expr_inline, const char *name, int name_len, int no_capture,
+                         int compound, int subroutine_index) {
     regex_token_t *token;
 
-    if((token = _regexTokenBaseCreate(build, eTokenSubExprStart, NULL, NULL, 0, 0)) == NULL) {
+    if((token = _regexTokenBaseCreate(build, eTokenSubExprStart, name, NULL, name_len)) == NULL) {
         return 0;
     }
-    token->flags = flags;
-    token->group = group;
-    token->sub_index = (short)sub_index;
+
+    if(subroutine_index > 0) {
+        token->flags |= RE_TOK_FLAG_SUBROUTINE;
+        token->sub_index = (short)subroutine_index;
+    }
+    if(compound) {
+        token->flags |= RE_TOK_FLAG_COMPOUND;
+    }
+    if(no_capture) {
+        token->flags |= RE_TOK_FLAG_NO_CAPTURE;
+    }
+    if(expr_inline) {
+        build->context->group_count++;
+        token->group = build->context->group_count;
+    }
+
+    if(!regexExprCreate(build)) {
+        return 0;
+    }
+
     return 1;
-#endif
-    return 0;
 }
 
-int regexBuildGroupEnd(regex_build_t *build) {
-    return _regexTokenBaseCreate(build, eTokenSubExprEnd, NULL, NULL, 0) != NULL;
+eReExprStatus_t regexBuildGroupEnd(regex_build_t *build) {
+    eReExprStatus_t status;
+    regex_token_t *group, *start, *end;
+
+    if((status = _regexExprFinalize(build->expr)) != eReExprSuccess) {
+        return status;
+    }
+    if(build->expr->parent == NULL) {
+        return eReExprInvalidClose;
+    }
+    group = build->expr->tokens;
+    regexExprDestroy(build);
+
+    if(((start = _regexExprOperandPop(build->expr)) == NULL) ||
+       (start->tokenType != eTokenSubExprStart)) {
+        return eReExprMissingOpen;
+    }
+
+    if(!(start->flags & RE_TOK_FLAG_NO_CAPTURE)) {
+        start->tokenType = eTokenSave;
+
+        if((end = _regexTokenAlloc(build->context, eTokenSave, NULL, NULL, 0)) == NULL) {
+            return eReExprOutOfMemory;
+        }
+        if((end->ptrlist = _regexPtrlistCreate(build->context, end, eRePtrOutA)) == NULL) {
+            return eReExprOutOfMemory;
+        }
+        end->group = start->group;
+
+        _regexPtrlistPatch(build->context, &(start->ptrlist), group, 0);
+        _regexPtrlistPatch(build->context, &(group->ptrlist), end, 0);
+        start->ptrlist = end->ptrlist;
+        group->ptrlist = NULL;
+        end->ptrlist = NULL;
+        _regexExprOperandPush(build->expr, start);
+    } else if(start->flags & RE_TOK_FLAG_SUBROUTINE) {
+        // No capture subroutine
+        start->tokenType = eTokenCall;
+        regexSubroutineExprSet(build->context, start->sub_index, group);
+        _regexExprOperandPush(build->expr, start);
+    } else {
+        // No capture, not a subroutine
+        _regexExprOperandPush(build->expr, group);
+    }
+    return eReExprSuccess;
 }
 
-int regexBuildWrapSubexpression(regex_build_t *build, const char *name, int name_len,
-                                int no_capture, int compound, const char *subroutine, int sub_len) {
-    // TODO
-    return 0;
+eReExprStatus_t regexBuildWrapSubexpression(regex_build_t *build, const char *name, int name_len,
+                                            int no_capture, int compound, int subroutine, int index) {
+    eReExprStatus_t status;
+    regex_token_t *token;
+
+    if((status = _regexExprFinalize(build->expr)) != eReExprSuccess) {
+        return status;
+    }
+    token = _regexExprOperandPop(build->expr);
+    if(!regexBuildGroupStart(build, 0, name, RE_STR_NULL_TERM, no_capture, compound, index)) {
+        return eReExprOutOfMemory;
+    }
+    _regexExprOperandPush(build->expr, token);
+    if((status = regexBuildGroupEnd(build)) != eReExprSuccess) {
+        return status;
+    }
+    return eReExprSuccess;
 }
 
 int regexBuildQuantify(regex_build_t *build, eReQuantifier_t quantifier) {
@@ -2480,7 +2583,7 @@ int regexBuildQuantify(regex_build_t *build, eReQuantifier_t quantifier) {
         case eReQuantifyOneOrMany: type = eTokenOneOrMany; break;
         default: return 0;
     }
-    if((token = _regexAllocToken(build->context, type, NULL, NULL, 0)) == NULL) {
+    if((token = _regexTokenAlloc(build->context, type, NULL, NULL, 0)) == NULL) {
         return 0;
     }
     if(!_regexExprTokenPush(build->expr, token)) {
@@ -2491,7 +2594,7 @@ int regexBuildQuantify(regex_build_t *build, eReQuantifier_t quantifier) {
 
 int regexBuildRange(regex_build_t *build, int min, int max) {
     regex_token_t *token;
-    if((token = _regexAllocToken(build->context, eTokenRange, NULL, NULL, 0)) == NULL) {
+    if((token = _regexTokenAlloc(build->context, eTokenRange, NULL, NULL, 0)) == NULL) {
         return 0;
     }
     token->min = min;
@@ -2505,7 +2608,7 @@ int regexBuildRange(regex_build_t *build, int min, int max) {
 int regexBuildAlternative(regex_build_t *build) {
     regex_token_t *token;
 
-    if((token = _regexAllocToken(build->context, eTokenAlternative, NULL, NULL, 0)) != NULL) {
+    if((token = _regexTokenAlloc(build->context, eTokenAlternative, NULL, NULL, 0)) != NULL) {
         return 0;
     }
     if(!_regexExprTokenPush(build->expr, token)) {
@@ -2515,7 +2618,7 @@ int regexBuildAlternative(regex_build_t *build) {
 }
 
 int regexCreateTokenJmp(regex_build_ctx_t *context, regex_token_t **token) {
-    if((*token = _regexAllocToken(context, eTokenJmp, NULL, NULL, 0)) == NULL) {
+    if((*token = _regexTokenAlloc(context, eTokenJmp, NULL, NULL, 0)) == NULL) {
         return 0;
     }
     return 1;
@@ -3029,6 +3132,68 @@ int regexEscapeCharLen(const char *str, int *stride) {
 //               |<------------ 3 byte group ---------->|
 // |<------------------ 4 byte group ------------------>|
 
+static int _regexUtf8SubroutineCreate(regex_build_t *build, regex_utf8_range_t *utf8range,
+                                      const char *name, int name_len, int invert) {
+    unsigned int bitmap[32];
+    int use_char_class = 0;
+    int next_codepoint = 128;
+    regex_utf8_segment_t segment;
+    regex_utf8_range_t *walk;
+    int k;
+
+    memset(bitmap, 0, 32);
+
+    for(walk = utf8range; walk != NULL; walk = walk->next) {
+        if((walk->start <= 127) && (walk->end <= 127)) {
+            for(k = walk->start; ((k <= 127) && (k <= walk->end)); k++) {
+                bitmap[k / 32u] |= (1u << (k % 32u));
+            }
+            use_char_class = 1;
+            continue;
+        }
+        break;
+    }
+    if(use_char_class) {
+        // low byte char class is needed
+        // TODO
+    }
+
+    memset(&segment, 0, sizeof(regex_utf8_segment_t));
+
+    for(walk = utf8range; walk != NULL; walk = walk->next) {
+        keep_processing:
+        switch(_regexUtf8RangeSegment(&next_codepoint, walk->start, walk->end, &segment)) {
+            case eReUtf8SegDoneRangeRemaining:
+                if(!_regexUtf8SegmentGenerate(build, &segment)) {
+                    build->status = eCompileOutOfMem;
+                    return 0;
+                }
+                memset(&segment, 0, sizeof(regex_utf8_segment_t));
+                goto keep_processing;
+
+            case eReUtf8SegDoneNextRange:
+                if(!_regexUtf8SegmentGenerate(build, &segment)) {
+                    build->status = eCompileOutOfMem;
+                    return 0;
+                }
+                memset(&segment, 0, sizeof(regex_utf8_segment_t));
+                break;
+
+            case eReUtf8SegKeepNextRange:
+                break;
+        }
+    }
+    if(segment.bytes) {
+        if(!_regexUtf8SegmentGenerate(build, &segment)) {
+            build->status = eCompileOutOfMem;
+            return 0;
+        }
+    }
+
+    // TODO - register the subroutine
+    return 1;
+}
+
 regex_utf8_range_t *_regexUtf8RangeCreate(regex_build_ctx_t *context, int start, int end) {
     regex_utf8_range_t *range;
 
@@ -3159,14 +3324,16 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class
     int last = 0;
     int k;
     regex_pattern_t pattern;
-    regex_subroutine_t *subroutine;
+    int index;
+    regex_token_t *token;
     const char *sub_name;
     const char *sub_alias;
 
+    // TODO - re-evaluate character class interactions with subroutines
     if((name != NULL) && (class_pattern == NULL)) {
-        if((subroutine = _regexSubroutineIndexEntryGet(&(build->context->subroutine_index), "class:", name, name_len, -1)) != NULL) {
+        if((index = regexSubroutineLookup(build->context, DEF_UTF8_CLASS_SUB_PREFIX, name, name_len)) > 0) {
             // Found the class in the subroutine index
-            if(!_regexCreateTokenCall(build, subroutine->id)) {
+            if(!regexBuildConcatCall(build, index)) {
                 return 0;
             }
             return 1;
@@ -3180,16 +3347,19 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class
             INTERNAL_ERROR("failed to retrieve utf8 char class");
             return 0;
         }
-        switch(_regexSubroutineIndexRegisterPattern(&(build->context->subroutine_index), "class:",
-                                                    sub_name, sub_alias, class_pattern)) {
-            case RE_SUBROUTINE_INVALID_CALL:
+        // TODO - build the class pattern
+        token = NULL;
+        switch(regexSubroutineRegister(build->context, DEF_UTF8_CLASS_SUB_PREFIX,
+                                       sub_name, sub_alias, token)) {
+            case eReSubMissingName:
+            case eReSubMissingExpr:
                 build->status = eCompileInternalError;
                 INTERNAL_ERROR("failed to register subroutine for utf8 char class");
                 return 0;
-            case RE_SUBROUTINE_COLLISION:
+            case eReSubCollision:
                 build->status = eCompileSubroutineNameCollision;
                 return 0;
-            case RE_SUBROUTINE_OUTOFMEM:
+            case eReSubOutOfMemory:
                 build->status = eCompileOutOfMem;
                 return 0;
             default:
@@ -3358,10 +3528,9 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
     parse_str_t str_count;
     int len;
     const char *str;
+    const char *name;
+    int name_len;
     unsigned int flags;
-    regex_subroutine_t *routine;
-    int subexpr;
-    int named;
     int index;
 
     if(build->pattern == NULL) {
@@ -3434,10 +3603,10 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                         // Grouped subexpression, complex operator, resolves to a compound operand
                         // Speculative subexpression number. If non-capturing, will NOT actually
                         // increase the group count.
-                        subexpr = build->context->group_count;
                         flags = 0;
-                        named = 0;
-                        index = -1;
+                        index = 0;
+                        name_len = 0;
+                        name = NULL;
                         // Check for group meta modifiers
                         while(*(build->pattern->pattern) == '?') {
                             build->pattern->pattern++;
@@ -3446,66 +3615,91 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                                 flags |= RE_TOK_FLAG_CASE_INS;
                             } else if(_parseCheckNextPatternChar(&(build->pattern->pattern), 'P')) {
                                 // Named sub expression
-                                if(named || (flags & (RE_TOK_FLAG_SUBROUTINE | RE_TOK_FLAG_NO_CAPTURE))) {
+                                if(flags & (RE_TOK_FLAG_NAMED | RE_TOK_FLAG_NO_CAPTURE)) {
                                     return eCompileConflictingAttrs;
                                 }
-                                if(_parseCheckIdentifier(build->pattern->pattern, '<', '>', &str, &len) != eRegexPatternIdOk) {
+                                if(_parseCheckIdentifier(build->pattern->pattern, '<', '>', &name, &name_len) != eRegexPatternIdOk) {
                                     return eCompileMalformedSubExprName;
                                 }
-                                build->pattern->pattern += len + 2;
-                                if(regexVMGroupTableEntryAdd(build, str, len, subexpr) < 0) {
-                                    return eCompileOutOfMem;
-                                }
-                                named = 1;
+                                build->pattern->pattern += name_len + 2;
+                                flags |= RE_TOK_FLAG_NAMED;
                             } else if(_parseCheckNextPatternChar(&(build->pattern->pattern), ':')) {
                                 // Non-capturing subexpression
-                                if(named || (flags & (RE_TOK_FLAG_COMPOUND))) {
+                                if(flags & (RE_TOK_FLAG_COMPOUND | RE_TOK_FLAG_NAMED)) {
                                     return eCompileConflictingAttrs;
                                 }
                                 flags |= RE_TOK_FLAG_NO_CAPTURE;
                             } else if(_parseCheckNextPatternChar(&(build->pattern->pattern), '*')) {
                                 // Compound capturing subexpression
-                                if(flags & (RE_TOK_FLAG_NO_CAPTURE | RE_TOK_FLAG_SUBROUTINE)) {
+                                if(flags & (RE_TOK_FLAG_NO_CAPTURE)) {
                                     return eCompileConflictingAttrs;
                                 }
                                 flags |= RE_TOK_FLAG_COMPOUND;
                             } else if(_parseCheckNextPatternChar(&(build->pattern->pattern), 'R')) {
                                 // Named subroutine
-                                if(named || (flags & RE_TOK_FLAG_COMPOUND)) {
+                                if(flags & (RE_TOK_FLAG_SUBROUTINE)) {
                                     return eCompileConflictingAttrs;
                                 }
                                 if(_parseCheckIdentifier(build->pattern->pattern, '<', '>', &str, &len) != eRegexPatternIdOk) {
                                     return eCompileMalformedSubExprName;
                                 }
                                 build->pattern->pattern += len + 2;
-                                if((index = _regexSubroutineIndexRegisterIntent(&(build->build_ctx->subroutine_index), NULL, str, len,
-                                                                                NULL, 0)) < 0) {
-                                    if(index == RE_SUBROUTINE_COLLISION) {
-                                        return eCompileSubroutineNameCollision;
-                                    }
+                                if(!(index = regexSubroutineCreate(build->context))) {
                                     return eCompileOutOfMem;
                                 }
-                                flags |= RE_TOK_FLAG_SUBROUTINE | RE_TOK_FLAG_NO_CAPTURE;
+                                switch(regexSubroutineName(build->context, index, NULL, str, len)) {
+                                    case eReSubCollision:
+                                        return eCompileSubroutineNameCollision;
+                                    case eReSubOutOfMemory:
+                                        return eCompileOutOfMem;
+                                    case eReSubOk:
+                                        break;
+                                    default:
+                                        INTERNAL_ERROR("unanticipated response from regexSubroutineName() in _regexTokenizePattern()");
+                                        return eCompileInternalError;
+                                }
+                                flags |= RE_TOK_FLAG_SUBROUTINE;
                             } else {
                                 return eCompileUnsupportedMeta;
                             }
                         }
-                        if(!named) {
-                            if(regexVMGroupTableEntryAdd(build, NULL, 0, subexpr) < 0) {
-                                return eCompileOutOfMem;
-                            }
+                        if(!(flags & RE_TOK_FLAG_NO_CAPTURE)) {
+                            build->context->group_count++;
                         }
-                        build->build_ctx->group_count++;
-                        if(!_regexCreateTokenSubExprStart(build, subexpr, index, (int)(flags & RE_TOK_FLAG_COMPOUND), (int)(flags & RE_TOK_FLAG_NO_CAPTURE))) {
+                        if(!regexBuildGroupStart(build,
+                                                 ((flags & RE_TOK_FLAG_NO_CAPTURE) ? 0 : 1),
+                                                 name, name_len,
+                                                 (int)(flags & RE_TOK_FLAG_NO_CAPTURE),
+                                                 (int)(flags & RE_TOK_FLAG_COMPOUND),
+                                                 index)) {
                             return eCompileOutOfMem;
                         }
                         continue;
 
                     case ')': // Meta, end of subexpression (group)
-                        if(!regexBuildGroupEnd(build)) {
-                            return eCompileOutOfMem;
+                        // This should only be encountered in a recursive call
+                        // (initiated by an opening group meta character)
+                        switch(_regexExprFinalize(build->expr)) {
+                            case eReExprSuccess:
+                                regexBuildGroupEnd(build);
+                                return build->status;
+                            case eReExprOutOfMemory:
+                                return eCompileOutOfMem;
+                            case eReExprEmpty:
+                                return eCompileMissingPattern;
+                            case eReExprUnclosed:
+                                return eCompileMissingSubexprEnd;
+                            case eReExprUnusedOperators:
+                                return eCompileMissingOperand;
+                            case eReExprUnusedOperands:
+                                INTERNAL_ERROR("unused operands in group subexpression");
+                                return eCompileInternalError;
+                            case eReExprMissingOperand:
+                                return eCompileMissingOperand;
+                            default:
+                            case eReExprInternalError:
+                                return eCompileInternalError;
                         }
-                        continue;
 
                     case '^': // Meta, assertion - start of line
                         if(!regexBuildConcatAssertion(build, RE_TOK_FLAG_ASSERT_START_OF_LINE)) {
@@ -3539,21 +3733,20 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
             case eRegexPatternMetaClass:
                 switch(c.c) {
                     case 'R': // subroutine call
-                        if((routine = _regexSubroutineIndexEntryGet(&(build->build_ctx->subroutine_index), NULL, str, len, -1)) == NULL) {
+                        if(!(index = regexSubroutineLookup(build->context, NULL, str, len))) {
                             return eCompileUnknownSubroutine;
                         }
-                        if(!regexBuildConcatCall(build, routine->id)) {
+                        if(!regexBuildConcatCall(build, index)) {
                             return eCompileOutOfMem;
                         }
-                        routine->is_ref = 1;
                         continue;
 #ifdef MOJO_REGEX_UNICODE
                     case 'X': // full unicode glyph (base + markers)
-                        if((routine = _regexSubroutineIndexEntryGet(&(build->build_ctx->subroutine_index), "meta", "glyph", len, -1)) == NULL) {
+                        if(!(index = regexSubroutineLookup(build->context, DEF_UNICODE_GLYPH_SUB_PREFIX, DEF_UNICODE_GLYPH_SUB_NAME, RE_STR_NULL_TERM))) {
                             INTERNAL_ERROR("glyph subroutine is missing");
                             return eCompileUnknownSubroutine;
                         }
-                        if(!regexBuildConcatCall(build, routine->id)) {
+                        if(!regexBuildConcatCall(build, index)) {
                             return eCompileOutOfMem;
                         }
                         continue;
@@ -3650,6 +3843,7 @@ regex_build_ctx_t *regexBuildContextCreate(unsigned int flags) {
         _regexDealloc(context, _regexMemContext);
         return NULL;
     }
+    context->next_sub = 1;
     return context;
 }
 
@@ -3659,6 +3853,7 @@ void regexBuildContextDestroy(regex_build_ctx_t *context) {
     regex_expr_t *expr, *expr_next;
 
     regexVMDestroy(context->vm);
+    regexSubroutineFreeAll(context);
     for(expr = context->expr_pool; expr != NULL; expr = expr_next) {
         expr_next = expr->next;
         expr->context = NULL;
@@ -3879,6 +4074,145 @@ int regexPatternDestroy(regex_build_t *build) {
     build->context->pattern_pool = build->pattern;
     build->pattern = parent;
     return 1;
+}
+
+// Subroutine management functions //////////////////////////////////////////
+
+int regexSubroutineCreate(regex_build_ctx_t *context) {
+    regex_sub_t *sub;
+
+    if(context == NULL) {
+        return 0;
+    }
+
+    if((sub = _regexAlloc(sizeof(regex_sub_t), _regexMemContext)) == NULL) {
+        return 0;
+    }
+    sub->index = context->next_sub;
+    context->next_sub++;
+    sub->next = context->subroutines;
+    context->subroutines = sub;
+    return sub->index;
+}
+
+static regex_sub_t *_regexSubroutineGet(regex_build_ctx_t *context, int id) {
+    regex_sub_t *walk;
+
+    for(walk = context->subroutines; walk != NULL; walk = walk->next) {
+        if(id == walk->index) {
+            return walk;
+        }
+    }
+    return NULL;
+}
+
+eReSuboutineResult_t regexSubroutineName(regex_build_ctx_t *context, int id, const char *prefix, const char *name, int len) {
+    regex_sub_t *sub;
+
+    if((sub = _regexSubroutineGet(context, id)) == NULL) {
+        return 0;
+    }
+    if(sub->name != NULL) {
+        _regexDealloc(sub->name, _regexMemContext);
+    }
+    if((sub->name = _regexPrefixedStrdup(prefix, name, len)) == NULL) {
+        return 0;
+    }
+    return 1;
+}
+
+eReSuboutineResult_t regexSubroutineAlias(regex_build_ctx_t *context, int id, const char *prefix, const char *alias, int len) {
+    regex_sub_t *sub;
+
+    if((sub = _regexSubroutineGet(context, id)) == NULL) {
+        return 0;
+    }
+    if(sub->alias != NULL) {
+        _regexDealloc(sub->alias, _regexMemContext);
+    }
+    if((sub->name = _regexPrefixedStrdup(prefix, alias, len)) == NULL) {
+        return 0;
+    }
+    return 1;
+}
+
+int regexSubroutineLookup(regex_build_ctx_t *context, const char *prefix, const char *name, int len) {
+    regex_sub_t *walk;
+
+    for(walk = context->subroutines; walk != NULL; walk = walk->next) {
+        if(!_regexPrefixedStrncmp((const unsigned char *)prefix,
+                                  (const unsigned char *)walk->name, RE_STR_NULL_TERM,
+                                  (const unsigned char *)name, len)) {
+            return walk->index;
+        }
+        if(!_regexPrefixedStrncmp((const unsigned char *)prefix,
+                                  (const unsigned char *)walk->alias, RE_STR_NULL_TERM,
+                                  (const unsigned char *)name, len)) {
+            return walk->index;
+        }
+    }
+    return 0;
+}
+
+eReSuboutineResult_t regexSubroutineExprSet(regex_build_ctx_t *context, int id, regex_token_t *tokens) {
+    regex_sub_t *sub;
+
+    // TODO - fix return values
+    if((sub = _regexSubroutineGet(context, id)) == NULL) {
+        return 0;
+    }
+    if(sub->expr != NULL) {
+        return 0;
+    }
+    sub->expr = tokens;
+    // TODO - append eTokenReturn
+    return 1;
+}
+
+eReSuboutineResult_t regexSubroutineRegister(regex_build_ctx_t *context, const char *prefix, const char *name, const char *alias,
+                                             regex_token_t *tokens) {
+    int id;
+
+    if(((name == NULL) && (alias == NULL)) || (tokens == NULL)) {
+        return 0;
+    }
+    if(!(id = regexSubroutineCreate(context))) {
+        return 0;
+    }
+    if(name != NULL) {
+        if(!regexSubroutineName(context, id, NULL, name, RE_STR_NULL_TERM)) {
+            return 0;
+        }
+    }
+    if(alias != NULL) {
+        if(!regexSubroutineAlias(context, id, NULL, alias, RE_STR_NULL_TERM)) {
+            return 0;
+        }
+    }
+    if(!regexSubroutineExprSet(context, id, tokens)) {
+        return 0;
+    }
+    return id;
+}
+
+void regexSubroutineFreeAll(regex_build_ctx_t *context) {
+    regex_sub_t *walk, *next;
+
+    for(walk = context->subroutines, next = NULL; walk != NULL; walk = next) {
+        next = walk->next;
+        if(walk->expr != NULL) {
+            _regexTokenDestroy(NULL, walk->expr, 1);
+        }
+        if(walk->name != NULL) {
+            _regexDealloc(walk->name, _regexMemContext);
+        }
+        if(walk->alias != NULL) {
+            _regexDealloc(walk->alias, _regexMemContext);
+        }
+        _regexDealloc(walk, _regexMemContext);
+    }
+    context->subroutines = NULL;
+    context->next_sub = 1;
 }
 
 // Pattern compilation direct to VM convenience function ////////////////////
