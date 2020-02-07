@@ -8,16 +8,16 @@ Regex VM Bytecode (v9 - in development)
     Each operation is encoded into a single 32 bit int value:
 
        +-------------------------------+-------------------------------+
-       |  3                   2        '          1                    |
-       |1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6'5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0|
+       |                    1          '        2                   3  |
+       |0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5'6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1|
        +-------------------------------+-------------------------------+
-       |                              1'                               |
-       |F E D C B A 9 8 7 6 5 4 3 2 1 0'F E D C B A 9 8 7 6 5 4 3 2 1 0|
-       +---------------------------+---+-----------------------+-------+
-       |         31 ... 18         |          17 ... 4         | 3...0 |
-       +---------------------------+---------------------------+-------+
-       |    14 bits (operand A)    |     14 bits (operand B)   |4bit op|
-       +---------------------------+---------------------------+-------+
+       |                               '1                              |
+       |0 1 2 3 4 5 6 7 8 9 A B C D E F'0 1 2 3 4 5 6 7 8 9 A B C D E F|
+       +-------+-----------------------+---+---------------------------+
+       | 0...3 |          4 ... 17         |         18 ... 31         |
+       +-------+---------------------------+---------------------------+
+       |4bit op|    14 bits (operand A)    |    14 bits (operand B)    |
+       +-------+---------------------------+---------------------------+
 
     Operators:               opcode     Operand A               Operand B
         eTokenCharLiteral       0       char to match           program counter
@@ -42,24 +42,25 @@ Regex VM Bytecode (v9 - in development)
     Note about eTokenCharLiteral:
 
        +-------------------------------+-------------------------------+
-       |  3                   2        '          1                    |
-       |1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6'5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0|
+       |                    1          '        2                   3  |
+       |0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5'6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1|
        +-------------------------------+-------------------------------+
-       |                              1'                               |
-       |F E D C B A 9 8 7 6 5 4 3 2 1 0'F E D C B A 9 8 7 6 5 4 3 2 1 0|
-       +-+---------+---------------+---+-----------------------+-------+
-       | |         |   25 ... 18   |          17 ... 4         | 3...0 |
-       +-+---------+---------------+---------------------------+-------+
-       |I| unused  |      char     |   (opt) program counter   |4bit op|
-       +-+---------+---------------+---------------------------+-------+
+       |                               '1                              |
+       |0 1 2 3 4 5 6 7 8 9 A B C D E F'0 1 2 3 4 5 6 7 8 9 A B C D E F|
+       +-------+---------------+-------+-+-+---------------------------+
+       | 0...3 |    4 ... 11   |         | |         18 ... 31         |
+       +-------+---------------+---------+-+---------------------------+
+       |4bit op|     char      | unused  |I|   (opt) program counter   |
+       +-------+---------------+---------+-+---------------------------+
 
         Matches the character specified. If the inverse flag (I) is set, the
         logic is inverted, and the instruction matches any character EXCEPT the
         character specified. Operand B is optional, and, if specified, is the
-        program counter to jmp to in the case of not match. If the value is
-        0x3FFF, then the instruction reverts to default no match behaviour.
-        Note that this instruction matches a single BYTE. For utf8 literals,
-        use the eTokenUtf8Literal.
+        program counter to jmp to in the case of no match (effectively, this
+        integrates a reduced split either/or case). If the value is 0x3FFF,
+        then the instruction reverts to default no match behaviour. Note that
+        this instruction matches a single BYTE. For utf8 literals, use the
+        eTokenUtf8Literal.
 
     Note about eTokenCharAny:
         In ASCII mode, this instruction matches any character _except_
@@ -85,22 +86,22 @@ Regex VM Bytecode (v9 - in development)
     Note about eTokenUtf8Class:
 
        +-------------------------------+-------------------------------+
-       |  3                   2        '          1                    |
-       |1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6'5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0|
+       |                    1          '        2                   3  |
+       |0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5'6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1|
        +-------------------------------+-------------------------------+
-       |                              1'                               |
-       |F E D C B A 9 8 7 6 5 4 3 2 1 0'F E D C B A 9 8 7 6 5 4 3 2 1 0|
-       +---+-----------+-----------+-+-+-----------------------+-------+
-       |   |  29...24  |  23...18  | |        16 ... 4         | 3...0 |
-       +---+-----------+-----------+-+-------------------------+-------+
-       |Num|  midhigh  |  midlow   |I|     utf8 class index    |4bit op|
-       +---+-----------+-----------+-+-------------------------+-------+
+       |                               '1                              |
+       |0 1 2 3 4 5 6 7 8 9 A B C D E F'0 1 2 3 4 5 6 7 8 9 A B C D E F|
+       +-------+-----------------------+-+-+-----------+-----------+---+
+       | 0...3 |          4 ... 16       | | 18 ... 23 | 24 ... 29 |   |
+       +-------+-------------------------+-+-----------+-----------+---+
+       |4bit op|     utf8 class index    |I|  midlow   |  midhigh  |Enc|
+       +-------+-------------------------+-+-----------+-----------+---+
 
         This instruction represents the low bytes of a utf8 encoding (for 2, 3,
         and 4 byte encodings). For single byte encodings, a standard char class
         is used. num is the number of low bytes to match, with the lowest
-        being the class bitmap range specified in operand B, and the midlow,
-        and midhigh bytes stored in operand A. The low byte encoding is 6 bits
+        being the class bitmap range specified in operand A, and the midlow,
+        and midhigh bytes stored in operand B. The low byte encoding is 6 bits
         per byte, with the 2 bit 0x80 prefix removed. If the inverse bit (I) is
         set, then the match logic is inverted for all bytes present, including
         the class bitmap (it is NOT pre-inverted).
@@ -174,35 +175,33 @@ Regex VM Bytecode (v9 - in development)
     Note about eTokenUtf8Literal:
 
        +-------------------------------+-------------------------------+
-       |  3                   2        '          1                    |
-       |1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6'5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0|
+       |                    1          '        2                   3  |
+       |0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5'6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1|
        +-------------------------------+-------------------------------+
-       |                              1'                               |
-       |F E D C B A 9 8 7 6 5 4 3 2 1 0'F E D C B A 9 8 7 6 5 4 3 2 1 0|
-       +-+-----------+-----------------+-----------------------+-------+
-       | |           |                24 ... 4                 | 3...0 |
-       +-+-----------+-----------------------------------------+-------+
-       |I|  unused   |                codepoint                |4bit op|
-       +-+-----------+-----------------------------------------+-------+
+       |                               '1                              |
+       |0 1 2 3 4 5 6 7 8 9 A B C D E F'0 1 2 3 4 5 6 7 8 9 A B C D E F|
+       +-------+-----------------------+-----------------+-----------+-+
+       | 0...3 |                 4 ... 24                |           | |
+       +-------+-----------------------------------------+-----------+-+
+       |4bit op|                 codepoint               |  unused   |I|
+       +-------+-----------------------------------------+-----------+-+
 
         This instruction explicitly matches the encoded utf8 codepoint. The
-        high two bits (Num) represent the byte encoding (0 - 1 byte, 1 - 2
-        byte, 2 - 3 byte, and 3 - 4 byte). The inverse bit (I) will match any
-        character other than the one specified.
+        inverse bit (I) will match any character other than the one specified.
 
     Note about eTokenRange:
 
         +-------------------------------+-------------------------------+
-        |  3                   2        '          1                    |
-        |1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6'5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0|
+        |                    1          '        2                   3  |
+        |0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5'6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1|
         +-------------------------------+-------------------------------+
-        |                              1'                               |
-        |F E D C B A 9 8 7 6 5 4 3 2 1 0'F E D C B A 9 8 7 6 5 4 3 2 1 0|
-        +-------------+-------------+---+-----------------------+-------+
-        |  31 ... 25  |  24 ... 18  |          17 ... 4         | 3...0 |
-        +-------------+-------------+---------------------------+-------+
-        |  Min value  |  Max value  |      program counter      |4bit op|
-        +-------------+-------------+---------------------------+-------+
+        |                               '1                              |
+        |0 1 2 3 4 5 6 7 8 9 A B C D E F'0 1 2 3 4 5 6 7 8 9 A B C D E F|
+        +-------+-----------------------+---+-------------+-------------+
+        | 0...3 |          4 ... 17         |  18 ... 24  |  25 ... 31  |
+        +-------+---------------------------+-------------+-------------+
+        |4bit op|      program counter      |  Min value  |  Max value  |
+        +-------+---------------------------+---------------------------+
 
 ///////////////////////////////////////////////////////////////////////////*/
 
@@ -303,6 +302,17 @@ struct regex_vm_s {
 #ifdef MOJO_REGEX_VM_DEBUG
     regex_vm_sub_names_t *sub_name_table;
 #endif // MOJO_REGEX_VM_DEBUG
+};
+
+typedef struct regex_match_s regex_match_t;
+struct regex_match_s {
+    const char *text;
+    int len;
+    const char *pos;
+    regex_vm_t *vm;
+    const char **subexprs;
+    const char ***compound;
+    const char _buffer[0];
 };
 
 // Global memory allocator prototypes. If you change these, be sure and do so
@@ -440,6 +450,10 @@ void regexRegUnicodeCharClassRemove(const char *classId);
 #define UTF8_LOW_BYTE_MASK      0xC0u
 #define UTF8_LOW_BYTE_BITMASK   0x3Fu
 
+// Returns the number of bytes required to utf8 encode the codepoint that
+// begins the utf8 encoded sequence starting with byte 'c'
+int _parseUtf8EncodedHighByte(char c);
+
 // Parses a utf8 encoded string sequence, and returns the codepoint value.
 // Returns -1 if the str is not a multibyte utf8 encoded sequence.
 int _parseUtf8DecodeSequence(const char *str);
@@ -468,19 +482,19 @@ int _parseUtf8DecodeSequence(const char *str);
 // VM instruction flags /////////////////////////////////////////////////////
 
 // Map instruction bits to operand bit positions
-#define VM_OP_A_BIT(bit)    ((0x1u << (bit)) >> 18u)
-#define VM_OP_B_BIT(bit)    ((0x1u << (bit)) >> 4u)
+#define RE_VM_INSTR_BIT(bit)    (1u << (bit))
 
-#define RE_VM_FLAG_CHAR_INVERT          VM_OP_A_BIT(31u)
-#define RE_VM_FLAG_CHARANY_DOTALL       0x1u
-#define RE_VM_FLAG_MATCH_END_OF_INPUT   0x1u
-#define RE_VM_FLAG_SAVE_COMPOUND        0x1u
-#define RE_VM_FLAG_UTF8_CLASS_INVERT    VM_OP_B_BIT(17u)
 #define RE_VM_FLAG_ASSERT_START_OF_LINE 0x0u
 #define RE_VM_FLAG_ASSERT_END_OF_LINE   0x1u
 #define RE_VM_FLAG_ASSERT_START_OF_WORD 0x2u
 #define RE_VM_FLAG_ASSERT_END_OF_WORD   0x3u
-#define RE_VM_FLAG_UTF8_LITERAL_INVERT  VM_OP_A_BIT(29u)
+
+#define RE_VM_FLAG_CHAR_INVERT          RE_VM_INSTR_BIT(17u)
+#define RE_VM_FLAG_CHARANY_DOTALL       RE_VM_INSTR_BIT(4u)
+#define RE_VM_FLAG_MATCH_END_OF_INPUT   RE_VM_INSTR_BIT(4u)
+#define RE_VM_FLAG_SAVE_COMPOUND        RE_VM_INSTR_BIT(18u)
+#define RE_VM_FLAG_UTF8_CLASS_INVERT    RE_VM_INSTR_BIT(17u)
+#define RE_VM_FLAG_UTF8_LITERAL_INVERT  RE_VM_INSTR_BIT(31u)
 
 #define RE_VM_OPCODE_MASK   0xFu
 #define RE_VM_OP_A_MASK     0xFFFC0000u
@@ -489,6 +503,51 @@ int _parseUtf8DecodeSequence(const char *str);
 #define RE_VM_OP_B_OFFSET   4u
 #define RE_VM_OP_A_FROM_INSTR(instr)    ((((unsigned)instr) & RE_VM_OP_A_MASK) >> RE_VM_OP_A_OFFSET)
 #define RE_VM_OP_B_FROM_INSTR(instr)    ((((unsigned)instr) & RE_VM_OP_B_MASK) >> RE_VM_OP_B_OFFSET)
+
+// VM instruction operand/flag/value setter/getter macros ///////////////////
+
+// eTokenCharLiteral
+#define RE_VM_ENC_CHAR_TO_INSTR(c)          ((((unsigned)c) & 0xFFu) << 4u)
+#define RE_VM_DEC_CHAR_FROM_INSTR(instr)    ((instr & 0xFF0u) >> 4u)
+#define RE_VM_FLAG_CHAR_INVERT_TO_INSTR()   RE_VM_FLAG_CHAR_INVERT
+#define RE_VM_FLAG_CHAR_INVERT_FROM_INSTR(instr) (instr & RE_VM_FLAG_CHAR_INVERT)
+
+// eTokenCharAny
+#define RE_VM_FLAG_DOTALL_TO_INSTR()            RE_VM_FLAG_CHARANY_DOTALL
+#define RE_VM_FLAG_DOTALL_FROM_INSTR(instr)     (instr & RE_VM_FLAG_CHARANY_DOTALL)
+
+// eTokenMatch
+#define RE_VM_FLAG_EOF_TO_INSTR()               RE_VM_FLAG_MATCH_END_OF_INPUT
+#define RE_VM_FLAG_EOF_FROM_INSTR(instr)        (instr & RE_VM_FLAG_MATCH_END_OF_INPUT)
+
+// eTokenSave
+#define RE_VM_FLAG_COMPOUND_TO_INSTR()          RE_VM_FLAG_SAVE_COMPOUND
+#define RE_VM_FLAG_COMPOUND_FROM_INSTR(instr)   (instr & RE_VM_FLAG_SAVE_COMPOUND)
+
+// eTokenUtf8Class
+#define RE_VM_ENC_UTF8_INDEX_TO_INSTR(idx)              ((((unsigned)idx) & 0x1FFFu) << 4u)
+#define RE_VM_DEC_UTF8_INDEX_FROM_INSTR(instr)          ((instr & 0x1FFF0u) >> 4u)
+#define RE_VM_FLAG_UTF8_CLASS_INVERT_TO_INSTR()         RE_VM_FLAG_UTF8_CLASS_INVERT
+#define RE_VM_FLAG_UTF8_CLASS_INVERT_FROM_INSTR(instr)  (instr & RE_VM_FLAG_UTF8_CLASS_INVERT)
+#define RE_VM_FLAG_UTF8_CLASS_ENC_TO_INSTR(enc)         ((((unsigned)enc) & 0x3u) << 30u)
+#define RE_VM_FLAG_UTF8_CLASS_ENC_FROM_INSTR(enc)       ((instr & 0xC0000000u) >> 30u)
+#define RE_VM_ENC_UTF8_MIDLOW_TO_INSTR(midlow)          ((((unsigned)midlow) & 0x3Fu) << 18u)
+#define RE_VM_DEC_UTF8_MIDLOW_FROM_INSTR(instr)         ((instr & 0xFC0000u) >> 18u)
+#define RE_VM_ENC_UTF8_MIDHIGH_TO_INSTR(midhigh)        ((((unsigned)midhigh) & 0x3Fu) << 24u)
+#define RE_VM_DEC_UTF8_MIDHIGH_FROM_INSTR(instr)        ((instr & 0x3F000000u) >> 24u)
+
+// eTokenUtf8Literal
+#define RE_VM_ENC_UTF8_LITERAL_TO_INSTR(codepoint)          ((((unsigned)codepoint) & 0x10FFFFu) << 4u)
+#define RE_VM_DEC_UTF8_LITERAL_FROM_INSTR(instr)            ((instr & 0x10FFFF0u) >> 4u)
+#define RE_VM_FLAG_UTF8_LITERAL_INVERT_TO_INSTR()           RE_VM_FLAG_UTF8_LITERAL_INVERT
+#define RE_VM_FLAG_UTF8_LITERAL_INVERT_FROM_INSTR(instr)    (instr & RE_VM_FLAG_UTF8_LITERAL_INVERT)
+
+// eTokenRange
+#define RE_VM_ENC_RANGE_MIN_TO_INSTR(m)         ((((unsigned)m) & 0x3Fu) << 20u)
+#define RE_VM_DEC_RANGE_MIN_FROM_INSTR(instr)   (((instr & 0x3F00000u) >> 20u) & 0x3Fu)
+#define RE_VM_ENC_RANGE_MAX_TO_INSTR(m)         ((((unsigned)m) & 0x3Fu) << 26u)
+#define RE_VM_DEC_RANGE_MAX_FROM_INSTR(instr)   (((instr & 0xFC000000u) >> 26u) & 0x3Fu)
+
 
 typedef enum {
     eRePtrOutA,
@@ -632,11 +691,39 @@ struct regex_compound_s {
     regex_compound_t *next;
 };
 
+#define RE_VM_THREAD_INVERT_UTF8_FLAG   0x100u
+#define RE_VM_THREAD_INVERT_MASK_POS(pos)   (((unsigned)pos) & 0xFFu)
+#define RE_VM_THREAD_INVERT_MASK_FLAG(pos)   (((unsigned)pos) & RE_VM_THREAD_INVERT_UTF8_FLAG)
+
+#define RE_VM_THREAD_RANGE_PC_FROM_STACK(thread)            (thread->range_stack[thread->range_idx - 1] & 0xFFFFu)
+#define RE_VM_THREAD_RANGE_PC_TO_STACK(thread,pc)           (thread->range_stack[thread->range_idx - 1] = (((unsigned)pc) & 0xFFFFu))
+#define RE_VM_THREAD_RANGE_COUNT_FROM_STACK(thread)         ((thread->range_stack[thread->range_idx - 1] & 0xFFFF0000u) >> 16u)
+#define RE_VM_THREAD_RANGE_COUNT_CLEAR_STACK(thread)        (thread->range_stack[thread->range_idx - 1] &= 0xFFFFu)
+#define RE_VM_THREAD_RANGE_COUNT_SET_STACK(thread,count)    (thread->range_stack[thread->range_idx - 1] |= ((((unsigned)count) & 0xFFFFu) << 16u))
+#define RE_VM_THREAD_RANGE_COUNT_TO_STACK(thread,count)     RE_VM_THREAD_RANGE_COUNT_CLEAR_STACK(thread); RE_VM_THREAD_RANGE_COUNT_SET_STACK(thread,count);
+
 typedef struct regex_thread_s regex_thread_t;
 struct regex_thread_s {
     unsigned int pc;
-    int pos;
-    int *callstack;
+    int pos; // Tracks state in multi-char tokens (initialized to -1)
+        // eTokenStringLiteral
+        //     -1: this is the start of this token handling
+        //     #: the char within the string that is being checked
+        // eTokenUtf8Literal
+        //     -1: this is the start of this token handling
+        //     #*: encoded byte being checked
+        //     *: if the match is inverted, 256 is added to flag a invert match
+        //        (ie., a byte did NOT match, indicating the invert condition was met)
+        // eTokenCharAny
+        //     -1: this is an initial evalation. If unicode support is compiled
+        //         in, and the character is the start of a utf8 encoded sequence,
+        //         pos will be set to the number of encoded bytes.
+        //     >0: number of expected bytes remaining in a valid utf8 sequence
+    unsigned int *call_stack;
+    int call_idx;
+    unsigned *range_stack;
+    int range_idx;
+    int last_was_word;
     regex_thread_t *next;
     regex_compound_t *compound;
     const char **subexprs;
@@ -647,8 +734,11 @@ typedef struct regex_eval_s regex_eval_t;
 struct regex_eval_s {
     const char *sp;
     int start_of_line;
+    int end_of_line;
     int len;
     int pos;
+    int anchored;
+    int use_boundaries;
     regex_thread_t *thread;
     regex_thread_t *queue;
     regex_vm_t *vm;
@@ -668,7 +758,7 @@ typedef enum {
     eEvalNoMatch = 0,
     eEvalMatch = 1,
     eEvalContinue = 2
-} eReEvalResult;
+} eReEvalResult_t;
 
 #endif // MOJO_REGEX_EVALUATE_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
@@ -732,25 +822,25 @@ int _reMetaApplyOp_eTokenOneOrMany(regex_expr_t *expr, regex_token_t *operand_a,
 
 // Emit VM instruction details (compilation and evaluation, debug only) /////
 
-typedef void (*regexMetaVMInstrEmit_t)(FILE *fp, regex_vm_t *vm, int opcode,
-                                       unsigned int operand_a, unsigned int operand_b);
+typedef void (*regexMetaVMInstrEmit_t)(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
 
 #define RE_META_VM_EMIT_N(token)    NULL
 #define RE_META_VM_EMIT_Y(token)    _reMetaVMEmit_ ## token
 #define RE_META_VM_EMIT(unique,token)  RE_META_VM_EMIT_ ## unique(token)
 
-void _reMetaVMEmit_eTokenCharLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenCharClass(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenStringLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenCharAny(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenMatch(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenSplit(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenJmp(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenSave(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenUtf8Class(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenCall(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenAssertion(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
-void _reMetaVMEmit_eTokenUtf8Literal(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b);
+void _reMetaVMEmit_eTokenCharLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenCharClass(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenStringLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenCharAny(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenMatch(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenSplit(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenJmp(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenSave(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenUtf8Class(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenCall(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenAssertion(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenUtf8Literal(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
+void _reMetaVMEmit_eTokenRange(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr);
 // eTokenReturn and eTokenByte have no additional VM metadata to display
 
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
@@ -758,27 +848,27 @@ void _reMetaVMEmit_eTokenUtf8Literal(FILE *fp, regex_vm_t *vm, int opcode, unsig
 
 // Process the VM instruction (evaluation handler) //////////////////////////
 
-typedef eReEvalResult (*regexVMInstr_t)(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+typedef eReEvalResult_t (*regexVMInstr_t)(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
 
 #define RE_META_VM_INSTR_N(token)   NULL
 #define RE_META_VM_INSTR_Y(token)   _reVMInstr_ ## token
 #define RE_META_VM_INSTR(unique,token)     RE_META_VM_INSTR_ ## unique(token)
 
-eReEvalResult _reVMInstr_eTokenCharLiteral(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenCharClass(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenStringLiteral(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenCharAny(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenMatch(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenSplit(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenJmp(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenSave(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenUtf8Class(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenCall(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenReturn(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenByte(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenAssertion(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenUtf8Literal(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
-eReEvalResult _reVMInstr_eTokenRange(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenCharLiteral(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenCharClass(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenStringLiteral(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenCharAny(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenMatch(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenSplit(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenJmp(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenSave(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenUtf8Class(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenCall(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenReturn(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenByte(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenAssertion(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenUtf8Literal(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
+eReEvalResult_t _reVMInstr_eTokenRange(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c);
 
 #else // !MOJO_REGEX_EVALUATE_IMPLEMENTATION
 
@@ -841,7 +931,7 @@ regex_token_detail_t _regexTokenDetails[] = {
     RE_TOK_DETAIL(eTokenByte,           1,       Y,     "byte",       N,    N,    None,     eReTokTerminal,     N,        0),
     RE_TOK_DETAIL(eTokenAssertion,      0,       Y,     "assertion",  Y,    Y,    None,     eReTokTerminal,     N,        0),
     RE_TOK_DETAIL(eTokenUtf8Literal,    1,       Y,     "utf8literal",Y,    Y,    None,     eReTokTerminal,     N,        0),
-    RE_TOK_DETAIL(eTokenRange,          0,       Y,     "range",      N,    Y,    High,     eReTokPreceeding,   Y,        1),
+    RE_TOK_DETAIL(eTokenRange,          0,       Y,     "range",      Y,    Y,    High,     eReTokPreceeding,   Y,        1),
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
     RE_TOK_DETAIL(eTokenConcatenation,  0,       N,     NULL,         N,    N,    Medium,   eReTokNotTerminal,  Y,        2),
@@ -920,6 +1010,15 @@ void regexTokenStrDFAEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t 
 
 // Emits a single VM instruction in stringified form
 void regexVMInstrEmit(FILE *fp, regex_vm_t *vm, int pc);
+
+// Emits a VM program listing in stringified form, beginning at the program
+// counter index pc. If primary is false, emits until the end of the program.
+// If primary is true, emits until the end of the main program (no subroutines)
+// if pc is in the main program body, or until the end of the subroutine if pc
+// is within a subroutine.
+void regexVMProgramEmit(FILE *fp, regex_vm_t *vm, int pc, int primary);
+
+int regexVMFindSubroutinePCByName(regex_vm_t *vm, const char *name);
 
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
@@ -1155,6 +1254,32 @@ const char *regexVMGroupEntryGet(regex_vm_t *vm, int index);
 const char *regexVMSubNameEntryGet(regex_vm_t *vm, int pc);
 const char *regexVMSubAliasEntryGet(regex_vm_t *vm, int pc);
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+
+// Regex evaluation handlers ////////////////////////////////////////////////
+
+int _regexIsWordBoundaryChar(unsigned char c);
+regex_compound_t *regexThreadCompoundCreate(regex_eval_t *eval, regex_thread_t *thread);
+void regexThreadCompoundDestroy(regex_eval_t *eval, regex_compound_t *compound);
+int regexThreadCompoundCopy(regex_eval_t *eval, regex_thread_t *dest, regex_thread_t *src);
+int regexThreadCompoundCount(regex_compound_t *compound);
+void regexThreadCompoundReverse(regex_compound_t **compound);
+size_t regexThreadCompoundCalcMatchBufferSize(regex_vm_t *vm, regex_thread_t *thread);
+void regexThreadCompoundStoreInMatch(regex_match_t *match, const char *baseMem, regex_thread_t *thread);
+int regexThreadCompoundStart(regex_eval_t *eval, regex_thread_t *thread, int subexpr, const char *ptr);
+int regexThreadCompoundEnd(regex_thread_t *thread, const char *ptr);
+void regexThreadCopySubexprs(int count, regex_thread_t *dest, regex_thread_t *src);
+regex_eval_t *regexEvalCreate(regex_vm_t *vm, const char *pattern, int len);
+int regexThreadCreate(regex_eval_t *eval, regex_thread_t *parent, unsigned int pc, int from_range);
+void regexThreadFree(regex_eval_t *eval, regex_thread_t *thread);
+void regexEvalFree(regex_eval_t *eval);
+eReEvalResult_t regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, int complete, unsigned char c);
+void regexMatchFree(regex_match_t *match);
+#ifdef MOJO_REGEX_VM_DEBUG
+regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchored, FILE *debug);
+#else // !MOJO_REGEX_VM_DEBUG
+regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchored);
+#endif // MOJO_REGEX_VM_DEBUG
+
 
 /////////////////////////////////////////////////////////////////////////////
 #ifdef MOJO_REGEX_IMPLEMENTATION
@@ -1435,6 +1560,21 @@ void regexRegUnicodeCharClassRemove(const char *classId) {
 // UTF8 handling support functions
 /////////////////////////////////////////////////////////////////////////////
 
+// Returns the number of bytes required to utf8 encode the codepoint that
+// begins the utf8 encoded sequence starting with byte 'c'
+int _parseUtf8EncodedHighByte(char c) {
+    if(((unsigned)c & UTF8_TWO_BYTE_MASK) == UTF8_TWO_BYTE_PREFIX) {
+        return 2;
+    }
+    if(((unsigned)c & UTF8_THREE_BYTE_MASK) == UTF8_THREE_BYTE_PREFIX) {
+        return 3;
+    }
+    if(((unsigned)c & UTF8_FOUR_BYTE_MASK) == UTF8_FOUR_BYTE_PREFIX) {
+        return 4;
+    }
+    return 1;
+}
+
 // Returns the number of bytes required to utf8 encode the codepoint c
 static int _parseUtf8EncodingByteLen(int c) {
     if(c > 65535) {
@@ -1479,6 +1619,43 @@ int _parseUtf8DecodeSequence(const char *str) {
         }
     }
     return -1;
+}
+
+int _parseUtf8CompareEncodingByte(int codepoint, unsigned char c, int pos) {
+    if((pos > 4) || (pos <= 0)) {
+        return 0;
+    }
+    switch(pos) {
+        default:
+            return 0;
+        case 1:
+            if(codepoint > 127) {
+                return (((((unsigned)codepoint) & UTF8_LOW_BYTE_BITMASK) | UTF8_LOW_BYTE_PREFIX) == c);
+            } else {
+                return (((int)c) == codepoint);
+            }
+        case 2:
+            if(codepoint <= 127) {
+                return 0;
+            }
+            if(codepoint > 2047) {
+                return ((((((unsigned)codepoint) >> 6u) & UTF8_LOW_BYTE_BITMASK) | UTF8_LOW_BYTE_PREFIX) == c);
+            }
+            return ((((((unsigned)codepoint) >> 6u) & UTF8_TWO_BYTE_BITMASK) | UTF8_TWO_BYTE_PREFIX) == c);
+        case 3:
+            if(codepoint <= 2047) {
+                return 0;
+            }
+            if(codepoint > 65535) {
+                return ((((((unsigned)codepoint) >> 12u) & UTF8_LOW_BYTE_BITMASK) | UTF8_LOW_BYTE_PREFIX) == c);
+            }
+            return ((((((unsigned)codepoint) >> 12u) & UTF8_THREE_BYTE_BITMASK) | UTF8_THREE_BYTE_PREFIX) == c);
+        case 4:
+            if(codepoint <= 65535) {
+                return 0;
+            }
+            return ((((((unsigned)codepoint) >> 18u) & UTF8_FOUR_BYTE_BITMASK) | UTF8_FOUR_BYTE_PREFIX) == c);
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1847,55 +2024,56 @@ int _reMetaApplyOp_eTokenOneOrMany(regex_expr_t *expr, regex_token_t *operand_a,
 // Regex token details VM instruction emit handlers
 /////////////////////////////////////////////////////////////////////////////
 
-void _reMetaVMEmit_eTokenCharLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-    char c = (char)((unsigned)operand_a & 0xFFu);
+void _reMetaVMEmit_eTokenCharLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
+    char c = RE_VM_DEC_CHAR_FROM_INSTR(instr);
     fputc('\'', fp);
     _regexCharLiteralEmit(fp, c);
     fprintf(fp, "' (%03d)%s", c,
-            (((unsigned)operand_a & RE_VM_FLAG_CHAR_INVERT) ? "  inverse" : ""));
-    if(operand_b != 0x3FFF) {
-        fprintf(fp,"  jmp(%4.4d)", operand_b);
+            (RE_VM_FLAG_CHAR_INVERT_FROM_INSTR(instr) ? "  inverse" : ""));
+    if(RE_VM_OP_B_FROM_INSTR(instr) != 0x3FFF) {
+        fprintf(fp,"  jmp(%4.4d)", RE_VM_OP_B_FROM_INSTR(instr));
     }
 }
 
-void _reMetaVMEmit_eTokenCharClass(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+void _reMetaVMEmit_eTokenCharClass(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
     fputc('[', fp);
-    _regexCharClassBitmapEmit(fp, vm->class_table[operand_a]);
+    _regexCharClassBitmapEmit(fp, vm->class_table[RE_VM_OP_A_FROM_INSTR(instr)]);
     fputc(']', fp);
 }
 
-void _reMetaVMEmit_eTokenStringLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+void _reMetaVMEmit_eTokenStringLiteral(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
     const char *str;
     int len;
 
-    str = regexVMStringTableEntryGet(vm, (int)operand_a, &len);
+    str = regexVMStringTableEntryGet(vm, (int)RE_VM_OP_A_FROM_INSTR(instr), &len);
     fputc('"', fp);
     _regexEscapedStrEmit(fp, str, len);
     fputc('"', fp);
 }
 
-void _reMetaVMEmit_eTokenCharAny(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-    if(operand_a & RE_VM_FLAG_CHARANY_DOTALL) {
+void _reMetaVMEmit_eTokenCharAny(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
+    if(RE_VM_FLAG_DOTALL_FROM_INSTR(instr)) {
         fputs("dot_all", fp);
     }
 }
 
-void _reMetaVMEmit_eTokenMatch(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-    if(operand_a & RE_VM_FLAG_MATCH_END_OF_INPUT) {
+void _reMetaVMEmit_eTokenMatch(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
+    if(RE_VM_FLAG_EOF_FROM_INSTR(instr)) {
         fputs("($)", fp);
     }
 }
 
-void _reMetaVMEmit_eTokenSplit(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-    fprintf(fp, "%d, %d", operand_a, operand_b);
+void _reMetaVMEmit_eTokenSplit(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
+    fprintf(fp, "%d, %d", RE_VM_OP_A_FROM_INSTR(instr), RE_VM_OP_B_FROM_INSTR(instr));
 }
 
-void _reMetaVMEmit_eTokenJmp(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-    fprintf(fp, "%d", operand_a);
+void _reMetaVMEmit_eTokenJmp(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
+    fprintf(fp, "%d", RE_VM_OP_A_FROM_INSTR(instr));
 }
 
-void _reMetaVMEmit_eTokenSave(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-    const char *str = regexVMGroupEntryGet(vm, (int)operand_a);
+void _reMetaVMEmit_eTokenSave(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
+    int operand_a = RE_VM_OP_A_FROM_INSTR(instr);
+    const char *str = regexVMGroupEntryGet(vm, operand_a);
 
     fprintf(fp, "%d  group(%d %s)", operand_a,
             regexIndexToLogicalGroup((int)operand_a),
@@ -1903,25 +2081,38 @@ void _reMetaVMEmit_eTokenSave(FILE *fp, regex_vm_t *vm, int opcode, unsigned int
     if(str != NULL) {
         fprintf(fp, "  (%s)", str);
     }
-    if(operand_b & RE_VM_FLAG_SAVE_COMPOUND) {
+    if(RE_VM_FLAG_COMPOUND_FROM_INSTR(instr)) {
         fprintf(fp, "  compound");
     }
 }
 
-void _reMetaVMEmit_eTokenUtf8Class(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-    // TODO
+void _reMetaVMEmit_eTokenUtf8Class(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
+    int encoding = RE_VM_FLAG_UTF8_CLASS_ENC_FROM_INSTR(instr);
+    fprintf(fp, "%d  enc(%d)",
+            RE_VM_DEC_UTF8_INDEX_FROM_INSTR(instr),
+            encoding);
+
+    if(RE_VM_FLAG_UTF8_CLASS_INVERT_FROM_INSTR(instr)) {
+        fputs(":invert", fp);
+    }
+    if(encoding >= 3) {
+        fprintf(fp, ":high(0x%2.2x):", RE_VM_DEC_UTF8_MIDHIGH_FROM_INSTR(instr));
+    }
+    fprintf(fp, ":low(0x%2.2x):[", RE_VM_DEC_UTF8_MIDLOW_FROM_INSTR(instr));
+    _regexUtf8ClassBitmapEmit(fp, regexVMUtf8ClassEntryGet(vm, RE_VM_DEC_UTF8_INDEX_FROM_INSTR(instr)));
+    fputc(']', fp);
 }
 
-void _reMetaVMEmit_eTokenCall(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
+void _reMetaVMEmit_eTokenCall(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
 #ifdef MOJO_REGEX_VM_DEBUG
     const char *name, *alias;
 #endif // MOJO_REGEX_VM_DEBUG
-    fprintf(fp, "%d", operand_a);
+    fprintf(fp, "%d", RE_VM_OP_A_FROM_INSTR(instr));
 #ifdef MOJO_REGEX_VM_DEBUG
-    name = regexVMSubNameEntryGet(vm, (int)operand_a);
-    alias = regexVMSubAliasEntryGet(vm, (int)operand_a);
+    name = regexVMSubNameEntryGet(vm, RE_VM_OP_A_FROM_INSTR(instr));
+    alias = regexVMSubAliasEntryGet(vm, RE_VM_OP_A_FROM_INSTR(instr));
     if((name != NULL) || (alias != NULL)) {
-        fputs(" (", fp);
+        fputs("  (", fp);
         if(name != NULL) {
             fprintf(fp, "name(%s)", name);
         }
@@ -1933,8 +2124,8 @@ void _reMetaVMEmit_eTokenCall(FILE *fp, regex_vm_t *vm, int opcode, unsigned int
 #endif // MOJO_REGEX_VM_DEBUG
 }
 
-void _reMetaVMEmit_eTokenAssertion(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-    switch(operand_a) {
+void _reMetaVMEmit_eTokenAssertion(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
+    switch(RE_VM_OP_A_FROM_INSTR(instr)) {
         case RE_VM_FLAG_ASSERT_START_OF_LINE: fputs("(^)", fp); break;
         case RE_VM_FLAG_ASSERT_END_OF_LINE: fputs("($)", fp); break;
         case RE_VM_FLAG_ASSERT_START_OF_WORD: fputs("(\\<)", fp); break;
@@ -1943,12 +2134,19 @@ void _reMetaVMEmit_eTokenAssertion(FILE *fp, regex_vm_t *vm, int opcode, unsigne
     }
 }
 
-void _reMetaVMEmit_eTokenUtf8Literal(FILE *fp, regex_vm_t *vm, int opcode, unsigned int operand_a, unsigned int operand_b) {
-    int c = (int)((operand_a | (operand_b << 14u)) & 0x1FFFFFu);
+void _reMetaVMEmit_eTokenUtf8Literal(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
+    int c = RE_VM_DEC_UTF8_LITERAL_FROM_INSTR(instr);
 
     fprintf(fp, "'\\u%s%.4x%s%s",
             ((c > 0xFFFF) ? "{" : ""), c, ((c > 0xFFFF) ? "}" : ""),
-            ((operand_b & RE_VM_FLAG_CHAR_INVERT) ? "  invert" : ""));
+            (RE_VM_FLAG_UTF8_LITERAL_INVERT_FROM_INSTR(instr) ? "  invert" : ""));
+}
+
+void _reMetaVMEmit_eTokenRange(FILE *fp, regex_vm_t *vm, int opcode, unsigned int instr) {
+    fprintf(fp, "{%d,%d}  pc(%d)",
+            RE_VM_DEC_RANGE_MIN_FROM_INSTR(instr),
+            RE_VM_DEC_RANGE_MAX_FROM_INSTR(instr),
+            RE_VM_OP_A_FROM_INSTR(instr));
 }
 
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
@@ -1958,79 +2156,256 @@ void _reMetaVMEmit_eTokenUtf8Literal(FILE *fp, regex_vm_t *vm, int opcode, unsig
 // Regex token details VM instruction evaluation handlers
 /////////////////////////////////////////////////////////////////////////////
 
-eReEvalResult _reVMInstr_eTokenCharLiteral(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
+eReEvalResult_t _reVMInstr_eTokenCharLiteral(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    int check = RE_VM_DEC_CHAR_FROM_INSTR(instr);
+
+    if((RE_VM_FLAG_CHAR_INVERT_FROM_INSTR(instr) && (check == c)) || (check != c)) {
+        return eEvalNoMatch;
+    }
+    thread->pc++;
+    return eEvalMatch;
+}
+
+eReEvalResult_t _reVMInstr_eTokenCharClass(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    const unsigned int *bitmap;
+
+    if((bitmap = regexVMCharClassEntryGet(eval->vm, RE_VM_OP_A_FROM_INSTR(instr))) == NULL) {
+        return eEvalInternalError;
+    }
+    if(!(bitmap[c / 32] & (1u << (c % 32u)))) {
+        return eEvalNoMatch;
+    }
+    thread->pc++;
+    return eEvalMatch;
+}
+
+eReEvalResult_t _reVMInstr_eTokenStringLiteral(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    const char *str;
+    int len;
+
+    if((str = regexVMStringTableEntryGet(eval->vm, RE_VM_OP_A_FROM_INSTR(instr), &len)) == NULL) {
+        return eEvalInternalError;
+    }
+    if(thread->pos == -1) {
+        thread->pos = 0;
+    }
+    if(str[thread->pos] == c) {
+        thread->pos++;
+        if(thread->pos == len) {
+            thread->pc++;
+            thread->pos = -1;
+            return eEvalMatch;
+        }
+        return eEvalContinue;
+    }
     return eEvalNoMatch;
 }
 
-eReEvalResult _reVMInstr_eTokenCharClass(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
+eReEvalResult_t _reVMInstr_eTokenCharAny(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    if(RE_VM_FLAG_DOTALL_FROM_INSTR(instr) && (c == '\n')) {
+        return eEvalNoMatch;
+    }
+    if(1) { // TODO - compilation toggle unicode mode
+        if(thread->pos == -1) {
+            if((thread->pos = _parseUtf8EncodedHighByte((char)c)) == 1) {
+                thread->pos = -1;
+                thread->pc++;
+                return eEvalMatch;
+            }
+            return eEvalContinue;
+        } else if((c & UTF8_LOW_BYTE_MASK) != UTF8_LOW_BYTE_PREFIX) {
+            return eEvalNoMatch;
+        } else {
+            thread->pos--;
+            if(thread->pos == 0) {
+                thread->pc++;
+                thread->pos = -1;
+                return eEvalMatch;
+            }
+            return eEvalContinue;
+        }
+    } else {
+        thread->pc++;
+        return eEvalMatch;
+    }
+}
+
+eReEvalResult_t _reVMInstr_eTokenMatch(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    if((eval->anchored) || (RE_VM_FLAG_EOF_FROM_INSTR(instr))) {
+        if(eval->pos == eval->len) {
+            return eEvalMatch;
+        }
+    } else if((!eval->anchored) && (!RE_VM_FLAG_EOF_FROM_INSTR(instr))) {
+        return eEvalMatch;
+    }
     return eEvalNoMatch;
 }
 
-eReEvalResult _reVMInstr_eTokenStringLiteral(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
+eReEvalResult_t _reVMInstr_eTokenSplit(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    if(!regexThreadCreate(eval, thread, RE_VM_OP_A_FROM_INSTR(instr), 0)) {
+        return eEvalOutOfMem;
+    }
+    thread->pc = RE_VM_OP_B_FROM_INSTR(instr);
+    return eEvalMatch;
 }
 
-eReEvalResult _reVMInstr_eTokenCharAny(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
+eReEvalResult_t _reVMInstr_eTokenJmp(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    thread->pc = RE_VM_OP_A_FROM_INSTR(instr);
+    return eEvalContinue;
 }
 
-eReEvalResult _reVMInstr_eTokenMatch(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
+eReEvalResult_t _reVMInstr_eTokenSave(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    int index;
+
+    index = RE_VM_OP_A_FROM_INSTR(instr);
+    if(!regexIsIndexGroupStart(index)) {
+        // Group end
+        thread->subexprs[index] = eval->sp;
+        if(RE_VM_FLAG_COMPOUND_FROM_INSTR(instr)) {
+            if(!regexThreadCompoundEnd(thread, eval->sp)) {
+                return eEvalOutOfMem;
+            }
+        }
+    } else {
+        // Group start
+        if(thread->subexprs[index] == NULL) {
+            thread->subexprs[index] = eval->sp;
+        }
+        if(RE_VM_FLAG_COMPOUND_FROM_INSTR(instr)) {
+            if(!regexThreadCompoundStart(eval, thread, index, eval->sp)) {
+                return eEvalOutOfMem;
+            }
+        }
+    }
+    thread->pc++;
+    return eEvalContinue;
 }
 
-eReEvalResult _reVMInstr_eTokenSplit(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
+eReEvalResult_t _reVMInstr_eTokenUtf8Class(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    const unsigned int *bitmap;
+
     // TODO
-    return eEvalNoMatch;
+
+    if((bitmap = regexVMUtf8TableEntryGet(eval->vm, instr[1])) == NULL) {
+        return eEvalInternalError;
+    }
+    if(!utf8ClassBitmapCheck(bitmap, c)) {
+        return eEvalNoMatch;
+    }
+    thread->pc++;
+    return eEvalMatch;
 }
 
-eReEvalResult _reVMInstr_eTokenJmp(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
+eReEvalResult_t _reVMInstr_eTokenCall(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    thread->call_stack[thread->call_idx] = thread->pc + 1;
+    thread->call_idx++;
+    thread->pc = RE_VM_OP_A_FROM_INSTR(instr);
+    return eEvalContinue;
 }
 
-eReEvalResult _reVMInstr_eTokenSave(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
+eReEvalResult_t _reVMInstr_eTokenReturn(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    if(thread->call_idx == 0) {
+        return eEvalInternalError;
+    }
+    thread->pc = thread->call_stack[thread->call_idx];
+    thread->call_idx--;
+    return eEvalContinue;
 }
 
-eReEvalResult _reVMInstr_eTokenUtf8Class(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
+eReEvalResult_t _reVMInstr_eTokenByte(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    thread->pc++;
+    return eEvalMatch;
 }
 
-eReEvalResult _reVMInstr_eTokenCall(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
+eReEvalResult_t _reVMInstr_eTokenAssertion(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    switch(RE_VM_OP_A_FROM_INSTR(instr)) {
+        default:
+            return eEvalInternalError;
+        case RE_VM_FLAG_ASSERT_START_OF_LINE:
+            if(!eval->start_of_line) {
+                return eEvalNoMatch;
+            }
+            thread->pc++;
+            return eEvalContinue;
+        case RE_VM_FLAG_ASSERT_END_OF_LINE:
+            if(!eval->end_of_line) {
+                return eEvalNoMatch;
+            }
+            thread->pc++;
+            return eEvalContinue;
+        case RE_VM_FLAG_ASSERT_END_OF_WORD:
+            if((!_regexIsWordBoundaryChar(c)) && (thread->last_was_word)) {
+                thread->pc++;
+                return eEvalMatch;
+            }
+            return eEvalNoMatch;
+        case RE_VM_FLAG_ASSERT_START_OF_WORD:
+            if((_regexIsWordBoundaryChar(c)) && (!thread->last_was_word)) {
+                thread->pc++;
+                return eEvalMatch;
+            }
+            return eEvalNoMatch;
+    }
 }
 
-eReEvalResult _reVMInstr_eTokenReturn(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
+eReEvalResult_t _reVMInstr_eTokenUtf8Literal(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    int codepoint = RE_VM_DEC_UTF8_LITERAL_FROM_INSTR(instr);
+    int bytes = _parseUtf8EncodingByteLen(codepoint);
+
+    if(thread->pos == -1) {
+        thread->pos = 1;
+    } else {
+        thread->pos++;
+    }
+    if(!_parseUtf8CompareEncodingByte(codepoint, c, RE_VM_THREAD_INVERT_MASK_POS(thread->pos))) {
+        if(!RE_VM_FLAG_UTF8_LITERAL_INVERT_FROM_INSTR(instr)) {
+            thread->pos = -1;
+            return eEvalNoMatch;
+        }
+        thread->pos = (int)(((unsigned)thread->pos) | RE_VM_THREAD_INVERT_UTF8_FLAG);
+    }
+    if(thread->pos == bytes) {
+        if(RE_VM_FLAG_UTF8_LITERAL_INVERT_FROM_INSTR(instr)) {
+            if(!RE_VM_THREAD_INVERT_MASK_FLAG(thread->pos)) {
+                thread->pos = -1;
+                return eEvalNoMatch;
+            }
+        }
+        thread->pos = -1;
+        thread->pc++;
+        return eEvalMatch;
+    }
+    return eEvalContinue;
 }
 
-eReEvalResult _reVMInstr_eTokenByte(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
-}
+eReEvalResult_t _reVMInstr_eTokenRange(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
+    int count, min, max;
 
-eReEvalResult _reVMInstr_eTokenAssertion(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
-}
-
-eReEvalResult _reVMInstr_eTokenUtf8Literal(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
-}
-
-eReEvalResult _reVMInstr_eTokenRange(regex_eval_t *eval, regex_thread_t *thread, int anchored, unsigned char c) {
-    // TODO
-    return eEvalNoMatch;
+    if((thread->range_idx > 0) && (thread->pc == RE_VM_THREAD_RANGE_PC_FROM_STACK(thread))) {
+        // This is a continuing range value
+        min = RE_VM_DEC_RANGE_MIN_FROM_INSTR(instr);
+        max = RE_VM_DEC_RANGE_MAX_FROM_INSTR(instr);
+        count = RE_VM_THREAD_RANGE_COUNT_FROM_STACK(thread);
+        count++;
+        if(count == max) {
+            thread->range_idx--;
+            thread->pc = RE_VM_OP_A_FROM_INSTR(instr);
+            return eEvalMatch;
+        } else if(count >= min) {
+            if(!regexThreadCreate(eval, thread, RE_VM_OP_A_FROM_INSTR(instr), 1)) {
+                return eEvalOutOfMem;
+            }
+        }
+        thread->pc++;
+        return eEvalMatch;
+    } else {
+        // This is the start of a range
+        thread->range_idx++;
+        RE_VM_THREAD_RANGE_PC_TO_STACK(thread, thread->pc);
+        RE_VM_THREAD_RANGE_COUNT_CLEAR_STACK(thread);
+        thread->pc++;
+        return eEvalMatch;
+    }
 }
 
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
@@ -2155,20 +2530,59 @@ void regexTokenStrDFAEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t 
 
 void regexVMInstrEmit(FILE *fp, regex_vm_t *vm, int pc) {
     int opcode;
-    unsigned int op_a, op_b;
 
     if((vm == NULL) || (pc < 0) || (pc >= vm->size)) {
         return;
     }
     opcode = (int)(((unsigned)(vm->program[pc])) & RE_VM_OPCODE_MASK);
-    op_a = RE_VM_OP_A_FROM_INSTR(vm->program[pc]);
-    op_b = RE_VM_OP_B_FROM_INSTR(vm->program[pc]);
     fprintf(fp, "%4d  %*s", pc, MAX_TOKEN_INSTR_NAME_LEN, _regexTokenDetails[opcode].instr);
     if(_regexTokenDetails[opcode].emitVMInstr != NULL) {
         fputs("  ", fp);
-        _regexTokenDetails[opcode].emitVMInstr(fp, vm, opcode, op_a, op_b);
+        _regexTokenDetails[opcode].emitVMInstr(fp, vm, opcode, vm->program[pc]);
     }
     fputc('\n', fp);
+}
+
+void regexVMProgramEmit(FILE *fp, regex_vm_t *vm, int pc, int primary) {
+    int end = vm->size;
+#ifdef MOJO_REGEX_VM_DEBUG
+    int sub = 0, jmp, pos;
+    if(primary) {
+        for(pos = 0; pos < vm->size; pos++) {
+            if((vm->program[pos] & RE_VM_OPCODE_MASK) == eTokenCall) {
+                jmp = RE_VM_OP_A_FROM_INSTR(vm->program[pos]);
+                if(jmp <= pc) {
+                    // pc is within a subroutine, track the most likely candidate
+                    // found so far
+                    sub = jmp;
+                } else if((sub != 0) && (jmp > pc)) {
+                    // pc was determined to be within a subroutine, and we've now
+                    // identified the start of the NEXT subroutine after pc,
+                    // which marks our endpoint.
+                    end = jmp;
+                    break;
+                }
+            }
+        }
+    }
+#endif // MOJO_REGEX_VM_DEBUG
+    for(; pc < end; pc++) {
+        regexVMInstrEmit(fp, vm, pc);
+    }
+}
+
+int regexVMFindSubroutinePCByName(regex_vm_t *vm, const char *name) {
+#ifdef MOJO_REGEX_VM_DEBUG
+    int idx;
+
+    for(idx = 0; idx < vm->sub_name_tbl_size; idx++) {
+        if((!strcasecmp(vm->sub_name_table[idx].name, name)) ||
+           (!strcasecmp(vm->sub_name_table[idx].alias, name))) {
+            return vm->sub_name_table[idx].pc;
+        }
+    }
+#endif // MOJO_REGEX_VM_DEBUG
+    return 0;
 }
 
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
@@ -2460,14 +2874,14 @@ int regexBuildConcatCharAny(regex_build_t *build, int dot_all) {
 int regexBuildConcatUtf8Class(regex_build_t *build, int encoding, int mid_high,
                               int mid_low, int invert, unsigned int *bitmap) {
     regex_token_t *token;
-    short lead_bits = (short)(((unsigned int)mid_high << 6u) | (unsigned int)mid_low);
 
     if((token = _regexTokenBaseCreate(build, eTokenUtf8Class, NULL, bitmap, 8)) == NULL) {
         return 0;
     }
     token->flags = (invert ? RE_TOK_FLAG_INVERT : 0);
-    token->lead_bits = (short)lead_bits;
-    token->lead_count = (short)encoding;
+    token->mid_low = (short)mid_low;
+    token->mid_high = (short)mid_high;
+    token->encoding = (short)encoding;
     return 1;
 }
 
@@ -4553,6 +4967,127 @@ const char *regexVMSubAliasEntryGet(regex_vm_t *vm, int pc) {
             return vm->sub_name_table[k].alias;
         }
     }
+    return NULL;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Regex evaluation handlers
+/////////////////////////////////////////////////////////////////////////////
+
+int _regexIsWordBoundaryChar(unsigned char c) {
+    // TODO
+    return 0;
+}
+
+regex_compound_t *regexThreadCompoundCreate(regex_eval_t *eval, regex_thread_t *thread) {
+    // TODO
+    return NULL;
+}
+
+void regexThreadCompoundDestroy(regex_eval_t *eval, regex_compound_t *compound) {
+    // TODO
+}
+
+int regexThreadCompoundCopy(regex_eval_t *eval, regex_thread_t *dest, regex_thread_t *src) {
+    // TODO
+    return 0;
+}
+
+int regexThreadCompoundCount(regex_compound_t *compound) {
+    // TODO
+    return 0;
+}
+
+void regexThreadCompoundReverse(regex_compound_t **compound) {
+    // TODO
+}
+
+size_t regexThreadCompoundCalcMatchBufferSize(regex_vm_t *vm, regex_thread_t *thread) {
+    // TODO
+    return 0;
+}
+
+void regexThreadCompoundStoreInMatch(regex_match_t *match, const char *baseMem, regex_thread_t *thread) {
+    // TODO
+}
+
+int regexThreadCompoundStart(regex_eval_t *eval, regex_thread_t *thread, int subexpr, const char *ptr) {
+    // TODO
+    return 0;
+}
+
+int regexThreadCompoundEnd(regex_thread_t *thread, const char *ptr) {
+    // TODO
+    return 0;
+}
+
+void regexThreadCopySubexprs(int count, regex_thread_t *dest, regex_thread_t *src) {
+    // TODO
+}
+
+regex_eval_t *regexEvalCreate(regex_vm_t *vm, const char *pattern, int len) {
+    // TODO
+    return NULL;
+}
+
+int regexThreadCreate(regex_eval_t *eval, regex_thread_t *parent, unsigned int pc, int from_range) {
+    // TODO
+    return 0;
+}
+
+void regexThreadFree(regex_eval_t *eval, regex_thread_t *thread) {
+    // TODO
+}
+
+void regexEvalFree(regex_eval_t *eval) {
+    // TODO
+}
+
+eReEvalResult_t regexThreadProcess(regex_eval_t *eval, regex_thread_t *thread, int complete, unsigned char c) {
+    int opcode;
+    eReEvalResult_t status;
+#ifdef MOJO_REGEX_VM_DEBUG
+    int first = 1;
+#endif // MOJO_REGEX_VM_DEBUG
+
+    while(!_regexTokenDetails[(opcode = (int)(RE_VM_OPCODE_MASK & eval->vm->program[thread->pc]))].textAdvance) {
+#ifdef MOJO_REGEX_VM_DEBUG
+        if(eval->debug != NULL) {
+            if(!first) {
+                fprintf(eval->debug, "             ");
+            }
+            regexVMInstrEmit(eval->debug, eval->vm, (int)(thread->pc));
+            first = 0;
+        }
+#endif // MOJO_REGEX_VM_DEBUG
+        if((status = _regexTokenDetails[opcode].handleInstr(eval, thread, eval->vm->program[thread->pc], c)) != eEvalContinue) {
+            return status;
+        }
+    }
+#ifdef MOJO_REGEX_VM_DEBUG
+    if(eval->debug) {
+        if(!first) {
+            fprintf(eval->debug, "             ");
+        }
+        regexVMInstrEmit(eval->debug, eval->vm, (int)thread->pc);
+    }
+#endif // MOJO_REGEX_VM_DEBUG
+    if(eval->pos == eval->len) {
+        return eEvalNoMatch;
+    }
+    return _regexTokenDetails[(int)(RE_VM_OPCODE_MASK & eval->vm->program[thread->pc])].handleInstr(eval, thread, eval->vm->program[thread->pc], c);
+}
+
+void regexMatchFree(regex_match_t *match) {
+    // TODO
+}
+
+#ifdef MOJO_REGEX_VM_DEBUG
+regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchored, FILE *debug) {
+#else // !MOJO_REGEX_VM_DEBUG
+regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchored) {
+#endif // MOJO_REGEX_VM_DEBUG
+    // TODO
     return NULL;
 }
 
