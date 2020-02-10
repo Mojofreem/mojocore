@@ -932,7 +932,6 @@ regex_token_detail_t _regexTokenDetails[] = {
     RE_TOK_DETAIL(eTokenAssertion,      0,       Y,     "assertion",  Y,    Y,    None,     eReTokTerminal,     N,        0),
     RE_TOK_DETAIL(eTokenUtf8Literal,    1,       Y,     "utf8literal",Y,    Y,    None,     eReTokTerminal,     N,        0),
     RE_TOK_DETAIL(eTokenRange,          0,       Y,     "range",      Y,    Y,    High,     eReTokPreceeding,   Y,        1),
-#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
     RE_TOK_DETAIL(eTokenConcatenation,  0,       N,     NULL,         N,    N,    Medium,   eReTokNotTerminal,  Y,        2),
     RE_TOK_DETAIL(eTokenAlternative,    0,       N,     NULL,         N,    N,    Medium,   eReTokNotTerminal,  Y,        2),
@@ -942,15 +941,12 @@ regex_token_detail_t _regexTokenDetails[] = {
     RE_TOK_DETAIL(eTokenSubExprStart,   0,       N,     NULL,         N,    Y,    Low,      eReTokNotPreceeding,N,        0),
     RE_TOK_DETAIL(eTokenSubExprEnd,     0,       N,     NULL,         N,    N,    Low,      eReTokPreceeding,   N,        0),
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
-#ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
     RE_TOK_DETAIL_END
 };
 
 // This should be adjusted to the length of the longest VM instr name
 // (Currently 11, the length of "utf8literal")
 #define MAX_TOKEN_INSTR_NAME_LEN    11
-
-#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
 
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
@@ -1005,7 +1001,7 @@ void regexTokenWalkTree(regex_token_t *token, int val);
 //       a sequence marker to avoid looping.
 void regexTokenStrDFAEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
 
-#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
 
 // Emits a single VM instruction in stringified form
@@ -1034,8 +1030,6 @@ eRegexTokenPriority_t regexGetTokenTypePriority(eRegexToken_t tokenType);
 // Operator arity (number of tokens that the operator functions on) in the
 // shunting yard
 int regexGetOperatorArity(regex_token_t *token);
-
-#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 
 // Token handling functions /////////////////////////////////////////////////
 
@@ -1246,6 +1240,7 @@ int regexVMUtf8ClassEntryAdd(regex_build_t *build, unsigned int *bitmap);
 int regexVMGroupEntryAdd(regex_build_t *build, const char *name, int len, int index);
 int regexVMSubNameEntryAdd(regex_build_t *build, const char *name, const char *alias, int index);
 int regexVMSubNameEntrySetPC(regex_vm_t *vm, int index, int pc);
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
 const char *regexVMStringTableEntryGet(regex_vm_t *vm, int index, int *len);
 const unsigned int *regexVMCharClassEntryGet(regex_vm_t *vm, int index);
@@ -1254,6 +1249,7 @@ const char *regexVMGroupEntryGet(regex_vm_t *vm, int index);
 const char *regexVMSubNameEntryGet(regex_vm_t *vm, int pc);
 const char *regexVMSubAliasEntryGet(regex_vm_t *vm, int pc);
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#ifdef MOJO_REGEX_EVALUATE_IMPLEMENTATION
 
 // Regex evaluation handlers ////////////////////////////////////////////////
 
@@ -1280,6 +1276,9 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
 regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchored);
 #endif // MOJO_REGEX_VM_DEBUG
 
+#endif // MOJO_REGEX_EVALUATE_IMPLEMENTATION
+
+#endif // _MOJO_REGEX_HEADER_
 
 /////////////////////////////////////////////////////////////////////////////
 #ifdef MOJO_REGEX_IMPLEMENTATION
@@ -1661,6 +1660,42 @@ int _parseUtf8CompareEncodingByte(int codepoint, unsigned char c, int pos) {
 /////////////////////////////////////////////////////////////////////////////
 // Regex token details emit handlers
 /////////////////////////////////////////////////////////////////////////////
+
+static int _regexGetPatternCharLen(const char *pattern) {
+    int codepoint;
+
+    // Check for utf8 encoding
+    if((codepoint = _parseUtf8DecodeSequence(pattern)) != -1) {
+        if(codepoint > 0xFFFF) {
+            return 8; // \u{######}
+        } else if(codepoint > 2047) {
+            return 6; // \u####
+        } else if(codepoint > 127) {
+            return 6; // \u####
+        }
+        if(codepoint > 127) {
+            return 1;
+        }
+    }
+    switch(*pattern) {
+        case '\0':
+        case '\a':
+        case '\b':
+        case '\x1b':
+        case '\f':
+        case '\n':
+        case '\r':
+        case '\t':
+        case '\v':
+            return 2;
+
+        default:
+            if((*pattern >= ' ') && (*pattern <= 127)) {
+                return 1;
+            }
+            return 4; // \x##
+    }
+}
 
 static void _regexCharLiteralEmit(FILE *fp, int c) {
     switch(c) {
@@ -2525,7 +2560,7 @@ void regexTokenStrDFAEmit(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t 
     }
 }
 
-#endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
 
 void regexVMInstrEmit(FILE *fp, regex_vm_t *vm, int pc) {
@@ -3997,6 +4032,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
     int name_len;
     unsigned int flags;
     int index;
+    int min, max;
 
     if(build->pattern == NULL) {
         return eCompileMissingPattern;
@@ -4060,6 +4096,17 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
 
                     case '|': // Meta, alternative operator
                         if(!regexBuildAlternative(build)) {
+                            return eCompileOutOfMem;
+                        }
+                        continue;
+
+                    case '{': // Meta, range operator
+                        if(_parseRangeQuantifier(str, &min, &max) == 0) {
+                            INTERNAL_ERROR("failed to parse range operator parameters");
+                            return eCompileInternalError;
+                        }
+                        build->pattern->pattern += len;
+                        if(!regexBuildRange(build, min, max)) {
                             return eCompileOutOfMem;
                         }
                         continue;
@@ -4368,12 +4415,16 @@ void regexBuildDestroy(regex_build_t *build) {
 }
 
 int regexBuildFinalize(regex_build_t *build) {
-    // TODO
     if(build == NULL) {
         return 0;
     }
-    //return regexExprOperatorApply(build->expr, 0);
-    return 0;
+    if(_regexExprFinalize(build->expr) != eReExprSuccess) {
+        return 0;
+    }
+    if(build->expr->parent != NULL) {
+        return 0;
+    }
+    return 1;
 }
 
 // Expression management functions //////////////////////////////////////////
@@ -4700,15 +4751,12 @@ regex_build_t *regexCompile(const char *pattern, unsigned int flags) {
         build->status = eCompileOutOfMem;
         return build;
     }
-
     if(!regexBuildPatternProcess(build)) {
         return build;
     }
-
     if(regexVMCreate(build) == NULL) {
         return build;
     }
-
     regexVMGenerate(build);
 
     return build;
@@ -4740,6 +4788,13 @@ regex_vm_t *regexVMCreate(regex_build_t *build) {
 int regexVMGenerate(regex_build_t *build) {
     // TODO
     return 0;
+}
+
+regex_vm_t *regexVMFromBuild(regex_build_t *build) {
+    if((build == NULL) || (build->context == NULL)) {
+        return NULL;
+    }
+    return build->context->vm;
 }
 
 void regexVMDestroy(regex_vm_t *vm) {
@@ -5092,6 +5147,201 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
 }
 
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
+#ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+const char *regexCompilePhaseStrGet(eRegexCompilePhase_t phase) {
+    switch(phase) {
+        case ePhaseTokenize: return "tokenizer";
+        case ePhaseNFAGraph: return "NFA graph generation";
+        case ePhaseVMGen: return "VM generation";
+        case ePhaseComplete: return "compilation completed";
+        default: return "unknown phase";
+    }
+}
+
+const char *regexCompileStatusStrGet(eRegexCompileStatus_t status) {
+    switch(status) {
+        case eCompileOk: return "compiled successfully";
+        case eCompileCharClassRangeIncomplete: return "char class range is incomplete";
+        case eCompileCharClassIncomplete: return "char class definition is incomplete";
+        case eCompileEscapeCharIncomplete: return "escape character is incomplete";
+        case eCompileInvalidEscapeChar: return "invalid escaped metacharacter";
+        case eCompileMalformedSubExprName: return "subexpression name is malformed";
+        case eCompileUnsupportedMeta: return "expression uses an unsupported meta character";
+        case eCompileOutOfMem: return "out of memory";
+        case eCompileMissingOperand: return "missing operand during postfix transform";
+        case eCompileMissingSubexprStart: return "missing subexpr start \"(\"";
+        case eCompileInternalError: return "unknown internal error token";
+        case eCompileUnknownUnicodeClass: return "unknown unicode property class set";
+        case eCompileConflictingAttrs: return "conflicting subexpression attributes specified";
+        case eCompileUnknownSubroutine: return "unknown subroutine call identifier";
+        default: return "unknown failure";
+    }
+}
+
+int regexGetTensDigit(int val) {
+    for(; val >= 100; val /= 100);
+    return val / 10;
+}
+
+int regexGetHundredsDigit(int val) {
+    for(; val >= 1000; val /= 1000);
+    return val / 100;
+}
+
+int regexGetPatternDetailOffset(const char *pattern, int linelen, int pos) {
+    int k, offset = 0, plen = 0, out;
+
+    for(k = 0; (k < pos) && (pattern[k] != '\0'); k++) {
+        out = _regexGetPatternCharLen(pattern + k);
+        plen += out;
+        while(plen > linelen) {
+            out = _regexGetPatternCharLen(pattern + offset);
+            plen -= out;
+            offset++;
+        }
+    }
+    return offset;
+}
+
+void regexEmitPatternDetail(FILE *fp, const char *label, const char *pattern, size_t patlen, int pos, int linelen) {
+    int lead, offset = 0, k, end;
+
+    if(label == NULL) {
+        label = "Pattern";
+    }
+    lead = strlen(label) + 2;
+    linelen -= lead + 1;
+    if(linelen <= 0) {
+        return;
+    }
+
+    offset = regexGetPatternDetailOffset(pattern, linelen, pos);
+    end = strlen(pattern) - offset;
+    if(end > (linelen + 1)) {
+        end = linelen + 1;
+    }
+
+    if(pos >= 100) {
+        fprintf(fp, "%*.*s", lead, lead, "");
+        for(k = offset; k < end; k++) {
+            fputc((!(k % 100) ? regexGetHundredsDigit(k) + '0' : ' '), fp);
+        }
+        fputc('\n', fp);
+    }
+    fprintf(fp, "%*.*s", lead, lead, "");
+    for(k = offset; k < end; k++) {
+        fputc((!(k % 10) ? regexGetTensDigit(k) + '0' : ' '), fp);
+    }
+    fprintf(fp, "\n%*.*s", lead, lead, "");
+    for(k = offset; k < end; k++) {
+        fputc((k % 10) + '0', fp);
+    }
+    fputc('\n', fp);
+
+    fprintf(fp, "%s: ", label);
+    regexEmitEscapedStr(fp, pattern + offset, end);
+    fputc('\n', fp);
+
+    fprintf(fp, "(@%-*d)  %*.*s^\n", lead - 5, pos, pos - offset, pos - offset, "");
+}
+
+void regexCompileResultEmit(FILE *fp, regex_compile_ctx_t *ctx) {
+    fprintf(fp, "Result: %s\n", regexCompileStatusStrGet(ctx->status));
+    if(ctx->status != eCompileOk) {
+        fprintf(fp, "Phase: %s\n", regexCompilePhaseStrGet(ctx->phase));
+        if(ctx->phase == ePhaseTokenize) {
+            regexEmitPatternDetail(fp, "Pattern", ctx->pattern, strlen(ctx->pattern), ctx->position, 78);
+
+            if(ctx->subpattern != NULL) {
+                regexEmitPatternDetail(fp, "Subpat ", ctx->subpattern, strlen(ctx->subpattern), ctx->sub_position, 78);
+            }
+        } else if(ctx->phase == ePhaseNFAGraph) {
+            // ...?
+        } else if(ctx->phase == ePhaseVMGen) {
+            // ...?
+        }
+    }
+}
+
+
+#endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
+
+#ifdef MOJO_REGEX_TEST_MAIN
+
+void regexDumpMatch(regex_match_t *match) {
+    int k, m, n, len;
+    const char *ptr;
+
+    if(match == NULL) {
+        printf("No match\n");
+        return;
+    }
+    printf("Match found\n");
+    printf("    %d groups\n", regexGroupCountGet(match->vm));
+    for(k = 0; k <= regexGroupCountGet(match->vm); k++) {
+        if((ptr = regexGroupValueGet(match, k, &len)) == NULL) {
+            printf("        %d [%s]: no match\n", k, regexGroupNameLookup(match->vm, k));
+        } else {
+            printf("        %d [%s]: [", k, regexGroupNameLookup(match->vm, k));
+            regexEmitEscapedStr(stdout, ptr, len);
+            printf("]\n");
+            if((m = regexGroupCompoundCountGet(match, k)) > 0) {
+                for(n = 0; n < m; n++) {
+                    ptr = regexGroupCompoundValueGet(match, k, n, &len);
+                    printf("            %d [", n);
+                    regexEmitEscapedStr(stdout, ptr, len);
+                    printf("]\n");
+
+                }
+            }
+        }
+    }
+}
+
+int main(int argc, char **argv) {
+    regex_build_t *build;
+    regex_match_t *match;
+
+    if(argc > 1) {
+        if((build = regexCompile(argv[1], 0)) == NULL) {
+            return 1;
+        }
+        if(build->status != eCompileOk) {
+            //printf("Compile failed: %s", regexCompileStatusStrGet(result.status));
+            regexCompileResultEmit(stdout, build);
+            regexBuildDestroy(build);
+            return 1;
+        }
+        regexCompileResultEmit(stdout, &build);
+        if(argc > 2) {
+            regexVMPrintProgram(stdout, regexVMFromBuild(build));
+            printf("-------------------------\n");
+
+            printf("Evaluating [%s]\n", argv[2]);
+            printf(" (escaped) [");
+            regexEmitEscapedStr(stdout, argv[2], (int)strlen(argv[2]));
+            printf("]\n");
+#ifdef MOJO_REGEX_VM_DEBUG
+            if((match = regexMatch(regexVMFromBuild(build), argv[2], RE_STR_NULL_TERM, 1, stdout)) == NULL) {
+#else // !MOJO_REGEX_VM_DEBUG
+            if((match = regexMatch(regexVMFromBuild(build), argv[2], RE_STR_NULL_TERM, 0)) == NULL) {
+#endif // MOJO_REGEX_VM_DEBUG
+                printf("No match\n");
+                //return 1;
+            } else {
+                regexDumpMatch(match);
+                regexMatchFree(match);
+            }
+        }
+        //regexVMGenerateDeclaration(result.vm, "myparser", stdout);
+        //regexVMGenerateDefinition(result.vm, "myparser", stdout);
+    }
+
+    return 0;
+}
+
+#endif // MOJO_REGEX_TEST_MAIN
 
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
@@ -5113,5 +5363,3 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 
 #endif // MOJO_REGEX_IMPLEMENTATION
-
-#endif // _MOJO_REGEX_HEADER_
