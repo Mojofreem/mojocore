@@ -783,6 +783,12 @@ typedef enum {
 
 // Emit token details (compilation only) ////////////////////////////////////
 
+static int _regexGetPatternCharLen(const char *pattern);
+static void _regexCharLiteralEmit(FILE *fp, int c);
+static void _regexCharClassBitmapEmit(FILE *fp, const unsigned int *bitmap);
+static void _regexUtf8ClassBitmapEmit(FILE *fp, const unsigned int *bitmap);
+static void _regexEscapedStrEmit(FILE *fp, const char *str, int len);
+
 typedef void (*regexMetaTokenEmit_t)(FILE *fp, regex_build_ctx_t *build_ctx, regex_token_t *token);
 
 #define RE_META_TOK_EMIT_N(token)   NULL
@@ -3808,15 +3814,11 @@ static int _parseCharClassBitmapRangeSet(regex_build_t *build, regex_utf8_range_
 }
 
 // Parse a class pattern, and generate a eTokenCharClass or eTokenUtf8Class
-// sequence. By default, uses the pattern in tokenizer. If class_pattern is
-// defined, it will use it as the pattern instead of the tokenizer pattern. If
-// class_pattern and name are defined, then name will be associated with the
-// class_pattern in diagnostic output. If class_pattern is not defined, but
-// name is defined, then it is assumed that name is referencing a utf8 property
-// class, and an attempt will be made to lookup the class pattern in the
-// registered unicode classes.
-static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class_pattern,
-                                         const char *name, int name_len, int invert) {
+// sequence. If name is defined, then name will be associated with the
+// class_pattern in diagnostic output.
+static int _parseCharClassAndCreateToken2(regex_build_t *build, const char *class_pattern,
+                                          int in_line, int invert,
+                                          const char *name, int name_len, int subroutine) {
     unsigned int bitmap[8], *ptr;
     parseChar_t c;
     regex_utf8_range_t *utf8range = NULL;
@@ -3829,52 +3831,17 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class
     const char *sub_name;
     const char *sub_alias;
 
-    // TODO - re-evaluate character class interactions with subroutines
-    if((name != NULL) && (class_pattern == NULL)) {
-        if((index = regexSubroutineLookup(build->context, DEF_UTF8_CLASS_SUB_PREFIX, name, name_len)) > 0) {
-            // Found the class in the subroutine index
-            if(!regexBuildConcatCall(build, index)) {
-                return 0;
-            }
-            return 1;
-        }
-        if((class_pattern = _regexRegUnicodeCharClassGet(name, name_len)) == NULL) {
-            build->status = eCompileUnknownUnicodeClass;
-            return 0;
-        }
-        if(!_regexRegUnicodeCharClassLookup(name, name_len, &sub_name, &sub_alias)) {
-            build->status = eCompileInternalError;
-            INTERNAL_ERROR("failed to retrieve utf8 char class");
-            return 0;
-        }
-        // TODO - build the class pattern
-        token = NULL;
-        switch(regexSubroutineRegister(build->context, DEF_UTF8_CLASS_SUB_PREFIX,
-                                       sub_name, sub_alias, token)) {
-            case eReSubMissingName:
-            case eReSubMissingExpr:
-                build->status = eCompileInternalError;
-                INTERNAL_ERROR("failed to register subroutine for utf8 char class");
-                return 0;
-            case eReSubCollision:
-                build->status = eCompileSubroutineNameCollision;
-                return 0;
-            case eReSubOutOfMemory:
-                build->status = eCompileOutOfMem;
-                return 0;
-            default:
-                break;
-        }
-    }
-
-    if(class_pattern != NULL) {
-        if(!regexPatternCreate(build, class_pattern, RE_STR_NULL_TERM)) {
-            build->status = eCompileOutOfMem;
-            return 0;
-        }
+    if(class_pattern == NULL) {
+        return 0;
     }
 
     memset(bitmap, 0, 32);
+
+    if(!regexPatternCreate(build, class_pattern, RE_STR_NULL_TERM)) {
+        build->status = eCompileOutOfMem;
+        return 0;
+    }
+
 
     c = _parseGetNextPatternChar(&(build->pattern->pattern), 0, NULL, NULL);
     if(_parsePatternIsValid(&c)) {
@@ -3954,7 +3921,7 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class
                     build->status = eCompileCharClassRangeIncomplete;
                     return 0;
                 }
-                if(class_pattern != NULL) {
+                if(in_line) {
                     goto parseClassCompleted;
                 }
                 build->status = eCompileCharClassIncomplete;
@@ -4011,8 +3978,77 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class
         }
     }
 
-    if(class_pattern != NULL) {
-        regexPatternDestroy(build);
+    if(utf8_props) {
+        switch(regexSubroutineRegister(build->context, DEF_UTF8_CLASS_SUB_PREFIX,
+                                       sub_name, sub_alias, build->expr->tokens)) {
+            case eReSubMissingName:
+            case eReSubMissingExpr:
+                build->status = eCompileInternalError;
+                INTERNAL_ERROR("failed to register subroutine for utf8 char class");
+                return 0;
+            case eReSubCollision:
+                build->status = eCompileSubroutineNameCollision;
+                return 0;
+            case eReSubOutOfMemory:
+                build->status = eCompileOutOfMem;
+                return 0;
+            default:
+                break;
+        }
+    }
+
+    regexPatternDestroy(build);
+
+    return 1;
+}
+
+// Parse a class pattern, and generate a eTokenCharClass or eTokenUtf8Class
+// sequence. By default, uses the pattern in tokenizer. If class_pattern is
+// defined, it will use it as the pattern instead of the tokenizer pattern. If
+// class_pattern and name are defined, then name will be associated with the
+// class_pattern in diagnostic output. If class_pattern is not defined, but
+// name is defined, then it is assumed that name is referencing a utf8 property
+// class, and an attempt will be made to lookup the class pattern in the
+// registered unicode classes.
+static int _parseCharClassAndConcatToken(regex_build_t *build, const char *class_pattern,
+                                         const char *name, int name_len, int invert) {
+    unsigned int bitmap[8], *ptr;
+    parseChar_t c;
+    regex_utf8_range_t *utf8range = NULL;
+    int range = 0;
+    int last = 0;
+    int k;
+    regex_pattern_t pattern;
+    int index;
+    regex_token_t *token;
+    const char *sub_name;
+    const char *sub_alias;
+    int utf8_props = 0;
+
+    if((name != NULL) && (class_pattern == NULL)) {
+        utf8_props = 1;
+        if((index = regexSubroutineLookup(build->context, DEF_UTF8_CLASS_SUB_PREFIX, name, name_len)) > 0) {
+            // Found the class in the subroutine index
+            if(!regexBuildConcatCall(build, index)) {
+                return 0;
+            }
+            return 1;
+        }
+        if((class_pattern = _regexRegUnicodeCharClassGet(name, name_len)) == NULL) {
+            build->status = eCompileUnknownUnicodeClass;
+            return 0;
+        }
+        if(!_regexRegUnicodeCharClassLookup(name, name_len, &sub_name, &sub_alias)) {
+            build->status = eCompileInternalError;
+            INTERNAL_ERROR("failed to retrieve utf8 char class");
+            return 0;
+        }
+        // TODO - build the class pattern
+        token = NULL;
+    }
+
+    if(!_parseCharClassAndCreateToken(build, class_pattern, 1, invert, name, name_len, utf8_props)) {
+        return 0;
     }
 
     return 1;
@@ -5204,25 +5240,26 @@ int regexGetPatternDetailOffset(const char *pattern, int linelen, int pos) {
     return offset;
 }
 
-void regexEmitPatternDetail(FILE *fp, const char *label, const char *pattern, size_t patlen, int pos, int linelen) {
+void regexEmitPatternDetail(FILE *fp, const char *label,
+                            regex_pattern_t *pattern, int linelen) {
     int lead, offset = 0, k, end;
 
     if(label == NULL) {
         label = "Pattern";
     }
-    lead = strlen(label) + 2;
+    lead = (int)strlen(label) + 2;
     linelen -= lead + 1;
     if(linelen <= 0) {
         return;
     }
 
-    offset = regexGetPatternDetailOffset(pattern, linelen, pos);
-    end = strlen(pattern) - offset;
+    offset = regexGetPatternDetailOffset(pattern->pattern, linelen, pattern->pos);
+    end = pattern->len - offset;
     if(end > (linelen + 1)) {
         end = linelen + 1;
     }
 
-    if(pos >= 100) {
+    if(pattern->pos >= 100) {
         fprintf(fp, "%*.*s", lead, lead, "");
         for(k = offset; k < end; k++) {
             fputc((!(k % 100) ? regexGetHundredsDigit(k) + '0' : ' '), fp);
@@ -5240,26 +5277,20 @@ void regexEmitPatternDetail(FILE *fp, const char *label, const char *pattern, si
     fputc('\n', fp);
 
     fprintf(fp, "%s: ", label);
-    regexEmitEscapedStr(fp, pattern + offset, end);
+    _regexEscapedStrEmit(fp, pattern->pattern + offset, end);
     fputc('\n', fp);
 
-    fprintf(fp, "(@%-*d)  %*.*s^\n", lead - 5, pos, pos - offset, pos - offset, "");
+    fprintf(fp, "(@%-*d)  %*.*s^\n", lead - 5, pattern->pos, pattern->pos - offset, pattern->pos - offset, "");
 }
 
-void regexCompileResultEmit(FILE *fp, regex_compile_ctx_t *ctx) {
-    fprintf(fp, "Result: %s\n", regexCompileStatusStrGet(ctx->status));
-    if(ctx->status != eCompileOk) {
-        fprintf(fp, "Phase: %s\n", regexCompilePhaseStrGet(ctx->phase));
-        if(ctx->phase == ePhaseTokenize) {
-            regexEmitPatternDetail(fp, "Pattern", ctx->pattern, strlen(ctx->pattern), ctx->position, 78);
+void regexCompileResultEmit(FILE *fp, regex_build_t *build) {
+    regex_pattern_t *pattern;
 
-            if(ctx->subpattern != NULL) {
-                regexEmitPatternDetail(fp, "Subpat ", ctx->subpattern, strlen(ctx->subpattern), ctx->sub_position, 78);
-            }
-        } else if(ctx->phase == ePhaseNFAGraph) {
-            // ...?
-        } else if(ctx->phase == ePhaseVMGen) {
-            // ...?
+    fprintf(fp, "Result: %s\n",
+            ((build == NULL) ? "Out of memory" : regexCompileStatusStrGet(build->status)));
+    if((build != NULL) && (build->status != eCompileOk)) {
+        for(pattern = build->pattern; pattern != NULL; pattern = pattern->parent) {
+            regexEmitPatternDetail(fp, ((pattern == build->pattern) ? "Pattern" : "Subpat"), pattern, 78);
         }
     }
 }
@@ -5269,6 +5300,7 @@ void regexCompileResultEmit(FILE *fp, regex_compile_ctx_t *ctx) {
 
 #ifdef MOJO_REGEX_TEST_MAIN
 
+#if 0
 void regexDumpMatch(regex_match_t *match) {
     int k, m, n, len;
     const char *ptr;
@@ -5284,13 +5316,13 @@ void regexDumpMatch(regex_match_t *match) {
             printf("        %d [%s]: no match\n", k, regexGroupNameLookup(match->vm, k));
         } else {
             printf("        %d [%s]: [", k, regexGroupNameLookup(match->vm, k));
-            regexEmitEscapedStr(stdout, ptr, len);
+            _regexEscapedStrEmit(stdout, ptr, len);
             printf("]\n");
             if((m = regexGroupCompoundCountGet(match, k)) > 0) {
                 for(n = 0; n < m; n++) {
                     ptr = regexGroupCompoundValueGet(match, k, n, &len);
                     printf("            %d [", n);
-                    regexEmitEscapedStr(stdout, ptr, len);
+                    _regexEscapedStrEmit(stdout, ptr, len);
                     printf("]\n");
 
                 }
@@ -5298,6 +5330,7 @@ void regexDumpMatch(regex_match_t *match) {
         }
     }
 }
+#endif // 0
 
 int main(int argc, char **argv) {
     regex_build_t *build;
@@ -5313,14 +5346,14 @@ int main(int argc, char **argv) {
             regexBuildDestroy(build);
             return 1;
         }
-        regexCompileResultEmit(stdout, &build);
+        regexCompileResultEmit(stdout, build);
         if(argc > 2) {
-            regexVMPrintProgram(stdout, regexVMFromBuild(build));
+            regexVMProgramEmit(stdout, regexVMFromBuild(build), 0, 0);
             printf("-------------------------\n");
 
             printf("Evaluating [%s]\n", argv[2]);
             printf(" (escaped) [");
-            regexEmitEscapedStr(stdout, argv[2], (int)strlen(argv[2]));
+            _regexEscapedStrEmit(stdout, argv[2], (int)strlen(argv[2]));
             printf("]\n");
 #ifdef MOJO_REGEX_VM_DEBUG
             if((match = regexMatch(regexVMFromBuild(build), argv[2], RE_STR_NULL_TERM, 1, stdout)) == NULL) {
@@ -5330,7 +5363,7 @@ int main(int argc, char **argv) {
                 printf("No match\n");
                 //return 1;
             } else {
-                regexDumpMatch(match);
+                //regexDumpMatch(match);
                 regexMatchFree(match);
             }
         }
