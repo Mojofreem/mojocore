@@ -203,6 +203,90 @@ Regex VM Bytecode (v9 - in development)
         |4bit op|      program counter      |  Min value  |  Max value  |
         +-------+---------------------------+---------------------------+
 
+        This instruction acts as a combined conditional and split. If the
+        expression has matched between min value, and max value, iterations,
+        then for each iteration, a thread will be split and executed at
+        program counter. If the matched iterations are less than max value,
+        the thread will continue at the next instruction.
+
+
+    pattern - consumes text buffer, token by token
+    expr - everything is assembled within an expression
+        all operations on an expression, when completed, should leave a single
+        operand and no operators remaining within the expression
+
+    pattern
+    subexpression
+    class
+    predefined
+
+
+    UTF8 property classes
+        derived from Unicode database
+        entry retains:
+            verbose name
+            alias (property set abbreviation
+            class pattern
+
+        add entry
+        remove entry
+        lookup entry
+        call entry
+
+    subroutines
+        pre-declared, entry retains:
+            pattern
+                OR
+            token DFA
+            name
+        inline:
+            defined within a grouping [ie., (?P<...>...)]
+            defined as part of a character class (ie., UTF8 sequences)
+
+    only primary groups (ie., groups defined within the top level pattern) are
+    index referencable. Any subroutine or generated class subexpressions must
+    be referenced by name.
+
+    pre-registered
+        unicode class
+            name
+            alias
+            class pattern
+        metaclass
+            name
+            class pattern
+        subroutine
+            name
+            pattern
+
+        flags
+            dynamic - the entry was explicitly allocated, and may be freed upon removal
+            utf8 - the entry contains unicode instructions
+            class - the entry is a class pattern (not a general expression)
+
+typedef enum {
+    eReRegFlagDynamic = 1,
+    eReRegFlagUtf8 = 2,
+    eReRegFlagClass = 4,
+    eReRegFlagTypeSubroutine = 8,
+    eReRegFlagTypeMetaClass = 9,
+    eReRegFlagTypeUtf8Class = 10
+} eReRegisteredFlags_t;
+
+typedef struct regex_registered_entry_s regex_registered_entry_t;
+struct regex_registered_entry_s {
+    unsigned int flags;
+    char *name;
+    char *alias;
+    char *pattern;
+    regex_predefined_entry_t *next;
+};
+
+int regexPredefinedRegister(const char *pattern, const char *name, const char *alias, unsigned int flags);
+int regexPredefinedUnregister(const char *name, const char *alias);
+regex_registered_entry_t *regexPredefinedLookup(const char *name, const char *alias);
+
+
 ///////////////////////////////////////////////////////////////////////////*/
 
 // Build the main test driver stub
@@ -230,6 +314,7 @@ Regex VM Bytecode (v9 - in development)
 #define MOJO_REGEX_IMPLEMENTATION
 
 #include <stdio.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
@@ -391,6 +476,31 @@ typedef enum {
     ePhaseComplete
 } eRegexCompilePhase_t;
 
+#ifndef DEF_REGEX_PREREGISTER_ENTRY
+#define DEF_REGEX_PREREGISTER_ENTRY
+
+typedef enum {
+    eReRegTypeUtf8Class,
+    eReRegTypeCharClass,
+    eReRegTypeSubroutine
+} eReRegisterType_t;
+
+typedef struct regex_registered_entry_s regex_registered_entry_t;
+struct regex_registered_entry_s {
+    eReRegisterType_t type;
+    int is_static;
+    char *name;
+    char *alias;
+    char *pattern;
+    regex_registered_entry_t *next;
+};
+
+#endif // DEF_REGEX_PREREGISTER_ENTRY
+
+int regexRegisterEntryAdd(eReRegisterType_t type, int is_static, const char *name, const char *alias, const char *pattern);
+int regexRegisterEntryRemove(eReRegisterType_t type, const char *name, const char *alias);
+regex_registered_entry_t *regexRegisterEntryLookup(eReRegisterType_t type, const char *name, int name_len);
+
 #ifndef DEF_REGEX_UNICODE_CLASS
 #define DEF_REGEX_UNICODE_CLASS
 
@@ -404,6 +514,8 @@ struct regex_unicode_class_s {
 
 #endif // DEF_REGEX_UNICODE_CLASS
 
+int regexRegisterUnicodePropClasses(regex_unicode_class_t *import_table);
+
 #define RE_FLAG_DOT_ALL     0x1u
 
 #define META_CLASS_DIGITS_PATTERN           "0-9"
@@ -413,9 +525,15 @@ struct regex_unicode_class_s {
 #define META_CLASS_WORD_PATTERN             "a-zA-Z0-9_"
 #define META_CLASS_INV_WORD_PATTERN         "^a-zA-Z0-9_"
 
+#define META_GRAPHEME_SUBROUTINE            "\P{M}\p{M}*"
+
 #define DEF_UNICODE_GLYPH_SUB_PREFIX    "meta:"
 #define DEF_UNICODE_GLYPH_SUB_NAME      "glyph"
 #define DEF_UTF8_CLASS_SUB_PREFIX       "class:"
+
+#define RE_SUB_CLASS_PREFIX             "class:"
+#define RE_SUB_UTF8_PREFIX              "utf8:"
+#define RE_SUB_ROUTINE_PREFIX           "routine:"
 
 // Adds a unicode property class to the global property class table. Returns 1
 // on success, or 0 if the "alias" or "name" have already been registered.
@@ -1108,6 +1226,7 @@ struct parseChar_s {
     eRegexPatternCharState_t state; // identity of the parsed value
     const char *ptr;    // pointer to the position in the pattern that the char was parsed from
     int len;    // length of the parse value (for position advance)
+    int emit;   // length of the parse value if re-emitted (to normalized form)
     int c;  // parsed character value
 };
 
@@ -1123,14 +1242,18 @@ struct parse_str_s {
     int bytes;
 };
 
+// Returns true if the character passed is a valid hex digit [0-9a-fA-F]
 static int _parseIsHexDigit(char c);
+// Returns the numeric value of the passed hex digit
 static int _parseHexValueGet(char c);
+// Returns true if the character is a valid Id character [a-zA-Z0-9_\-]
 static int _parseIsIdChar(char c);
+// Returns true, and parses the numeric value of the string provided, if in hexidecimal form
 static int _parseHexValueStr(const char *str, int len, unsigned int *value);
 
 // Validates that pattern points to a valid range quantifier (ie., "{3,6}").
-// Returns 0 if false, or the length of the quantifier (excluding delimiters)
-// if true.
+// Returns 0 if false, or the length of the quantifier string (excluding
+// delimiters) if true.
 static int _parseRangeQuantifier(const char *pattern, int *min, int *max);
 static void _parseCharEmit(FILE *fp, parseChar_t *pc);
 static int _parsePatternIsValid(parseChar_t *pc);
@@ -1177,8 +1300,16 @@ void _regexUtf8RangeDestroy(regex_build_ctx_t *context, regex_utf8_range_t *rang
 int _parseCreateUtf8Range(regex_build_t *build, regex_utf8_range_t **sequence, int start, int end);
 static int _parseCharClassBitmapSet(regex_build_t *build, regex_utf8_range_t **range, unsigned int *bitmap, int c);
 static int _parseCharClassBitmapRangeSet(regex_build_t *build, regex_utf8_range_t **range, unsigned int *bitmap, int a, int b);
-static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class_pattern,
+static int _parseCharClassAndConcatToken(regex_build_t *build, const char *class_pattern,
                                          const char *name, int name_len, int invert);
+static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class_pattern,
+                                         int in_line, int invert,
+                                         const char *name, int name_len, int subroutine);
+
+regex_token_t *parseCharClassAndCreateToken(regex_build_t *build, const char *pattern, int in_line, int invert);
+// parse class from pattern
+// parse registered class
+
 
 static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build);
 
@@ -1202,10 +1333,22 @@ eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token);
 int regexExprDestroy(regex_build_t *build);
 
 int regexPatternCreate(regex_build_t *build, const char *pattern, int len);
+
+typedef struct regex_pattern_pointer_s regex_pattern_pointer_t;
+struct regex_pattern_pointer_s {
+    regex_pattern_t *pattern;
+    int line_len;
+    int trailing;
+    int emit_offset;    // offset within the pattern buffer to begin emitting
+    int emit_distance;  // text char distance from emit start to pattern pos
+};
+regex_pattern_pointer_t regexPatternPointerDistance(regex_build_t *build, int line_len, int trailing);
+void regexPatternEmit(regex_build_t *build, const char *prefix, int prefix_max, regex_pattern_pointer_t *pointer);
 int regexPatternDestroy(regex_build_t *build);
 
 typedef enum {
     eReSubOk,
+    eReSubInvalid,
     eReSubCollision,
     eReSubMissingName,
     eReSubMissingExpr,
@@ -1437,6 +1580,136 @@ static int _regexPrefixedStrncmp(const unsigned char *prefix,
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
 /////////////////////////////////////////////////////////////////////////////
+// Pre-registered character classes and subroutines
+/////////////////////////////////////////////////////////////////////////////
+
+int _regex_preregistered_defaults_init = 0;
+regex_registered_entry_t *_regex_preregistered_table = NULL;
+
+char *_regexStrTrimToNull(char **str) {
+    if(*str == NULL) {
+        return *str;
+    }
+    while(isspace(**str)) {
+        (*str)++;
+    }
+    if((**str) == '\0') {
+        *str = NULL;
+    }
+    return *str;
+}
+
+int regexRegisterEntryAdd(eReRegisterType_t type, int is_static, const char *name, const char *alias, const char *pattern) {
+    regex_registered_entry_t *entry;
+
+    name = _regexStrTrimToNull((char **)(&name));
+    alias = _regexStrTrimToNull((char **)(&alias));
+    if((name == NULL) && (alias == NULL)) {
+        INTERNAL_ERROR("cannot preregister an unnamed entry");
+        return 0;
+    }
+    for(entry = _regex_preregistered_table; entry != NULL; entry = entry->next) {
+        if(entry->type == type) {
+            if((name != NULL) &&
+               ((!_regexStrncmp((const unsigned char *)name, RE_STR_NULL_TERM,
+                                (const unsigned char *)entry->name, RE_STR_NULL_TERM)) ||
+                (!_regexStrncmp((const unsigned char *)name, RE_STR_NULL_TERM,
+                                (const unsigned char *)entry->alias, RE_STR_NULL_TERM)))) {
+                INTERNAL_ERROR("cannot preregister an entry with an existing name");
+                return 0;
+            } else if((alias != NULL) &&
+                      ((!_regexStrncmp((const unsigned char *)alias, RE_STR_NULL_TERM,
+                                       (const unsigned char *)entry->name, RE_STR_NULL_TERM)) ||
+                       (!_regexStrncmp((const unsigned char *)alias, RE_STR_NULL_TERM,
+                                       (const unsigned char *)entry->alias, RE_STR_NULL_TERM)))) {
+                INTERNAL_ERROR("cannot preregister an entry with an existing alias");
+                return 0;
+            }
+        }
+    }
+    if((entry = _regexAlloc(sizeof(regex_registered_entry_t), _regexMemContext)) == NULL) {
+        return 0;
+    }
+    entry->type = type;
+    entry->is_static = is_static;
+    if(is_static) {
+        entry->name = (char *)name;
+        entry->alias = (char *)alias;
+        entry->pattern = (char *)pattern;
+    } else {
+        if(((name != NULL) && ((entry->name = _regexStrdup(name, RE_STR_NULL_TERM)) == NULL)) ||
+           ((alias != NULL) && ((entry->alias = _regexStrdup(alias, RE_STR_NULL_TERM)) == NULL)) ||
+           ((entry->pattern = _regexStrdup(pattern, RE_STR_NULL_TERM)) == NULL)) {
+            return 0;
+        }
+    }
+    entry->next = _regex_preregistered_table;
+    _regex_preregistered_table = entry;
+    return 1;
+}
+
+int regexRegisterEntryRemove(eReRegisterType_t type, const char *name, const char *alias) {
+    regex_registered_entry_t *entry, *last;
+
+    for(entry = _regex_preregistered_table, last = NULL;
+        entry != NULL;
+        last = entry, entry = entry->next) {
+        if(entry->type == type) {
+            if(((name != NULL) && (!_regexStrncmp((const unsigned char *)name, RE_STR_NULL_TERM, (const unsigned char *)entry->name, RE_STR_NULL_TERM))) ||
+               ((alias != NULL) && (!_regexStrncmp((const unsigned char *)name, alias, (const unsigned char *)entry->alias, RE_STR_NULL_TERM)))) {
+                if(last == NULL) {
+                    _regex_preregistered_table = entry->next;
+                } else {
+                    last->next = entry->next;
+                }
+                if(!(entry->is_static)) {
+                    if(entry->name != NULL) {
+                        _regexDealloc(entry->name, _regexMemContext);
+                    }
+                    if(entry->alias != NULL) {
+                        _regexDealloc(entry->alias, _regexMemContext);
+                    }
+                    if(entry->pattern != NULL) {
+                        _regexDealloc(entry->pattern, _regexMemContext);
+                    }
+                }
+                _regexDealloc(entry, _regexMemContext);
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+regex_registered_entry_t *regexRegisterEntryLookup(eReRegisterType_t type, const char *name, int name_len) {
+    regex_registered_entry_t *entry;
+
+    for(entry = _regex_preregistered_table; entry != NULL; entry = entry->next) {
+        if((entry->type == type) &&
+           ((!_regexStrncmp((const unsigned char *)name, name_len, (const unsigned char *)entry->name, RE_STR_NULL_TERM)) ||
+            (!_regexStrncmp((const unsigned char *)name, name_len, (const unsigned char *)entry->alias, RE_STR_NULL_TERM)))) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+int regexRegisterUnicodePropClasses(regex_unicode_class_t *import_table) {
+    int idx;
+    int fail = 0;
+
+    for(idx = 0; import_table[idx].class_string != NULL; idx++) {
+        if(!regexRegisterEntryAdd(eReRegTypeUtf8Class, 1,
+                                  import_table[idx].name,
+                                  import_table[idx].alias,
+                                  import_table[idx].class_string)) {
+            fail = 1;
+        }
+    }
+    return !fail;
+}
+
+/////////////////////////////////////////////////////////////////////////////
 // Character class registration functions
 /////////////////////////////////////////////////////////////////////////////
 
@@ -1444,6 +1717,26 @@ static int _regexPrefixedStrncmp(const unsigned char *prefix,
 
 // TODO - inline the base utf8 props classes to ensure this is a true single file library
 #include "utf8_props.h"
+
+static int _regexRegUnicodeInitializeTable(void) {
+    if(_regex_preregistered_defaults_init) {
+        return 1;
+    }
+    _regex_preregistered_defaults_init = 1;
+    if((!regexRegisterEntryAdd(eReRegTypeCharClass, 1, "digits", "d", META_CLASS_DIGITS_PATTERN)) ||
+       (!regexRegisterEntryAdd(eReRegTypeCharClass, 1, "^digits", "D", META_CLASS_INV_DIGITS_PATTERN)) ||
+       (!regexRegisterEntryAdd(eReRegTypeCharClass, 1, "whitespace", "s", META_CLASS_WHITESPACE_PATTERN)) ||
+       (!regexRegisterEntryAdd(eReRegTypeCharClass, 1, "^whitespace", "S", META_CLASS_INV_WHITESPACE_PATTERN)) ||
+       (!regexRegisterEntryAdd(eReRegTypeCharClass, 1, "word", "w", META_CLASS_WORD_PATTERN)) ||
+       (!regexRegisterEntryAdd(eReRegTypeCharClass, 1, "^word", "W", META_CLASS_INV_WORD_PATTERN)) ||
+       (!regexRegisterEntryAdd(eReRegTypeSubroutine, 1, "grapheme", "X", META_GRAPHEME_SUBROUTINE))) {
+        return 0;
+    }
+    return regexRegisterUnicodePropClasses(_regex_char_class_default_import_table);
+}
+
+
+
 
 regex_unicode_class_t _subroutine_test = {
         NULL, "test",
@@ -1491,6 +1784,7 @@ int regexRegUnicodeCharClassAddTable(regex_unicode_class_t *utf8class) {
     return failed ? 0 : 1;
 }
 
+#if 0
 static int _regexRegUnicodeInitializeTable(void) {
     if(_regex_unicode_table_initialized) {
         return 1;
@@ -1498,6 +1792,7 @@ static int _regexRegUnicodeInitializeTable(void) {
     _regex_unicode_table_initialized = 1;
     return regexRegUnicodeCharClassAddTable(_regex_char_class_default_import_table);
 }
+#endif // 0
 
 static const char *_regexRegUnicodeCharClassGet(const char *classId, int len) {
     regex_unicode_class_t *walk;
@@ -3816,9 +4111,9 @@ static int _parseCharClassBitmapRangeSet(regex_build_t *build, regex_utf8_range_
 // Parse a class pattern, and generate a eTokenCharClass or eTokenUtf8Class
 // sequence. If name is defined, then name will be associated with the
 // class_pattern in diagnostic output.
-static int _parseCharClassAndCreateToken2(regex_build_t *build, const char *class_pattern,
-                                          int in_line, int invert,
-                                          const char *name, int name_len, int subroutine) {
+static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class_pattern,
+                                         int in_line, int invert,
+                                         const char *name, int name_len, int subroutine) {
     unsigned int bitmap[8], *ptr;
     parseChar_t c;
     regex_utf8_range_t *utf8range = NULL;
@@ -4012,21 +4307,11 @@ static int _parseCharClassAndCreateToken2(regex_build_t *build, const char *clas
 // registered unicode classes.
 static int _parseCharClassAndConcatToken(regex_build_t *build, const char *class_pattern,
                                          const char *name, int name_len, int invert) {
-    unsigned int bitmap[8], *ptr;
-    parseChar_t c;
-    regex_utf8_range_t *utf8range = NULL;
-    int range = 0;
-    int last = 0;
-    int k;
-    regex_pattern_t pattern;
-    int index;
-    regex_token_t *token;
+    int index = 0;
     const char *sub_name;
     const char *sub_alias;
-    int utf8_props = 0;
 
     if((name != NULL) && (class_pattern == NULL)) {
-        utf8_props = 1;
         if((index = regexSubroutineLookup(build->context, DEF_UTF8_CLASS_SUB_PREFIX, name, name_len)) > 0) {
             // Found the class in the subroutine index
             if(!regexBuildConcatCall(build, index)) {
@@ -4043,11 +4328,28 @@ static int _parseCharClassAndConcatToken(regex_build_t *build, const char *class
             INTERNAL_ERROR("failed to retrieve utf8 char class");
             return 0;
         }
-        // TODO - build the class pattern
-        token = NULL;
+        if((index = regexSubroutineCreate(build->context)) == 0) {
+            build->status = eCompileOutOfMem;
+            return 0;
+        }
+        if(sub_name != NULL) {
+            if(regexSubroutineName(build->context, index, DEF_UTF8_CLASS_SUB_PREFIX, sub_name, RE_STR_NULL_TERM) != eReSubOk) {
+                INTERNAL_ERROR("failed to name subroutine for utf8 prop class");
+                build->status = eCompileInternalError;
+                return 0;
+            }
+        }
+        if(sub_alias != NULL) {
+            if(regexSubroutineAlias(build->context, index, DEF_UTF8_CLASS_SUB_PREFIX, sub_alias, RE_STR_NULL_TERM) !=
+               eReSubOk) {
+                INTERNAL_ERROR("failed to alias subroutine for utf8 prop class");
+                build->status = eCompileInternalError;
+                return 0;
+            }
+        }
     }
 
-    if(!_parseCharClassAndCreateToken(build, class_pattern, 1, invert, name, name_len, utf8_props)) {
+    if(!_parseCharClassAndCreateToken(build, class_pattern, 1, invert, name, name_len, index)) {
         return 0;
     }
 
@@ -4107,7 +4409,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                         continue;
 
                     case '[': // Meta, char class
-                        if(!_parseCharClassAndCreateToken(build, NULL, NULL, 0, 0)) {
+                        if(!_parseCharClassAndConcatToken(build, NULL, NULL, 0, 0)) {
                             return build->status;
                         }
                         continue;
