@@ -209,6 +209,7 @@ Regex VM Bytecode (v9 - in development)
         program counter. If the matched iterations are less than max value,
         the thread will continue at the next instruction.
 
+    =========================================================================
 
     pattern - consumes text buffer, token by token
     expr - everything is assembled within an expression
@@ -287,6 +288,84 @@ int regexPredefinedUnregister(const char *name, const char *alias);
 regex_registered_entry_t *regexPredefinedLookup(const char *name, const char *alias);
 
 
+Compilation response status codes
+
+    ok
+    out of mem
+    char class range incomplete
+    char class incomplete
+    escape char incomplete
+    unknown unicode char class
+    invalid escape char
+    malformed subexpr name
+    unsupported meta
+    missing operand
+    missing subexpr start
+    missing subexpr end
+    conflicting attrs
+    unknown subroutine
+    subroutine name collision
+    missing pattern
+    internal error
+
+    expr empty
+    expr unclosed
+    expr unused operand
+    expr missing operand
+    expr missing open
+    expr invalid close
+    expr internal error
+
+read char
+read str
+write char
+write str
+
+buffer()
+
+
+regex_build_t *regexCompile(const char *pattern, unsigned int flags);
+regex_vm_t *regexVMGenerate(regex_build_t *build);
+
+regex_build_t *regexBuildPattern();
+
+tokens
+    char literal
+    char class
+    string literal
+    char any
+    save
+    utf8 class
+    call
+    byte
+    assertion
+    utf8 literal
+    range
+
+    match - explicitly added to close an expression
+    return - explicitly added to close a subroutine
+    split - intrinsically added during expression construction
+    jmp - intrinsically added during expression construction
+
+operators
+    zero or one
+    zero or many
+    one or many
+    range
+
+compound operators
+    concatenate
+    alternate
+
+wrap expression
+    expression
+    name
+    no capture
+    compound
+
+
+
+
 ///////////////////////////////////////////////////////////////////////////*/
 
 // Build the main test driver stub
@@ -322,7 +401,8 @@ regex_registered_entry_t *regexPredefinedLookup(const char *name, const char *al
 #define MOJO_REGEX_DEBUG_INTERNAL_ERRORS
 
 #ifdef MOJO_REGEX_DEBUG_INTERNAL_ERRORS
-#   define INTERNAL_ERROR(msg)  fprintf(stderr, "ERROR [%s] in %s @ %d\n", msg, __FUNCTION__, __LINE__)
+#   define INTERNAL_ERROR(fmt,...)  fprintf(stderr, "ERROR [" fmt "] in %s @ %d\n", ## __VA_ARGS__, __FUNCTION__, __LINE__)
+//#   define INTERNAL_ERROR(msg)  fprintf(stderr, "ERROR [%s] in %s @ %d\n", msg, __FUNCTION__, __LINE__)
 #else
 #   define INTERNAL_ERROR(msg)
 #endif
@@ -525,7 +605,7 @@ int regexRegisterUnicodePropClasses(regex_unicode_class_t *import_table);
 #define META_CLASS_WORD_PATTERN             "a-zA-Z0-9_"
 #define META_CLASS_INV_WORD_PATTERN         "^a-zA-Z0-9_"
 
-#define META_GRAPHEME_SUBROUTINE            "\P{M}\p{M}*"
+#define META_GRAPHEME_SUBROUTINE            "\\P{M}\\p{M}*"
 
 #define DEF_UNICODE_GLYPH_SUB_PREFIX    "meta:"
 #define DEF_UNICODE_GLYPH_SUB_NAME      "glyph"
@@ -846,6 +926,15 @@ struct regex_thread_s {
     regex_compound_t *compound;
     const char **subexprs;
     char _buffer[0];
+        // Catchall buffer for context size variance. This allows us to allocate
+        // the thread context in a single allocation, simplifying creation
+        // and destruction. Note that regex_compound_t are excluded, and handled
+        // through a separate memory pool.
+        // Size is:
+        //     sizeof(regex_thread_t) +
+        //     vm->max_call_depth * sizeof(unsigned int) +
+        //     vm->max_nested_ranges * sizeof(unsigned int) +
+        //     vm->group_tbl_size * 2 * sizeof(const char *)
 };
 
 typedef struct regex_eval_s regex_eval_t;
@@ -1333,17 +1422,7 @@ eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token);
 int regexExprDestroy(regex_build_t *build);
 
 int regexPatternCreate(regex_build_t *build, const char *pattern, int len);
-
-typedef struct regex_pattern_pointer_s regex_pattern_pointer_t;
-struct regex_pattern_pointer_s {
-    regex_pattern_t *pattern;
-    int line_len;
-    int trailing;
-    int emit_offset;    // offset within the pattern buffer to begin emitting
-    int emit_distance;  // text char distance from emit start to pattern pos
-};
-regex_pattern_pointer_t regexPatternPointerDistance(regex_build_t *build, int line_len, int trailing);
-void regexPatternEmit(regex_build_t *build, const char *prefix, int prefix_max, regex_pattern_pointer_t *pointer);
+int regexPatternEmit(regex_build_t *build, const char *prefix, int prefix_max, int line_len, int trailing);
 int regexPatternDestroy(regex_build_t *build);
 
 typedef enum {
@@ -1538,7 +1617,8 @@ static int _regexStrncmp(const unsigned char *str_a, int len_a,
         len_b = (int)strlen((char *)str_b);
     }
     if(len_a != len_b) {
-        return memcmp(str_a, str_b, ((len_a < len_b) ? len_a : len_b));
+        return -1;
+        //return memcmp(str_a, str_b, ((len_a < len_b) ? len_a : len_b));
     }
     return memcmp(str_a, str_b, len_a);
 }
@@ -1575,6 +1655,22 @@ static int _regexPrefixedStrncmp(const unsigned char *prefix,
         return -1;
     }
     return memcmp(str_a, str_b + pre_len, len_a);
+}
+
+int _regexStrDigitCount(int number) {
+    struct {
+        int check;
+        int digits;
+    } digitTbl[] = {{10, 1}, {100, 2}, {1000, 3}, {10000, 4}, {100000, 5}, {-1, 6}};
+
+    int k;
+
+    for(k = 0; digitTbl[k].check != -1; k++) {
+        if(number < digitTbl[k].check) {
+            return digitTbl[k].digits;
+        }
+    }
+    return 6;
 }
 
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
@@ -1622,7 +1718,7 @@ int regexRegisterEntryAdd(eReRegisterType_t type, int is_static, const char *nam
                                        (const unsigned char *)entry->name, RE_STR_NULL_TERM)) ||
                        (!_regexStrncmp((const unsigned char *)alias, RE_STR_NULL_TERM,
                                        (const unsigned char *)entry->alias, RE_STR_NULL_TERM)))) {
-                INTERNAL_ERROR("cannot preregister an entry with an existing alias");
+                INTERNAL_ERROR("cannot preregister an entry with an existing alias [%s] - [%s][%s]", alias, entry->name, entry->alias);
                 return 0;
             }
         }
@@ -1656,7 +1752,7 @@ int regexRegisterEntryRemove(eReRegisterType_t type, const char *name, const cha
         last = entry, entry = entry->next) {
         if(entry->type == type) {
             if(((name != NULL) && (!_regexStrncmp((const unsigned char *)name, RE_STR_NULL_TERM, (const unsigned char *)entry->name, RE_STR_NULL_TERM))) ||
-               ((alias != NULL) && (!_regexStrncmp((const unsigned char *)name, alias, (const unsigned char *)entry->alias, RE_STR_NULL_TERM)))) {
+               ((alias != NULL) && (!_regexStrncmp((const unsigned char *)alias, RE_STR_NULL_TERM, (const unsigned char *)entry->alias, RE_STR_NULL_TERM)))) {
                 if(last == NULL) {
                     _regex_preregistered_table = entry->next;
                 } else {
@@ -1734,9 +1830,6 @@ static int _regexRegUnicodeInitializeTable(void) {
     }
     return regexRegisterUnicodePropClasses(_regex_char_class_default_import_table);
 }
-
-
-
 
 regex_unicode_class_t _subroutine_test = {
         NULL, "test",
@@ -1921,6 +2014,8 @@ int _parseUtf8DecodeSequence(const char *str) {
     return -1;
 }
 
+// Returns true if the character 'c' is the properly utf8 encoded byte at
+// position 'pos' for the codepoint.
 int _parseUtf8CompareEncodingByte(int codepoint, unsigned char c, int pos) {
     if((pos > 4) || (pos <= 0)) {
         return 0;
@@ -1962,27 +2057,24 @@ int _parseUtf8CompareEncodingByte(int codepoint, unsigned char c, int pos) {
 // Regex token details emit handlers
 /////////////////////////////////////////////////////////////////////////////
 
+// Returns the number of characters needed to represent the character at the
+// first position of pattern, in escaped string form.
 static int _regexGetPatternCharLen(const char *pattern) {
     int codepoint;
 
     // Check for utf8 encoding
     if((codepoint = _parseUtf8DecodeSequence(pattern)) != -1) {
-        if(codepoint > 0xFFFF) {
+        if(codepoint > 0xFFFF) { // 0xFFFF - 0x10FFFF
             return 8; // \u{######}
-        } else if(codepoint > 2047) {
-            return 6; // \u####
-        } else if(codepoint > 127) {
+        } else if(codepoint > 127) { // 0x7F - 0xFFFE
             return 6; // \u####
         }
-        if(codepoint > 127) {
-            return 1;
-        }
+        // Low bytes don't need utf8 encoding, fall through
     }
     switch(*pattern) {
         case '\0':
         case '\a':
         case '\b':
-        case '\x1b':
         case '\f':
         case '\n':
         case '\r':
@@ -2619,8 +2711,8 @@ eReEvalResult_t _reVMInstr_eTokenSave(regex_eval_t *eval, regex_thread_t *thread
 
 eReEvalResult_t _reVMInstr_eTokenUtf8Class(regex_eval_t *eval, regex_thread_t *thread, unsigned int instr, unsigned char c) {
     const unsigned int *bitmap;
-
     // TODO
+#if 0
 
     if((bitmap = regexVMUtf8TableEntryGet(eval->vm, instr[1])) == NULL) {
         return eEvalInternalError;
@@ -2629,6 +2721,7 @@ eReEvalResult_t _reVMInstr_eTokenUtf8Class(regex_eval_t *eval, regex_thread_t *t
         return eEvalNoMatch;
     }
     thread->pc++;
+#endif // 0
     return eEvalMatch;
 }
 
@@ -2925,7 +3018,7 @@ int regexVMFindSubroutinePCByName(regex_vm_t *vm, const char *name) {
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
 int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
-    if((token == NULL) || (token->tokenType < 0) || (token->tokenType > eTokenUnknown)) {
+    if((token == NULL) || (token->tokenType > eTokenUnknown)) {
         if(token == NULL) {
             INTERNAL_ERROR("regexTokenIsTerminal called with NULL token");
         } else {
@@ -2939,7 +3032,7 @@ int regexTokenIsTerminal(regex_token_t *token, int preceeding) {
 }
 
 eRegexTokenPriority_t regexGetTokenTypePriority(eRegexToken_t tokenType) {
-    if((tokenType < 0) || (tokenType > eTokenUnknown)) {
+    if(tokenType > eTokenUnknown) {
         INTERNAL_ERROR("regexGetTokenTypePriority called with invalid token type");
         return 0;
     }
@@ -2947,7 +3040,7 @@ eRegexTokenPriority_t regexGetTokenTypePriority(eRegexToken_t tokenType) {
 }
 
 int regexGetOperatorArity(regex_token_t *token) {
-    if((token == NULL) || (token->tokenType < 0) || (token->tokenType > eTokenUnknown)) {
+    if((token == NULL) || (token->tokenType > eTokenUnknown)) {
         if(token == NULL) {
             INTERNAL_ERROR("regexGetOperatorArity called with NULL token");
         } else {
@@ -3028,7 +3121,7 @@ int _regexPtrlistPatch(regex_build_ctx_t *context, regex_ptrlist_t **list, regex
     return patched;
 }
 
-void _regexPtrListFree(regex_build_ctx_t *context, regex_ptrlist_t *list) {
+void _regexPtrlistFree(regex_build_ctx_t *context, regex_ptrlist_t *list) {
     regex_ptrlist_t *next = NULL;
 
     for(; list != NULL; list = next) {
@@ -3042,7 +3135,7 @@ void _regexPtrListFree(regex_build_ctx_t *context, regex_ptrlist_t *list) {
     }
 }
 
-static void _regexPtrListDump(regex_ptrlist_t *list) {
+static void _regexPtrlistDump(regex_ptrlist_t *list) {
     for(; list != NULL; list = list->next) {
         printf("PtrList node 0x%4.4X - %s\n", (int)((uintptr_t)list->token & 0xFFFFu), (list->type == eRePtrOutA ? "out_a" : "out_b"));
     }
@@ -3133,7 +3226,7 @@ void _regexTokenDestroy(regex_build_ctx_t *context, regex_token_t *token, int fu
             default:
                 break;
         }
-        _regexPtrListFree(NULL, token->ptrlist);
+        _regexPtrlistFree(NULL, token->ptrlist);
         if(context != NULL) {
             token->next = context->token_pool;
             context->token_pool = token;
@@ -3436,12 +3529,14 @@ int regexCreateTokenJmp(regex_build_ctx_t *context, regex_token_t **token) {
 // Character parsing, assists with escaped chars
 /////////////////////////////////////////////////////////////////////////////
 
+// Returns true if the character passed is a valid hex digit [0-9a-fA-F]
 static int _parseIsHexDigit(char c) {
     return (((c >= 'a') && (c <= 'f')) ||   // a - f
             ((c >= 'A') && (c <= 'F')) ||   // A - F
             ((c >= '0') && (c <= '9')));    // 0 - 9
 }
 
+// Returns the numeric value of the passed hex digit
 static int _parseHexValueGet(char c) {
     if ((c >= 'a') && (c <= 'f')) {
         return c - 'a' + 10;
@@ -3454,6 +3549,7 @@ static int _parseHexValueGet(char c) {
     return 0; // This should never be reached if c is a hex digit
 }
 
+// Returns true if the character is a valid Id character [a-zA-Z0-9_\-]
 static int _parseIsIdChar(char c) {
     return (((c >= 'a') && (c <= 'z')) ||   // a - z
             ((c >= 'A') && (c <= 'Z')) ||   // A - Z
@@ -3462,6 +3558,9 @@ static int _parseIsIdChar(char c) {
 
 }
 
+// Parser the numeric value of the string provided, if in hexidecimal form.
+// Returns true if the entirety of the passed string is consumed, or false if
+// some (non hexidecimal) characters remain.
 static int _parseHexValueStr(const char *str, int len, unsigned int *value) {
     unsigned int val = 0;
     int cnt;
@@ -3554,6 +3653,9 @@ static void _parsePatternCharBacktrack(const char **pattern, parseChar_t *pc) {
     }
 }
 
+// Checks if the next character in the pattern is 'c', and increments the pattern
+// position and returns true if so. If not, returns false and the pattern
+// position is unchanged.
 static int _parseCheckNextPatternChar(const char **pattern, char c) {
     parseChar_t pc;
 
@@ -3599,16 +3701,24 @@ static eRegexPatternId_t _parseCheckIdentifier(const char *pattern,
     return eRegexPatternIdOk;
 }
 
+// Parses the next semantic character from pattern, returning the relevant
+// details in a parseChar_t structure. If 'allow_brace' is true, then will
+// treat an opening brace ({) as a char literal, otherwise, an opening brace
+// is checed as a potential range operator. For pattern metcharacters that
+// have associated meta values (\R{...}, {...}, ?P<...>), any parsed identifier
+// strings are pointed to by 'id', with 'len' the internal length (excluding
+// delimiters).
 static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brace,
                                             const char **id, int *len) {
     parseChar_t result = {
             .c = 0,
             .ptr = *pattern,
             .state = eRegexPatternInvalid,
-            .len = 1
+            .len = 1,
+            .emit = 1,
     };
     eRegexPatternId_t id_status;
-    int size;
+    int size, min, max;
     const char *ptr;
 
     if(**pattern == '\0') {
@@ -3618,6 +3728,7 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brac
 
     if(**pattern == '\\') {
         result.len = 2;
+        result.emit = 2;
         switch(*(*pattern + 1)) {
             case '\0': // End of pattern string
                 result.state = eRegexPatternInvalid;
@@ -3633,6 +3744,7 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brac
                     *len = size;
                 }
                 result.len = size + 4; // \p{size}
+                result.emit = result.len;
                 result.c = *(*pattern + 1);
                 result.state = eRegexPatternUnicodeMetaClass;
                 return result;
@@ -3659,6 +3771,7 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brac
                 }
                 result.state = eRegexPatternMetaClass;
                 result.len = size + 4; // \R{size}
+                result.emit = result.len;
                 result.c = *(*pattern + 1);
                 return result;
 
@@ -3673,6 +3786,7 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brac
                 return result;
             case 'e': result.c = '\x1B'; // escape
                 result.state = eRegexPatternEscapedChar;
+                result.emit = 4;
                 return result;
             case 'f': result.c = '\f'; // formfeed
                 result.state = eRegexPatternEscapedChar;
@@ -3711,6 +3825,7 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brac
                     result.len = size + 4;
                 }
                 result.state = eRegexPatternUnicode;
+                result.emit = result.len;
                 return result;
 
             case 'x': // hexidecimal encoded byte
@@ -3718,6 +3833,7 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brac
                     result.state = eRegexPatternInvalidEscape;
                 } else {
                     result.len = 4;
+                    result.emit = 4;
                     result.state = eRegexPatternEscapedChar;
                 }
                 return result;
@@ -3772,7 +3888,7 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brac
             }
 
             result.c = **pattern;
-            if((size = _parseRangeQuantifier(*pattern + 1, NULL, NULL)) == 0) {
+            if((size = _parseRangeQuantifier(*pattern + 1, &min, &max)) == 0) {
                 result.state = eRegexPatternInvalidEscape;
                 return result;
             }
@@ -3785,13 +3901,190 @@ static parseChar_t _parseGetNextPatternChar(const char **pattern, int allow_brac
             }
             result.state = eRegexPatternMetaChar;
             result.len = size;
+            result.emit = 3 + _regexStrDigitCount(min) + _regexStrDigitCount(max); // {#,#}
+            return result;
+
+        case '\a': case '\b': case '\f': case '\n':
+        case '\r': case '\t': case '\v':
+            result.c = **pattern;
+            result.emit = 2;
+            result.state = eRegexPatternEscapedChar;
             return result;
 
         default:
             result.c = **pattern;
+            if((result.c < ' ') || (result.c > 127)) {
+                result.emit = 4;
+            }
             result.state = eRegexPatternChar;
             return result;
     }
+}
+
+typedef struct patternPos_s patternPos_t;
+struct patternPos_s {
+    int len;
+    int emit;
+};
+
+patternPos_t _patternGetPosDetail(const char *pattern) {
+    patternPos_t pp = {
+        .len = 0,
+        .emit = 0,
+    };
+
+    switch(*pattern) {
+        case '\0':
+            return pp;
+        case '\a': case '\b': case '\f': case '\n':
+        case '\r': case '\t': case '\v':
+            pp.len = 1;
+            pp.emit = 2;
+            return pp;
+        default:
+            pp.len = 1;
+            if((*pattern < ' ') || (*pattern > 127)) {
+                pp.emit = 4;
+            } else {
+                pp.emit = 1;
+            }
+            return pp;
+    }
+}
+
+void _patternCharEmit(FILE *fp, const char *pattern) {
+    switch(*pattern) {
+        case '\0':
+            return;
+        case '\a': fputc('\\', fp); fputc('a', fp); return;
+        case '\b': fputc('\\', fp); fputc('b', fp); return;
+        case '\f': fputc('\\', fp); fputc('f', fp); return;
+        case '\n': fputc('\\', fp); fputc('n', fp); return;
+        case '\r': fputc('\\', fp); fputc('r', fp); return;
+        case '\t': fputc('\\', fp); fputc('t', fp); return;
+        case '\v': fputc('\\', fp); fputc('v', fp); return;
+        default:
+            if((*pattern < ' ') || (*pattern > 127)) {
+                fprintf(fp, "\\x%2.2x", *pattern);
+            } else {
+                fputc(*pattern, fp);
+            }
+            return;
+    }
+}
+
+#define DEF_PATTERN_EMIT_TRAILING_OVERHEAD  10
+
+void _emitPositionHeader(FILE *fp, int offset, int start, int end) {
+    int k, v;
+    int digits = _regexStrDigitCount(end);
+    int divisor;
+
+    for(divisor = 1, k = 1; k < digits; k++, divisor *= 10);
+    fprintf(fp, "%d digits, %d divisor base\n", digits, divisor);
+    for(; digits; digits--, divisor /= 10) {
+        fprintf(fp, "%*.*s", offset, offset, "");
+        for(k = start; k <= end; k++) {
+            if(!(k % divisor)) {
+                v = k / divisor;
+                fputc(v + '0', fp);
+            } else {
+                fputc(' ', fp);
+            }
+        }
+        fputc('\n', fp);
+    }
+}
+
+void _patternPosEmit(FILE *fp, regex_pattern_t *pattern, const char *prefix, int line_len) {
+    int pos_len, pos_pad = 0, pre_len, pre_pad = 0;
+    int offset, k;
+    patternPos_t pp;
+    int size, trail;
+
+    if(pattern == NULL) {
+        return;
+    }
+
+    // TODO - remove marker line
+    fprintf(fp, "|%*.*s|\n", line_len - 2, line_len - 2, "");
+
+    pos_len = _regexStrDigitCount(pattern->pos) + 1; // length of pos arg, w/ leading ampersand (@)
+    if(prefix != NULL) {
+        pre_len = (int)strlen(prefix);
+        if(pre_len > pos_len) {
+            pos_pad = pre_len - pos_len;
+        }
+    }
+
+    // Recalculate the line length, excluding leading prefix, position annotation, and trailing char
+    line_len -= pos_len + pos_pad + 2;
+
+    fprintf(fp, "|%*.*s||%*.*s|\n", pos_len + pos_pad, pos_len + pos_pad, "", line_len - 2, line_len - 2, "");
+
+    // Find the offset to begin emitting the pattern at
+    for(offset = 0, size = 0, k = 0; k <= pattern->pos; k++) {
+        pp = _patternGetPosDetail(pattern->pattern + k);
+        if(pp.len == 0) {
+            break;
+        }
+        size += pp.emit;
+        if(size > line_len) {
+            pp = _patternGetPosDetail(pattern->pattern + offset);
+            if(pp.len == 0) {
+                break;
+            }
+            size -= pp.emit;
+            offset++;
+        }
+    }
+
+    // Accomodate the trailing pattern detail
+    for(k = pattern->pos + 1, trail = DEF_PATTERN_EMIT_TRAILING_OVERHEAD;
+        (k < pattern->len);
+        k++, trail--) {
+        pp = _patternGetPosDetail(pattern->pattern + k);
+        if(pp.len == 0) {
+            break;
+        }
+        size += pp.emit;
+        if(size > line_len) {
+            if(trail <= 0) {
+                break;
+            }
+            pp = _patternGetPosDetail(pattern->pattern + offset);
+            if(pp.len == 0) {
+                break;
+            }
+            size -= pp.emit;
+            offset++;
+        }
+    }
+    trail = k;
+
+    // Emit position header (experimental)
+    _emitPositionHeader(fp, pos_len + pos_pad + 2, offset, trail);
+
+    // Emit the prefix
+    if(prefix != NULL) {
+        fprintf(fp, "%*.*s%*.*s: ", pre_len, pre_len, prefix, pre_pad, pre_pad, "");
+    } else {
+        fprintf(fp, "%*.*s: ", pos_len, pos_len, "");
+    }
+
+    // Emit the pattern segment
+    for(k = offset; k <= trail; k++) {
+        _patternCharEmit(fp, pattern->pattern + k);
+    }
+    fputc('\n', fp);
+
+    // Emit the position annotation and marker
+    fprintf(fp, "@%d%*.*s: ", pattern->pos, pos_pad, pos_pad, "");
+    for(k = offset; k < pattern->pos; k++) {
+        fputc('-', fp);
+    }
+    fputc('^', fp);
+    fputc('\n', fp);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -3961,6 +4254,8 @@ static int _regexUtf8SubroutineCreate(regex_build_t *build, regex_utf8_range_t *
 
     memset(&segment, 0, sizeof(regex_utf8_segment_t));
 
+    // TODO
+#if 0
     for(walk = utf8range; walk != NULL; walk = walk->next) {
         keep_processing:
         switch(_regexUtf8RangeSegment(&next_codepoint, walk->start, walk->end, &segment)) {
@@ -3990,7 +4285,7 @@ static int _regexUtf8SubroutineCreate(regex_build_t *build, regex_utf8_range_t *
             return 0;
         }
     }
-
+#endif // 0
     // TODO - register the subroutine
     return 1;
 }
@@ -4008,6 +4303,8 @@ regex_utf8_range_t *_regexUtf8RangeCreate(regex_build_ctx_t *context, int start,
     range->next = NULL;
     range->start = start;
     range->end = end;
+    // TODO
+    return range;
 }
 
 void _regexUtf8RangeDestroy(regex_build_ctx_t *context, regex_utf8_range_t *range, int free_all) {
@@ -4273,6 +4570,8 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class
         }
     }
 
+    // TODO
+#if 0
     if(utf8_props) {
         switch(regexSubroutineRegister(build->context, DEF_UTF8_CLASS_SUB_PREFIX,
                                        sub_name, sub_alias, build->expr->tokens)) {
@@ -4291,7 +4590,7 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class
                 break;
         }
     }
-
+#endif // 0
     regexPatternDestroy(build);
 
     return 1;
@@ -4629,18 +4928,24 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                     default:
                         return eCompileUnsupportedMeta;
                 }
+                // TODO
+#if 0
                 if(!_parseCharClassAndCreateToken(build, class, NULL, 0, 0)) {
                     return build->status;
                 }
+#endif // 0
                 continue;
 
             case eRegexPatternUnicodeMetaClass:
                 if(_regexRegUnicodeCharClassGet(str, len) == NULL) {
                     return eCompileUnknownUnicodeClass;
                 }
+                // TODO
+#if 0
                 if(!_parseCharClassAndCreateToken(build, NULL, str, len, ((c.c == 'P') ? 1 : 0))) {
                     return build->status;
                 }
+#endif // 0
                 continue;
 
             case eRegexPatternChar:
@@ -4858,7 +5163,7 @@ eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token) {
         INTERNAL_ERROR("NULL expr or token passed to _regexExprTokenPush");
         return eReExprInternalError;
     }
-    if((token->tokenType < 0) || (token->tokenType >= eTokenUnknown)) {
+    if(token->tokenType >= eTokenUnknown) {
         INTERNAL_ERROR("Invalid token (out of range) type passed to _regexExprTokenPush");
         return eReExprInternalError;
     }
@@ -5637,7 +5942,28 @@ void regexDumpMatch(regex_match_t *match) {
 int main(int argc, char **argv) {
     regex_build_t *build;
     regex_match_t *match;
+    regex_pattern_t *pattern;
 
+    regex_build_ctx_t *ctx;
+    const char *test = "This is\\s+(?:a test, yo[0-9a-z]*), abide, when all else fails, yo yo yo. Super werd salad";
+    int k;
+
+    if((ctx = regexBuildContextCreate(0)) == NULL) {
+        return 1;
+    }
+    if((build = regexBuildCreate(ctx)) == NULL) {
+        return 1;
+    }
+    if(!regexPatternCreate(build, test, RE_STR_NULL_TERM)) {
+        return 1;
+    }
+    for(k = 0; k < build->pattern->len; k++) {
+        build->pattern->pos = k;
+        _patternPosEmit(stdout, build->pattern, "root prefix", 78);
+    }
+    return 0;
+
+#if 0
     if(argc > 1) {
         if((build = regexCompile(argv[1], 0)) == NULL) {
             return 1;
@@ -5674,6 +6000,7 @@ int main(int argc, char **argv) {
     }
 
     return 0;
+#endif // 0
 }
 
 #endif // MOJO_REGEX_TEST_MAIN
