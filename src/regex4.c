@@ -209,85 +209,6 @@ Regex VM Bytecode (v9 - in development)
         program counter. If the matched iterations are less than max value,
         the thread will continue at the next instruction.
 
-    =========================================================================
-
-    pattern - consumes text buffer, token by token
-    expr - everything is assembled within an expression
-        all operations on an expression, when completed, should leave a single
-        operand and no operators remaining within the expression
-
-    pattern
-    subexpression
-    class
-    predefined
-
-
-    UTF8 property classes
-        derived from Unicode database
-        entry retains:
-            verbose name
-            alias (property set abbreviation
-            class pattern
-
-        add entry
-        remove entry
-        lookup entry
-        call entry
-
-    subroutines
-        pre-declared, entry retains:
-            pattern
-                OR
-            token DFA
-            name
-        inline:
-            defined within a grouping [ie., (?P<...>...)]
-            defined as part of a character class (ie., UTF8 sequences)
-
-    only primary groups (ie., groups defined within the top level pattern) are
-    index referencable. Any subroutine or generated class subexpressions must
-    be referenced by name.
-
-    pre-registered
-        unicode class
-            name
-            alias
-            class pattern
-        metaclass
-            name
-            class pattern
-        subroutine
-            name
-            pattern
-
-        flags
-            dynamic - the entry was explicitly allocated, and may be freed upon removal
-            utf8 - the entry contains unicode instructions
-            class - the entry is a class pattern (not a general expression)
-
-typedef enum {
-    eReRegFlagDynamic = 1,
-    eReRegFlagUtf8 = 2,
-    eReRegFlagClass = 4,
-    eReRegFlagTypeSubroutine = 8,
-    eReRegFlagTypeMetaClass = 9,
-    eReRegFlagTypeUtf8Class = 10
-} eReRegisteredFlags_t;
-
-typedef struct regex_registered_entry_s regex_registered_entry_t;
-struct regex_registered_entry_s {
-    unsigned int flags;
-    char *name;
-    char *alias;
-    char *pattern;
-    regex_predefined_entry_t *next;
-};
-
-int regexPredefinedRegister(const char *pattern, const char *name, const char *alias, unsigned int flags);
-int regexPredefinedUnregister(const char *name, const char *alias);
-regex_registered_entry_t *regexPredefinedLookup(const char *name, const char *alias);
-
-
 Compilation response status codes
 
     ok
@@ -316,60 +237,30 @@ Compilation response status codes
     expr invalid close
     expr internal error
 
-read char
-read str
-write char
-write str
-
-buffer()
-
-
-regex_build_t *regexCompile(const char *pattern, unsigned int flags);
-regex_vm_t *regexVMGenerate(regex_build_t *build);
-
-regex_build_t *regexBuildPattern();
-
-tokens
-    char literal
-    char class
-    string literal
-    char any
-    save
-    utf8 class
-    call
-    byte
-    assertion
-    utf8 literal
-    range
-
-    match - explicitly added to close an expression
-    return - explicitly added to close a subroutine
-    split - intrinsically added during expression construction
-    jmp - intrinsically added during expression construction
-
-operators
-    zero or one
-    zero or many
-    one or many
-    range
-
-compound operators
-    concatenate
-    alternate
-
-wrap expression
-    expression
-    name
-    no capture
-    compound
-
-
 pattern parsing: during tokenizer
     string aggregation
     ID parsing
     range parsing
     subexpr name parsing
     subroutine name parsing
+
+
+direct pattern processing
+registered class generation
+    registry ->
+        pattern tokenizer ->
+            if char class -> class token DFA
+            if utf8 class->
+                build context ->
+                    token DFA
+registered subroutines
+    registry ->
+        pattern tokenizer ->
+            build context -> (for future call inclusion)
+                token DFA
+
+
+
 
 ///////////////////////////////////////////////////////////////////////////*/
 
@@ -1343,6 +1234,7 @@ struct parseChar_s {
 };
 
 typedef enum {
+    eRegexPatternNone,
     eRegexPatternIdOk,
     eRegexPatternIdMalformed,
     eRegexPatternIdMissing
@@ -3597,6 +3489,76 @@ static int _parseIsIdChar(char c) {
 
 }
 
+// Returns true if the character is a valid range character [0-9,]
+static int _parseIsRangeChar(char c) {
+    return (((c >= '0') && (c <= '9')) || (c == ','));
+}
+
+// Returns true if the string pointed to by str is a valid ID name
+static int _parseIsIdString(const char *str, int len) {
+    int k;
+
+    if(len == 0) {
+        return 0;
+    }
+
+    for(k = 0; k < len; k++) {
+        if(!_parseIsIdChar(str[k])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Returns true if str is a valid range quantifier value ({#,#})
+static int _parseIsRangeString(const char *str, int len) {
+    int k = 0;
+
+    for(k = 0; (k < len) && ((str[k] >= '0') && (str[k] <= '9')); k++);
+    if((k == 0) || ((k <= len) && (str[k] != ','))) {
+        return 0;
+    }
+    if(k == len) { // {n}
+        return 1;
+    }
+    for(k++; (k < len) && ((str[k] >= '0') && (str[k] <= '9')); k++);
+    if(k == len) { // {n,} OR {n,m}
+        return 1;
+    }
+    return 0;
+}
+
+// Validates that pattern points to a valid range quantifier (ie., "3,6"). Note
+// that pattern is expected to exclude the range delimiters (ie. { and }).
+// Returns true if the range was valid and decoded, false otherwise.
+static int _parseRangeQuantifierValue(const char *pattern, int len, int *min, int *max) {
+    int k, low, high = -1;
+
+    for(k = 0, low = 0; (k < len) && ((pattern[k] >= '0') && (pattern[k] <= '9')); k++) {
+        low *= 10;
+        low += pattern[k] - '0';
+    }
+    if((k == 0) && (k <= len) && (pattern[k] != ',')) {
+        return 0;
+    }
+    if(k < len) {
+        for(k++, high = 0; (k < len) && ((pattern[k] >= '0') && (pattern[k] <= '9')); k++) {
+            high *= 10;
+            high += pattern[k] - '0';
+        }
+        if(k != len) {
+            return 0;
+        }
+    }
+    if(min != NULL) {
+        *min = low;
+    }
+    if(max != NULL) {
+        *max = high;
+    }
+    return 1;
+}
+
 // Parser the numeric value of the string provided, if in hexidecimal form.
 // Returns true if the entirety of the passed string is consumed, or false if
 // some (non hexidecimal) characters remain.
@@ -3743,6 +3705,67 @@ static char _regexPatternChar(regex_pattern_t *pattern, int offset) {
 static const char *_regexPatternStr(regex_pattern_t *pattern, int offset) {
     return pattern->pattern + pattern->pos + offset;
 }
+
+// Attempts to parse an identifier delimited by start and end. If prefix_? is
+// not 0, attempts to match prefix_? characters first. On success, sets
+// id to the position of the start of the identifier, and len to the total length
+// of the identifier, and size to the length of the matched pattern segment.
+// Note that len does NOT include the delimiters. Only characters within the
+// char class [A-Za-z0-9_-] are valid for the identifier. Returns:
+//     eRegexPatternNone - the prefix characters were NOT found
+//     eRegexPatternIdOk - an id was found
+//     eRegexPatternIdMissing - the start delimiter was NOT found
+//     eRegexPatternIdMalformed - the id contained invalid characters (not in
+//                      [A-Za-z0-9_-]), the end delimiter was missing, or the
+//                      delimiters were empty
+// charValidationCallback is used to validate each individual character (without
+// state). phraseValidationCallback is used to confirm that the entirety of the
+// id is valid for the given context.
+static eRegexPatternId_t _parsePatternId(const char *pattern, char prefix_a, char prefix_b,
+                           int *size, int start, int end, const char **id, int *len,
+                           int (*charValidationCallback)(char c),
+                           int (*phraseValidationCallback)(const char *str, int len)) {
+    int k, offset = 0;
+
+    if(pattern == NULL) {
+        return eRegexPatternNone;
+    }
+    if(prefix_a != 0) {
+        if(*pattern != prefix_a) {
+            return eRegexPatternNone;
+        }
+        offset++;
+    }
+    if(prefix_b != 0) {
+        if(*(pattern + offset) != prefix_b) {
+            return eRegexPatternNone;
+        }
+        offset++;
+    }
+    if(*(pattern + offset) != start) {
+        return eRegexPatternIdMissing;
+    }
+    for(k = 0, offset++; charValidationCallback(pattern[k + offset]) && (pattern[k + offset] != end); k++);
+    if((k == 0) || (pattern[k + offset] != end)) {
+        return eRegexPatternIdMalformed;
+    }
+    if(phraseValidationCallback != NULL) {
+        if(!phraseValidationCallback(pattern + offset, k)) {
+            return eRegexPatternIdMalformed;
+        }
+    }
+    if(id != NULL) {
+        *id = pattern + offset;
+    }
+    if(len != NULL) {
+        *len = k;
+    }
+    if(size != NULL) {
+        *size = k + offset + 1;
+    }
+    return eRegexPatternIdOk;
+}
+
 
 // Parses the next semantic character from pattern, retaining the character
 // read and pattern parser state. If 'allow_brace' is true, then will treat an
