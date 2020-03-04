@@ -260,8 +260,6 @@ registered subroutines
                 token DFA
 
 
-
-
 ///////////////////////////////////////////////////////////////////////////*/
 
 // Build the main test driver stub
@@ -294,13 +292,18 @@ registered subroutines
 #include <string.h>
 #include <inttypes.h>
 
+// If defined, generates additional diagnostic details to stderr in the event
+// of internal errors. Useful for tracing down unexpected state conditions.
 #define MOJO_REGEX_DEBUG_INTERNAL_ERRORS
 
 #ifdef MOJO_REGEX_DEBUG_INTERNAL_ERRORS
-const char *regexTokenNameStr(int token);
+// Convenience macro for emitting additional context information in the event
+// of an internal error. Note that "fmt" MUST be an actual C string, NOT a
+// variable, due to the implicit macro string concatenation.
 #   define INTERNAL_ERROR(fmt,...)  fprintf(stderr, "ERROR [" fmt "] in %s @ %d\n", ## __VA_ARGS__, __FUNCTION__, __LINE__)
+
+//const char *regexTokenNameStr(int token);
 #   define TOKEN_CREATE(t)          fprintf(stdout, "Created token: [%s]\n", regexTokenNameStr(t))
-//#   define INTERNAL_ERROR(msg)  fprintf(stderr, "ERROR [%s] in %s @ %d\n", msg, __FUNCTION__, __LINE__)
 #else
 #   define INTERNAL_ERROR(msg)
 #   define TOKEN_CREATE(t)
@@ -335,6 +338,8 @@ const char *regexTokenNameStr(int token);
 #define REGEX_VM_MACHINE_VERSION    9
 
 #ifdef MOJO_REGEX_VM_DEBUG
+// Associates nuemonic details relating to subroutines (their explicitly defined
+// name (ie., R<...>), the property class they were derived from (ie., \p{M})).
 typedef struct regex_vm_sub_names_s regex_vm_sub_names_t;
 struct regex_vm_sub_names_s {
     int id;
@@ -426,8 +431,6 @@ typedef enum {
 
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
-#define DEF_VM_SIZE_INC 1024
-
 typedef enum {
     eCompileOk,
     eCompileCharClassRangeIncomplete,
@@ -448,13 +451,6 @@ typedef enum {
     eCompileMissingPattern,
     eCompileInternalError
 } eRegexCompileStatus_t;
-
-typedef enum {
-    ePhaseTokenize,
-    ePhaseNFAGraph,
-    ePhaseVMGen,
-    ePhaseComplete
-} eRegexCompilePhase_t;
 
 #ifndef DEF_REGEX_PREREGISTER_ENTRY
 #define DEF_REGEX_PREREGISTER_ENTRY
@@ -480,6 +476,12 @@ struct regex_registered_entry_s {
 int regexRegisterEntryAdd(eReRegisterType_t type, int is_static, const char *name, const char *alias, const char *pattern);
 int regexRegisterEntryRemove(eReRegisterType_t type, const char *name, const char *alias);
 regex_registered_entry_t *regexRegisterEntryLookup(eReRegisterType_t type, const char *name, int name_len);
+
+// Callback for registry enumeration. Called with a single registered entry.
+// Should return true to continue, false to end enumeration.
+typedef int (*regexRegisterCb_t)(const regex_registered_entry_t *entry, void *context);
+
+void regexRegisterEnum(regexRegisterCb_t callback, void *context);
 
 #ifndef DEF_REGEX_UNICODE_CLASS
 #define DEF_REGEX_UNICODE_CLASS
@@ -1263,16 +1265,6 @@ int regexCreateTokenJmp(regex_build_ctx_t *context, regex_token_t **token);
 
 // Pattern parsing handling functions ///////////////////////////////////////
 
-
-typedef struct parseChar_s parseChar_t;
-struct parseChar_s {
-    eRegexPatternCharState_t state; // identity of the parsed value
-    const char *ptr;    // pointer to the position in the pattern that the char was parsed from
-    int len;    // length of the parse value (for position advance)
-    int emit;   // length of the parse value if re-emitted (to normalized form)
-    int c;  // parsed character value
-};
-
 typedef enum {
     eRegexPatternNone,
     eRegexPatternIdOk,
@@ -1347,8 +1339,7 @@ void _regexUtf8RangeDestroy(regex_build_ctx_t *context, regex_utf8_range_t *rang
 int _parseCreateUtf8Range(regex_build_t *build, regex_utf8_range_t **sequence, int start, int end);
 static int _parseCharClassBitmapSet(regex_build_t *build, regex_utf8_range_t **range, unsigned int *bitmap, int c);
 static int _parseCharClassBitmapRangeSet(regex_build_t *build, regex_utf8_range_t **range, unsigned int *bitmap, int a, int b);
-static int _parseCharClassAndConcatToken(regex_build_t *build, const char *class_pattern,
-                                         const char *name, int name_len, int invert);
+static int _parseCharClassAndConcatToken(regex_build_t *build);
 static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class_pattern,
                                          int in_line, int invert,
                                          const char *name, int name_len, int subroutine);
@@ -1378,6 +1369,7 @@ void _regexExprOperatorPush(regex_expr_t *expr, regex_token_t *token);
 regex_token_t *_regexExprOperatorPop(regex_expr_t *expr);
 eReExprStatus_t _regexExprOperatorApply(regex_expr_t *expr);
 eReExprStatus_t _regexExprFinalize(regex_expr_t *expr);
+int _regexExprBuildFinalize(regex_build_t *build);
 eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token);
 int regexExprDestroy(regex_build_t *build);
 
@@ -1642,7 +1634,13 @@ int _regexStrDigitCount(int number) {
 int _regex_preregistered_defaults_init = 0;
 regex_registered_entry_t *_regex_preregistered_table = NULL;
 
+// Trims the whitespace from the beginning and end of string, returning NULL
+// if the string is empty, NULL, and simply whitespace. Note: the first
+// whitespace following non-whitespace is treated as the end of the string; any
+// content following is truncated. (ie., "  fools gold  " becomes "fools")
 char *_regexStrTrimToNull(char **str) {
+    char *ptr;
+
     if(*str == NULL) {
         return *str;
     }
@@ -1652,9 +1650,18 @@ char *_regexStrTrimToNull(char **str) {
     if((**str) == '\0') {
         *str = NULL;
     }
+    for(ptr = *str; ((!isspace(*ptr)) && (*ptr != '\0')); ptr++);
+    *ptr = '\0';
+
     return *str;
 }
 
+// Adds a new entry to the register. The type indicates the pattern's intended
+// usage:
+//     eReRegTypeUtf8Class - a UTF8 character class
+//     eReRegTypeCharClass - an ASCII character class
+//     eReRegTypeSubroutine - a regex pattern representing a subroutine
+// Note that the primary operational difference between
 int regexRegisterEntryAdd(eReRegisterType_t type, int is_static, const char *name, const char *alias, const char *pattern) {
     regex_registered_entry_t *entry;
 
@@ -4286,14 +4293,111 @@ static char *_regexPatternStrGet(regex_pattern_t *pattern, int len, int size) {
 //               |<------------ 3 byte group ---------->|
 // |<------------------ 4 byte group ------------------>|
 
-static int _regexUtf8SubroutineCreate(regex_build_t *build, regex_utf8_range_t *utf8range,
-                                      const char *name, int name_len, int invert) {
+static int _regexUtf8CalculateSegmentBoundary(regex_utf8_segment_t *segment) {
+    switch(segment->bytes) {
+        case 2:
+            return (int)((((unsigned)(segment->midlow) & UTF8_TWO_BYTE_BITMASK) << 6u) | UTF8_LOW_BYTE_BITMASK);
+        case 3:
+            return (int)((((unsigned)(segment->midhigh) & UTF8_THREE_BYTE_BITMASK) << 12u) |
+                         (((unsigned)(segment->midlow) & UTF8_LOW_BYTE_BITMASK) << 6u) |
+                         UTF8_LOW_BYTE_BITMASK);
+        case 4:
+            return (int)((((unsigned)(segment->high) & UTF8_FOUR_BYTE_BITMASK) << 18u) |
+                         (((unsigned)(segment->midhigh) & UTF8_LOW_BYTE_BITMASK) << 12u) |
+                         (((unsigned)(segment->midlow) & UTF8_LOW_BYTE_BITMASK) << 6u) |
+                         UTF8_LOW_BYTE_BITMASK);
+        default:
+            INTERNAL_ERROR("utf8 segment contains single byte encoding");
+            return -1;
+    }
+}
+
+static int _regexUtf8SegmentInBounds(regex_utf8_segment_t *segment, int start, int end) {
+    int seg_start, seg_end;
+
+    seg_start = (int)((unsigned)_regexUtf8CalculateSegmentBoundary(segment) & 0xFFFFFFC0u);
+    seg_end = _regexUtf8CalculateSegmentBoundary(segment);
+    return ((seg_start <= end) && (seg_end >= start));
+}
+
+static int _regexUtf8SegmentInit(regex_utf8_segment_t *segment, int codepoint) {
+    segment->bytes = _parseUtf8EncodingByteLen(codepoint);
+    switch(segment->bytes) {
+        case 2:
+            segment->midlow = (int)((((unsigned)codepoint) >> 6u) & UTF8_TWO_BYTE_BITMASK);
+            break;
+        case 3:
+            segment->midhigh = (int)((((unsigned)codepoint) >> 12u) & UTF8_THREE_BYTE_BITMASK);
+            segment->midlow = (int)((((unsigned)codepoint) >> 6u) & UTF8_LOW_BYTE_BITMASK);
+            break;
+        case 4:
+            segment->high = (int)((((unsigned)codepoint) >> 18u) & UTF8_FOUR_BYTE_BITMASK);
+            segment->midhigh = (int)((((unsigned)codepoint) >> 12u) & UTF8_LOW_BYTE_BITMASK);
+            segment->midlow = (int)((((unsigned)codepoint) >> 6u) & UTF8_LOW_BYTE_BITMASK);
+            break;
+        default:
+            INTERNAL_ERROR("utf8 codepoint is not multibyte");
+            return 0;
+    }
+    return 1;
+}
+
+static int _regexUtf8SegmentGenerate(regex_build_t *build, regex_utf8_segment_t *segment) {
+    // TODO - create the actual DFA chunk for the UTF8 char class
+    return 0;
+}
+
+// Returns a segment of a utf8 codepoint range for conversion into a char class.
+static eReUtf8RangeSegment_t _regexUtf8RangeSegment(int *next_codepoint, int start, int end,
+                                                    regex_utf8_segment_t *segment) {
+    int seg_end;
+    int c, bits;
+
+    if(*next_codepoint > start) {
+        if(*next_codepoint > end) {
+            return eReUtf8SegKeepNextRange;
+        }
+        start = *next_codepoint;
+    }
+
+    if(segment->bytes == 0) {
+        _regexUtf8SegmentInit(segment, start);
+    } else {
+        if(!_regexUtf8SegmentInBounds(segment, start, end)) {
+            return eReUtf8SegDoneRangeRemaining;
+        }
+    }
+
+    seg_end = _regexUtf8CalculateSegmentBoundary(segment);
+    for(c = start; c <= seg_end; c++) {
+        bits = (int)((unsigned)c & UTF8_LOW_BYTE_BITMASK);
+        segment->bitmap[bits / 32] |= (1u << (unsigned)(bits % 32));
+    }
+    *next_codepoint = seg_end + 1;
+
+    if(seg_end < end) {
+        return eReUtf8SegDoneRangeRemaining;
+    } else if(seg_end == end) {
+        return eReUtf8SegDoneNextRange;
+    } else {
+        return eReUtf8SegKeepNextRange;
+    }
+}
+
+static regex_token_t *_regexUtf8SubroutineCreate(regex_build_t *build,
+                                                 regex_utf8_range_t *utf8range,
+                                                 int invert) {
     unsigned int bitmap[32];
     int use_char_class = 0;
     int next_codepoint = 128;
     regex_utf8_segment_t segment;
     regex_utf8_range_t *walk;
     int k;
+    regex_token_t *token;
+
+    if(!regexExprCreate(build)) {
+        return NULL;
+    }
 
     memset(bitmap, 0, 32);
 
@@ -4309,20 +4413,18 @@ static int _regexUtf8SubroutineCreate(regex_build_t *build, regex_utf8_range_t *
     }
     if(use_char_class) {
         // low byte char class is needed
-        // TODO
+        // TODO - create charclass and include in expression
     }
 
     memset(&segment, 0, sizeof(regex_utf8_segment_t));
 
-    // TODO
-#if 0
     for(walk = utf8range; walk != NULL; walk = walk->next) {
         keep_processing:
         switch(_regexUtf8RangeSegment(&next_codepoint, walk->start, walk->end, &segment)) {
             case eReUtf8SegDoneRangeRemaining:
                 if(!_regexUtf8SegmentGenerate(build, &segment)) {
                     build->status = eCompileOutOfMem;
-                    return 0;
+                    return NULL;
                 }
                 memset(&segment, 0, sizeof(regex_utf8_segment_t));
                 goto keep_processing;
@@ -4330,7 +4432,7 @@ static int _regexUtf8SubroutineCreate(regex_build_t *build, regex_utf8_range_t *
             case eReUtf8SegDoneNextRange:
                 if(!_regexUtf8SegmentGenerate(build, &segment)) {
                     build->status = eCompileOutOfMem;
-                    return 0;
+                    return NULL;
                 }
                 memset(&segment, 0, sizeof(regex_utf8_segment_t));
                 break;
@@ -4342,12 +4444,18 @@ static int _regexUtf8SubroutineCreate(regex_build_t *build, regex_utf8_range_t *
     if(segment.bytes) {
         if(!_regexUtf8SegmentGenerate(build, &segment)) {
             build->status = eCompileOutOfMem;
-            return 0;
+            return NULL;
         }
     }
-#endif // 0
-    // TODO - register the subroutine
-    return 1;
+
+    if(!_regexExprBuildFinalize(build)) {
+        return NULL;
+    }
+    token = _regexExprOperandPop(build->expr);
+    if(!regexExprDestroy(build)) {
+        return NULL;
+    }
+    return token;
 }
 
 regex_utf8_range_t *_regexUtf8RangeCreate(regex_build_ctx_t *context, int start, int end) {
@@ -4465,12 +4573,13 @@ static int _parseCharClassBitmapRangeSet(regex_build_t *build, regex_utf8_range_
     return 1;
 }
 
+#if 0
 // Parse a class pattern, and generate a eTokenCharClass or eTokenUtf8Class
 // sequence. If name is defined, then name will be associated with the
 // class_pattern in diagnostic output.
 static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class_pattern,
                                          int in_line, int invert,
-                                         const char *name, int name_len, int subroutine) {
+                                         const char *name, int name_len, __unused int subroutine) {
     unsigned int bitmap[8], *ptr;
     regex_utf8_range_t *utf8range = NULL;
     int range = 0;
@@ -4654,7 +4763,9 @@ static int _parseCharClassAndCreateToken(regex_build_t *build, const char *class
 
     return 1;
 }
+#endif // 0
 
+#if 0
 // Parse a class pattern, and generate a eTokenCharClass or eTokenUtf8Class
 // sequence. By default, uses the pattern in tokenizer. If class_pattern is
 // defined, it will use it as the pattern instead of the tokenizer pattern. If
@@ -4713,6 +4824,7 @@ static int _parseCharClassAndConcatToken(regex_build_t *build, const char *class
 
     return 1;
 }
+#endif // 0
 
 // Parses the class pattern in build->pattern into a char/utf8 class, and returns
 // the top DFA token (single token for eTokenCharClass, micro DFA for eTokenUtf8Class)
@@ -5391,6 +5503,37 @@ eReExprStatus_t _regexExprFinalize(regex_expr_t *expr) {
     return eReExprSuccess;
 }
 
+int _regexExprBuildFinalize(regex_build_t *build) {
+    switch(_regexExprFinalize(build->expr)) {
+        case eReExprSuccess:
+            return 1;
+        case eReExprOutOfMemory:
+            build->status = eCompileOutOfMem;
+            return 0;
+        case eReExprEmpty:
+            build->status = eCompileMissingPattern;
+            return 0;
+        case eReExprUnclosed:
+            build->status = eCompileMissingSubexprEnd;
+            return 0;
+        case eReExprUnusedOperators:
+            build->status = eCompileMissingOperand;
+            return 0;
+        case eReExprUnusedOperands:
+            INTERNAL_ERROR("unused operands in group subexpression");
+            build->status = eCompileInternalError;
+            return 0;
+        case eReExprMissingOperand:
+            build->status = eCompileMissingOperand;
+            return 0;
+        default:
+        case eReExprInternalError:
+            build->status = eCompileInternalError;
+            INTERNAL_ERROR("unknown error during expr finalize");
+            return 0;
+    }
+}
+
 eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token) {
     eReExprStatus_t status;
 
@@ -6030,16 +6173,6 @@ regex_match_t *regexMatch(regex_vm_t *vm, const char *text, int len, int anchore
 #endif // MOJO_REGEX_COMMON_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
-const char *regexCompilePhaseStrGet(eRegexCompilePhase_t phase) {
-    switch(phase) {
-        case ePhaseTokenize: return "tokenizer";
-        case ePhaseNFAGraph: return "NFA graph generation";
-        case ePhaseVMGen: return "VM generation";
-        case ePhaseComplete: return "compilation completed";
-        default: return "unknown phase";
-    }
-}
-
 const char *regexCompileStatusStrGet(eRegexCompileStatus_t status) {
     switch(status) {
         case eCompileOk: return "compiled successfully";
@@ -6080,8 +6213,6 @@ static void _regexEmitPattern(FILE *fp, regex_pattern_t *pattern) {
 }
 
 void regexCompileResultEmit(FILE *fp, regex_build_t *build) {
-    regex_pattern_t *pattern, *root;
-
     fprintf(fp, "Result: %s\n",
             ((build == NULL) ? "Out of memory" : regexCompileStatusStrGet(build->status)));
     if((build != NULL) && (build->status != eCompileOk) && (build->pattern != NULL)) {
