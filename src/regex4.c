@@ -304,6 +304,8 @@ struct regex_vm_sub_names_s {
 };
 #endif // MOJO_REGEX_VM_DEBUG
 
+#define DEF_VM_SIZE_INC 1024
+
 typedef struct regex_vm_s regex_vm_t;
 struct regex_vm_s {
     int vm_version;                 // VM machine version
@@ -567,13 +569,22 @@ int _parseUtf8DecodeSequence(const char *str);
 
 #define RE_VM_OPCODE_MASK   0xFu
 #define RE_VM_OP_A_MASK     0xFFFC0000u
+#define RE_VM_OP_A_INV_MASK 0x3FFFFu
 #define RE_VM_OP_A_OFFSET   18u
 #define RE_VM_OP_B_MASK     0x3FFF0u
+#define RE_VM_OP_B_INV_MASK 0xFFFC000Fu
 #define RE_VM_OP_B_OFFSET   4u
 #define RE_VM_OP_A_FROM_INSTR(instr)    ((((unsigned)instr) & RE_VM_OP_A_MASK) >> RE_VM_OP_A_OFFSET)
 #define RE_VM_OP_B_FROM_INSTR(instr)    ((((unsigned)instr) & RE_VM_OP_B_MASK) >> RE_VM_OP_B_OFFSET)
+#define RE_VM_OP_A_TO_INSTR(op)         ((((unsigned)op) << RE_VM_OP_A_OFFSET) & RE_VM_OP_A_MASK)
+#define RE_VM_OP_B_TO_INSTR(op)         ((((unsigned)op) << RE_VM_OP_B_OFFSET) & RE_VM_OP_B_MASK)
+#define RE_VM_OP_A_INSTR_CLEAR(instr)   (instr &= RE_VM_OP_A_INV_MASK)
+#define RE_VM_OP_B_INSTR_CLEAR(instr)   (instr &= RE_VM_OP_B_INV_MASK)
 
 // VM instruction operand/flag/value setter/getter macros ///////////////////
+
+// All tokens
+#define RE_VM_ENC_TOKEN_TO_INSTR(token)     (((unsigned)token) & 0xFu)
 
 // eTokenCharLiteral
 #define RE_VM_ENC_CHAR_TO_INSTR(c)          ((((unsigned)c) & 0xFFu) << 4u)
@@ -738,6 +749,20 @@ struct regex_utf8_range_s {
     regex_utf8_range_t *next;
 };
 
+typedef struct regex_vm_pc_patch_s regex_vm_pc_patch_t;
+struct regex_vm_pc_patch_s {
+    regex_token_t *token;
+    int pc;
+    int operand;
+    regex_vm_pc_patch_t *next;
+};
+
+typedef struct regex_vm_gen_path_s regex_vm_gen_path_t;
+struct regex_vm_gen_path_s {
+    regex_token_t *token;
+    regex_vm_gen_path_t *next;
+};
+
 struct regex_build_ctx_s {
     unsigned int flags;
 
@@ -752,7 +777,15 @@ struct regex_build_ctx_s {
 
     int group_count;
 
+    regex_vm_pc_patch_t *patch_pool;
+    regex_vm_gen_path_t *gen_path_pool;
+
+    regex_vm_pc_patch_t *patch_list;
+    regex_vm_gen_path_t *gen_path_list;
+    regex_vm_gen_path_t *sub_path_list;
+
     regex_vm_t *vm;
+    int pc;
 };
 
 typedef struct regex_build_s regex_build_t;
@@ -2038,6 +2071,28 @@ static void _regexCharLiteralEmit(FILE *fp, int c) {
     }
 }
 
+static void _regexEscapedCharEmit(FILE *fp, int c) {
+    switch(c) {
+        case '-': fputs("\\-", fp); break;
+        case '\0': fputs("\\0", fp); break;
+        case '\a': fputs("\\a", fp); break;
+        case '\b': fputs("\\b", fp); break;
+        case '\x1b': fputs("\\e", fp); break;
+        case '\f': fputs("\\f", fp); break;
+        case '\n': fputs("\\n", fp); break;
+        case '\r': fputs("\\r", fp); break;
+        case '\t': fputs("\\t", fp); break;
+        case '\v': fputs("\\v", fp); break;
+        default:
+            if((c >= ' ') && (c <= 127)) {
+                fputc(c, fp);
+            } else {
+                fprintf(fp, "\\x%2.2X", c);
+            }
+            break;
+    }
+}
+
 static void _regexCharClassBitmapEmit(FILE *fp, const unsigned int *bitmap) {
     unsigned int k;
     unsigned int run;
@@ -2046,9 +2101,10 @@ static void _regexCharClassBitmapEmit(FILE *fp, const unsigned int *bitmap) {
         if(bitmap[k / 32] & (1u << (k % 32))) {
             for(run = k + 1; run < 256 && (bitmap[run / 32] & (1u << (run % 32))); run++);
             run--;
-            fprintf(fp, "%c", ((k < 32) || (k > 127)) ? '.' : k);
+            _regexEscapedCharEmit(fp, (int)k);
             if(run - k > 3) {
-                fprintf(fp, "-%c", ((run < 32) || (run > 127)) ? '.' : run);
+                fputc('-', fp);
+                _regexEscapedCharEmit(fp, (int)run);
                 k = run;
             }
         }
@@ -3177,6 +3233,9 @@ int _regexTokenExprApply(regex_build_t *build, regex_token_t *token) {
     if(_regexExprTokenPush(build->expr, token) != eReExprSuccess) {
         return 0;
     }
+    printf("-----------------------------------------------------------\n");
+    regexTokenStrDFAEmit(stdout, build->context, build->expr->tokens);
+    printf("-----------------------------------------------------------\n");
     return 1;
 }
 
@@ -5819,7 +5878,9 @@ regex_build_t *regexCompile(const char *pattern, unsigned int flags) {
     if(regexVMCreate(build) == NULL) {
         return build;
     }
-    regexVMGenerate(build);
+    if(!regexVMGenerate(build)) {
+        return build;
+    }
 
     return build;
 }
@@ -5847,9 +5908,343 @@ regex_vm_t *regexVMCreate(regex_build_t *build) {
     return build->context->vm;
 }
 
-int regexVMGenerate(regex_build_t *build) {
-    // TODO
+// VM Patch list management functions ///////////////////////////////////////
+
+int regexAddPCPatchEntry(regex_build_t *build, regex_token_t *token, int operand) {
+    regex_vm_pc_patch_t *entry;
+
+    if(build->context->patch_pool != NULL) {
+        entry = build->context->patch_pool;
+        build->context->patch_pool = entry->next;
+        memset(entry, 0, sizeof(regex_vm_pc_patch_t));
+    } else if((entry = _regexAlloc(sizeof(regex_vm_pc_patch_t), _regexMemContext)) == NULL) {
+        return 0;
+    }
+    entry->pc = build->context->pc;
+    entry->operand = operand;
+    entry->token = token;
+    entry->next = build->context->patch_list;
+    build->context->patch_list = entry;
+    return 1;
+}
+
+void regexVMPatchListFree(regex_build_t *build, regex_vm_pc_patch_t *patch_list) {
+    regex_vm_pc_patch_t *next;
+
+    for(; patch_list != NULL; patch_list = next) {
+        next = patch_list->next;
+        if(build != NULL) {
+            patch_list->next = build->context->patch_pool;
+            build->context->patch_pool = patch_list;
+        } else {
+            _regexDealloc(patch_list, _regexMemContext);
+        }
+    }
+}
+
+void regexVMPatchJumps(regex_build_t *build, regex_vm_pc_patch_t **patch_list) {
+    regex_vm_pc_patch_t *patch, *next;
+    unsigned int instr;
+
+    for(patch = *patch_list; patch != NULL; patch = next) {
+        next = patch->next;
+        instr = build->context->vm->program[patch->pc];
+        if(patch->operand == 1) {
+            RE_VM_OP_A_INSTR_CLEAR(instr);
+            instr |= RE_VM_OP_A_TO_INSTR(patch->token->pc);
+        } else {
+            RE_VM_OP_B_INSTR_CLEAR(instr);
+            instr |= RE_VM_OP_B_TO_INSTR(patch->token->pc);
+        }
+        build->context->vm->program[patch->pc] = instr;
+        patch->next = build->context->patch_pool;
+        build->context->patch_pool = patch;
+    }
+    *patch_list = NULL;
+}
+
+int regexVMGenPathSubroutineExists(regex_build_t *build, regex_token_t *token) {
+    regex_vm_gen_path_t *entry;
+
+    for(entry = build->context->sub_path_list; entry != NULL; entry = entry->next) {
+        if(entry->token == token) {
+            return 1;
+        }
+    }
     return 0;
+}
+
+int regexVMGenPathCreate(regex_build_t *build, regex_token_t *token, int subroutine) {
+    regex_vm_gen_path_t *entry;
+
+    if(build->context->gen_path_pool != NULL) {
+        entry = build->context->gen_path_pool;
+        build->context->gen_path_pool = entry->next;
+    } else {
+        if((entry = _regexAlloc(sizeof(regex_vm_gen_path_t), _regexMemContext)) == NULL) {
+            return 0;
+        }
+    }
+    entry->token = token;
+    if(subroutine) {
+        entry->next = build->context->sub_path_list;
+        build->context->sub_path_list = entry;
+    } else {
+        entry->next = build->context->gen_path_list;
+        build->context->gen_path_list = entry;
+    }
+    return 1;
+}
+
+regex_token_t *regexVMGenPathGetNext(regex_build_t *build, int subroutine) {
+    regex_vm_gen_path_t *entry;
+    regex_vm_gen_path_t **base = (subroutine ? &(build->context->sub_path_list) : &(build->context->gen_path_list));
+
+    if((entry = *base) == NULL) {
+        return NULL;
+    }
+    *base = entry->next;
+    entry->next = build->context->gen_path_pool;
+    build->context->gen_path_pool = entry;
+    return entry->token;
+}
+
+void regexVMGenPathFree(regex_build_t *build, int pool) {
+    regex_vm_gen_path_t *walk, *next;
+
+    for(walk = build->context->gen_path_list; walk != NULL; walk = next) {
+        next = walk->next;
+        if(pool) {
+            walk->next = build->context->gen_path_pool;
+            build->context->gen_path_pool = walk;
+        } else {
+            _regexDealloc(walk, _regexMemContext);
+        }
+    }
+    build->context->gen_path_list = NULL;
+
+    for(walk = build->context->sub_path_list; walk != NULL; walk = next) {
+        next = walk->next;
+        if(pool) {
+            walk->next = build->context->gen_path_pool;
+            build->context->gen_path_pool = walk;
+        } else {
+            _regexDealloc(walk, _regexMemContext);
+        }
+    }
+    build->context->sub_path_list = NULL;
+
+    if(!pool) {
+        for(walk = build->context->gen_path_pool; walk != NULL; walk = next) {
+            next = walk->next;
+            free(walk);
+        }
+        build->context->gen_path_pool = NULL;
+    }
+}
+
+// VM bytecode generator ////////////////////////////////////////////////////
+
+#define REGEX_VM_INSTR_ENCODE(vm,pc,instr,opa,opb) (vm)->program[(pc)] = (instr & 0xFU) | ((opa & 0x3FFFU) << 4U) | ((opb & 0x3FFFU) << 18U)
+
+int regexVMProgramAdd(regex_build_t *build, unsigned int instr) {
+    regex_vm_t *vm = build->context->vm;
+
+    if((vm->size - build->context->pc) <= 0) {
+        if((vm->program = _regexRealloc(vm->program,
+                                        (vm->size * sizeof(int)),
+                                        (vm->size + DEF_VM_SIZE_INC) * sizeof(int),
+                                        _regexMemContext)) == NULL) {
+            return 0;
+        }
+        vm->size += DEF_VM_SIZE_INC;
+    }
+
+    build->context->vm->program[build->context->pc] = instr;
+    build->context->pc++;
+
+    return 1;
+}
+
+int regexVMProgramGenerateInstr(regex_build_t *build, regex_token_t *token, regex_token_t **next) {
+    unsigned int instr;
+    int index;
+
+    if(token == NULL) {
+        *next = NULL;
+        return 1;
+    }
+    if(token->pc != -1) {
+        *next = NULL;
+        return 1;
+    }
+    token->pc = build->context->pc;
+
+    instr = RE_VM_ENC_TOKEN_TO_INSTR(token->tokenType);
+
+    switch(token->tokenType) {
+        case eTokenCharLiteral:
+            instr |= RE_VM_ENC_CHAR_TO_INSTR(token->c);
+            if(token->flags & RE_TOK_FLAG_INVERT) {
+                instr |= RE_VM_FLAG_CHAR_INVERT_TO_INSTR();
+            }
+            instr |= RE_VM_OP_B_TO_INSTR(token->jump);
+            break;
+        case eTokenStringLiteral:
+            if((index = regexVMStringTableEntryAdd(build, token->str, token->len)) == -1) {
+                return 0;
+            }
+            token->str = NULL;
+            instr |= RE_VM_OP_A_TO_INSTR(index);
+            break;
+        case eTokenCharClass:
+            if((index = regexVMCharClassEntryAdd(build, token->bitmap)) == -1) {
+                return 0;
+            }
+            token->bitmap = NULL;
+            instr |= RE_VM_OP_A_TO_INSTR(index);
+            break;
+        case eTokenUtf8Class:
+            if((index = regexVMUtf8ClassEntryAdd(build, token->bitmap)) == -1) {
+                return 0;
+            }
+            token->bitmap = NULL;
+            instr |= RE_VM_ENC_UTF8_INDEX_TO_INSTR(index);
+            instr |= RE_VM_FLAG_UTF8_CLASS_ENC_TO_INSTR(token->encoding);
+            if(token->flags & RE_TOK_FLAG_INVERT) {
+                instr |= RE_VM_FLAG_UTF8_CLASS_INVERT_TO_INSTR();
+            }
+            instr |= RE_VM_ENC_UTF8_MIDLOW_TO_INSTR(token->mid_low);
+            if(token->encoding >= 2) {
+                instr |= RE_VM_ENC_UTF8_MIDHIGH_TO_INSTR(token->mid_high);
+            }
+            break;
+        case eTokenCall:
+            if((index = token->out_b->pc) == -1) {
+                if(!regexAddPCPatchEntry(build, token->out_b, 1)) {
+                    return 0;
+                }
+                if(!regexVMGenPathSubroutineExists(build, token->out_b)) {
+                    if(!regexVMGenPathCreate(build, token->out_b, 1)) {
+                        return 0;
+                    }
+                }
+            }
+            instr |= RE_VM_OP_A_TO_INSTR(index);
+            break;
+        case eTokenSave:
+            // TODO - save group name, if applicable
+            if(token->flags & RE_TOK_FLAG_COMPOUND) {
+                instr |= RE_VM_FLAG_COMPOUND_TO_INSTR();
+            }
+            instr |= RE_VM_OP_A_TO_INSTR(token->group);
+            break;
+        case eTokenSplit:
+            if((index = token->out_a->pc) == -1) {
+                if(!regexAddPCPatchEntry(build, token->out_a, 1)) {
+                    return 0;
+                }
+            }
+            instr |= RE_VM_OP_A_TO_INSTR(index);
+            if((index = token->out_b->pc) == -1) {
+                if(!regexAddPCPatchEntry(build, token->out_b, 2)) {
+                    return 0;
+                }
+            }
+            instr |= RE_VM_OP_B_TO_INSTR(index);
+            break;
+        case eTokenJmp:
+            if((index = token->out_a->pc) == -1) {
+                if(!regexAddPCPatchEntry(build, token->out_a, 1)) {
+                    return 0;
+                }
+            }
+            instr |= RE_VM_OP_A_TO_INSTR(index);
+            break;
+        case eTokenAssertion:
+            instr |= RE_VM_OP_A_TO_INSTR(token->flags);
+            break;
+        default:
+            break;
+    }
+
+    if(!regexVMProgramAdd(build, instr)) {
+        return 0;
+    }
+
+    if(token->tokenType == eTokenSplit) {
+        if(!regexVMGenPathCreate(build, token->out_b, 0)) {
+            return 0;
+        }
+    }
+    *next = token->out_a;
+    return 1;
+}
+
+int regexVMProgramUnanchoredPrefix(regex_build_t *build) {
+    unsigned int prefix[] = {
+            (RE_VM_ENC_TOKEN_TO_INSTR(eTokenSplit) | RE_VM_OP_A_TO_INSTR(1) | RE_VM_OP_B_TO_INSTR(3)), // eTokenSplit(1,3)
+            (RE_VM_ENC_TOKEN_TO_INSTR(eTokenByte)), // eTokenByte()
+            (RE_VM_ENC_TOKEN_TO_INSTR(eTokenJmp))   // eTokenJmp(0)
+    };
+    if((!regexVMProgramAdd(build, prefix[0])) ||
+       (!regexVMProgramAdd(build, prefix[1])) ||
+       (!regexVMProgramAdd(build, prefix[2]))) {
+        return 0;
+    }
+    return 1;
+}
+
+int regexVMGenerate(regex_build_t *build) {
+    regex_token_t *token;
+    //regex_subroutine_t *routine;
+
+    if((token = _regexExprOperandPop(build->expr)) == NULL) {
+        return 0;
+    }
+    if(!regexVMProgramUnanchoredPrefix(build)) {
+        return 0;
+    }
+    printf("building primary...\n");
+    do {
+        for(;token != NULL;) {
+            if(!regexVMProgramGenerateInstr(build, token, &token)) {
+                return 0;
+            }
+        }
+    } while((token = regexVMGenPathGetNext(build, 0)) != NULL);
+
+    printf("building subroutines...\n");
+    token = regexVMGenPathGetNext(build, 1);
+    do {
+        do {
+            for(;token != NULL;) {
+                if(!regexVMProgramGenerateInstr(build, token, &token)) {
+                    return 0;
+                }
+            }
+        } while((token = regexVMGenPathGetNext(build, 0)) != NULL);
+    } while((token = regexVMGenPathGetNext(build, 1)) != NULL);
+
+#if 0
+#ifdef MOJO_REGEX_VM_DEBUG
+    for(routine = build->build_ctx->subroutine_index.subroutines; routine != NULL; routine = routine->next) {
+        if(!(routine->is_graph)) {
+            continue;
+        }
+        if(routine->tokens != NULL) {
+            regexVMSubNameEntrySetPC(build->build_ctx->vm, routine->id, routine->tokens->pc);
+        }
+    }
+#endif // MOJO_REGEX_VM_DEBUG
+#endif // 0
+
+    printf("patching...\n");
+    regexVMPatchJumps(build, &(build->context->patch_list));
+    regexVMPatchListFree(build, build->context->patch_list);
+    build->context->vm->size = build->context->pc;
+
+    return 1;
 }
 
 regex_vm_t *regexVMFromBuild(regex_build_t *build) {
@@ -6030,6 +6425,10 @@ int regexVMSubNameEntrySetPC(regex_vm_t *vm, int index, int pc) {
     }
     return 0;
 }
+
+// Generate VM source code output ///////////////////////////////////////////
+
+
 
 #endif // MOJO_REGEX_COMPILE_IMPLEMENTATION
 #ifdef MOJO_REGEX_COMMON_IMPLEMENTATION
@@ -6311,9 +6710,9 @@ int main(int argc, char **argv) {
             regexBuildDestroy(build);
             return 1;
         }
+        regexVMProgramEmit(stdout, regexVMFromBuild(build), 0, 0);
+        printf("-------------------------\n");
         if(argc > 2) {
-            regexVMProgramEmit(stdout, regexVMFromBuild(build), 0, 0);
-            printf("-------------------------\n");
 
             printf("Evaluating [%s]\n", argv[2]);
             printf(" (escaped) [");
