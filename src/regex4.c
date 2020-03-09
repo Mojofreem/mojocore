@@ -258,8 +258,10 @@ TODO:
 #   define INTERNAL_ERROR(fmt,...)  fprintf(stderr, "ERROR [" fmt "] in %s @ %d\n", ## __VA_ARGS__, __FUNCTION__, __LINE__)
 
 //const char *regexTokenNameStr(int token);
-#   define TOKEN_CREATE(t)          fprintf(stdout, "Created token: [%s]\n", regexTokenNameStr(t))
-#   define TOKEN_CREATED(b,t)         fputs("Created ", stdout); regexTokenStrEmit(stdout,b->context,t,eReEmitBrief); fputc('\n', stdout)
+//#   define TOKEN_CREATE(t)          fprintf(stdout, "Created token: [%s]\n", regexTokenNameStr(t))
+#   define TOKEN_CREATE(t)
+//#   define TOKEN_CREATED(b,t)         fputs("Created ", stdout); regexTokenStrEmit(stdout,b->context,t,eReEmitBrief); fputc('\n', stdout)
+#   define TOKEN_CREATED(b,t)
 #else
 #   define INTERNAL_ERROR(msg)
 #   define TOKEN_CREATE(t)
@@ -556,10 +558,10 @@ int _parseUtf8DecodeSequence(const char *str);
 // Map instruction bits to operand bit positions
 #define RE_VM_INSTR_BIT(bit)    (1u << (bit))
 
-#define RE_VM_FLAG_ASSERT_START_OF_LINE 0x0u
-#define RE_VM_FLAG_ASSERT_END_OF_LINE   0x1u
-#define RE_VM_FLAG_ASSERT_START_OF_WORD 0x2u
-#define RE_VM_FLAG_ASSERT_END_OF_WORD   0x3u
+#define RE_VM_FLAG_ASSERT_START_OF_LINE 0x10u
+#define RE_VM_FLAG_ASSERT_END_OF_LINE   0x20u
+#define RE_VM_FLAG_ASSERT_START_OF_WORD 0x30u
+#define RE_VM_FLAG_ASSERT_END_OF_WORD   0x40u
 
 #define RE_VM_FLAG_CHAR_INVERT          RE_VM_INSTR_BIT(17u)
 #define RE_VM_FLAG_CHARANY_DOTALL       RE_VM_INSTR_BIT(4u)
@@ -569,12 +571,12 @@ int _parseUtf8DecodeSequence(const char *str);
 #define RE_VM_FLAG_UTF8_LITERAL_INVERT  RE_VM_INSTR_BIT(31u)
 
 #define RE_VM_OPCODE_MASK   0xFu
-#define RE_VM_OP_A_MASK     0xFFFC0000u
-#define RE_VM_OP_A_INV_MASK 0x3FFFFu
-#define RE_VM_OP_A_OFFSET   18u
-#define RE_VM_OP_B_MASK     0x3FFF0u
-#define RE_VM_OP_B_INV_MASK 0xFFFC000Fu
-#define RE_VM_OP_B_OFFSET   4u
+#define RE_VM_OP_B_MASK     0xFFFC0000u
+#define RE_VM_OP_B_INV_MASK 0x3FFFFu
+#define RE_VM_OP_B_OFFSET   18u
+#define RE_VM_OP_A_MASK     0x3FFF0u
+#define RE_VM_OP_A_INV_MASK 0xFFFC000Fu
+#define RE_VM_OP_A_OFFSET   4u
 #define RE_VM_OP_A_FROM_INSTR(instr)    ((((unsigned)instr) & RE_VM_OP_A_MASK) >> RE_VM_OP_A_OFFSET)
 #define RE_VM_OP_B_FROM_INSTR(instr)    ((((unsigned)instr) & RE_VM_OP_B_MASK) >> RE_VM_OP_B_OFFSET)
 #define RE_VM_OP_A_TO_INSTR(op)         ((((unsigned)op) << RE_VM_OP_A_OFFSET) & RE_VM_OP_A_MASK)
@@ -3232,7 +3234,6 @@ int _regexTokenExprApply(regex_build_t *build, regex_token_t *token) {
             _regexTokenDestroy(build->context, token, 0);
             return 0;
         }
-        printf("concat...\n");
         if(_regexExprTokenPush(build->expr, concat) != eReExprSuccess) {
             return 0;
         }
@@ -3389,14 +3390,19 @@ int regexIndexToLogicalGroup(int index) {
 int regexBuildGroupStart(regex_build_t *build, int expr_inline, const char *name, int name_len, int no_capture,
                          int compound, int subroutine_index) {
     regex_token_t *token;
+    char *gname;
 
-    if((token = _regexTokenAlloc(build->context, eTokenSubExprStart, name, NULL, name_len)) == NULL) {
+    if((gname = _regexStrdup(name, RE_STR_NULL_TERM)) == NULL) {
+        return 0;
+    }
+
+    if((token = _regexTokenAlloc(build->context, eTokenSubExprStart, gname, NULL, 0)) == NULL) {
         return 0;
     }
     // We simply push without concat, since we'll be popping at the end of the
     // subexpression, and will evaluate whether we're retaining the token then
     // (ie., no capture)
-    _regexExprOperandPush(build->expr, token);
+    _regexExprTokenPush(build->expr, token);
 
     if(subroutine_index > 0) {
         token->flags |= RE_TOK_FLAG_SUBROUTINE;
@@ -3412,13 +3418,9 @@ int regexBuildGroupStart(regex_build_t *build, int expr_inline, const char *name
         build->context->group_count++;
         token->group = regexLogicalGroupToIndex(build->context->group_count, 1);
     }
-
     if(!regexExprCreate(build)) {
         return 0;
     }
-
-    printf("group start\n");
-
     return 1;
 }
 
@@ -3450,7 +3452,6 @@ eReExprStatus_t regexBuildGroupEnd(regex_build_t *build) {
             return eReExprOutOfMemory;
         }
         end->flags = start->flags;
-        end->out_b = start;
         end->group = regexLogicalGroupToIndex(regexIndexToLogicalGroup(start->group), 0);
 
         _regexPtrlistPatch(build->context, &(start->ptrlist), group, 0);
@@ -3468,8 +3469,6 @@ eReExprStatus_t regexBuildGroupEnd(regex_build_t *build) {
         // No capture, not a subroutine
         _regexTokenExprApply(build, group);
     }
-
-    printf("group end\n");
 
     return eReExprSuccess;
 }
@@ -3807,6 +3806,7 @@ static eRegexPatternId_t _parseCheckIdentifier(const char *pattern,
     if((pattern == NULL) || (*pattern != start)) {
         return eRegexPatternIdMissing;
     }
+    pattern++;
     for(k = 0; _parseIsIdChar(pattern[k]) && (pattern[k] != end); k++);
     if((k == 0) || (pattern[k] != end)) {
         return eRegexPatternIdMalformed;
@@ -5213,6 +5213,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
     int name_len;
     unsigned int flags;
     int index;
+    int group;
     int min, max;
 
     if(build->pattern == NULL) {
@@ -5357,9 +5358,6 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                             } else {
                                 return eCompileUnsupportedMeta;
                             }
-                        }
-                        if(!(flags & RE_TOK_FLAG_NO_CAPTURE)) {
-                            build->context->group_count++;
                         }
                         if(!regexBuildGroupStart(build,
                                                  ((flags & RE_TOK_FLAG_NO_CAPTURE) ? 0 : 1),
@@ -5795,7 +5793,6 @@ eReExprStatus_t _regexExprTokenPush(regex_expr_t *expr, regex_token_t *token) {
     } else {
         _regexExprOperandPush(expr, token);
         if((token->ptrlist == NULL) && (token->out_a == NULL)) {
-            printf("creating ptrlist on pushed [%s]\n", _regexTokenDetails[token->tokenType].name);
             if((token->ptrlist = _regexPtrlistCreate(expr->context, token, eRePtrOutA)) == NULL) {
                 return eReExprOutOfMemory;
             }
@@ -6235,7 +6232,6 @@ int regexVMProgramGenerateInstr(regex_build_t *build, regex_token_t *token, rege
     token->pc = build->context->pc;
 
     instr = RE_VM_ENC_TOKEN_TO_INSTR(token->tokenType);
-    printf("    append [%s]\n", _regexTokenDetails[token->tokenType].name);
     switch(token->tokenType) {
         case eTokenCharLiteral:
             instr |= RE_VM_ENC_CHAR_TO_INSTR(token->c);
@@ -6854,7 +6850,7 @@ int main(int argc, char **argv) {
     regex_match_t *match;
     regex_pattern_t *pattern;
 
-    const char *test = "This is\\s+(?:a test, yo[0-9a-z]*), abide, when all else fails, yo yo yo. Super werd salad";
+    const char *test = "This is\\s+(?P<foo>?*a test, yo[0-9a-z]*)?, abide, when all else fails, yo yo yo. Super werd salad";
     //const char *test = "a test, yo[0-9a-z]*";
 
     if(argc > 1) {
