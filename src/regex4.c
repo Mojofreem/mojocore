@@ -213,7 +213,9 @@ TODO:
     utf8 class - create base char class for low byte sequences
     utf8 class - generate DFA for high byte sequences
     sub - map eReSuboutineResult_t to compile result (helper function)
-
+    associate subroutine names w/ nuemonic VM output
+    complete evaluator
+    verify subroutines
 
 ///////////////////////////////////////////////////////////////////////////*/
 
@@ -1255,8 +1257,8 @@ int regexBuildRange(regex_build_t *build, int min, int max);
 int regexBuildAlternative(regex_build_t *build);
 
 int regexCreateTokenJmp(regex_build_ctx_t *context, regex_token_t **token);
-
-// TODO: create match, create return
+int regexCreateTokenMatch(regex_build_t *build);
+int regexCreateTokenReturn(regex_build_t *build);
 
 // Pattern parsing handling functions ///////////////////////////////////////
 
@@ -3392,13 +3394,14 @@ int regexBuildGroupStart(regex_build_t *build, int expr_inline, const char *name
     regex_token_t *token;
     char *gname;
 
-    if((gname = _regexStrdup(name, RE_STR_NULL_TERM)) == NULL) {
+    if((gname = _regexStrdup(name, name_len)) == NULL) {
         return 0;
     }
 
     if((token = _regexTokenAlloc(build->context, eTokenSubExprStart, gname, NULL, 0)) == NULL) {
         return 0;
     }
+
     // We simply push without concat, since we'll be popping at the end of the
     // subexpression, and will evaluate whether we're retaining the token then
     // (ie., no capture)
@@ -3426,7 +3429,7 @@ int regexBuildGroupStart(regex_build_t *build, int expr_inline, const char *name
 
 eReExprStatus_t regexBuildGroupEnd(regex_build_t *build) {
     eReExprStatus_t status;
-    regex_token_t *group, *start, *end;
+    regex_token_t *group, *start, *end, *ret;
 
     if((status = _regexExprFinalize(build->expr)) != eReExprSuccess) {
         return status;
@@ -3443,6 +3446,8 @@ eReExprStatus_t regexBuildGroupEnd(regex_build_t *build) {
     }
 
     if(!(start->flags & RE_TOK_FLAG_NO_CAPTURE)) {
+        // This is NOT a no capture group, so generate the pre/post-ceding save
+        // instructions to capture input groups
         start->tokenType = eTokenSave;
 
         if((end = _regexTokenAlloc(build->context, eTokenSave, NULL, NULL, 0)) == NULL) {
@@ -3459,15 +3464,29 @@ eReExprStatus_t regexBuildGroupEnd(regex_build_t *build) {
         start->ptrlist = end->ptrlist;
         group->ptrlist = NULL;
         end->ptrlist = NULL;
-        _regexTokenExprApply(build, start);
-    } else if(start->flags & RE_TOK_FLAG_SUBROUTINE) {
-        // No capture subroutine
-        start->tokenType = eTokenCall;
-        regexSubroutineExprSet(build->context, start->sub_index, group);
-        _regexTokenExprApply(build, start);
+    }
+
+    if(start->flags & RE_TOK_FLAG_SUBROUTINE) {
+        // This is a subroutine
+        if(start->flags & RE_TOK_FLAG_NO_CAPTURE) {
+            start->tokenType = eTokenCall;
+            regexSubroutineExprSet(build->context, start->sub_index, group);
+            _regexTokenExprApply(build, start);
+        } else {
+            if((ret = _regexTokenAlloc(build->context, eTokenReturn, NULL, NULL, 0)) == NULL) {
+                return eReExprOutOfMemory;
+            }
+            regexBuildConcatCall(build, start->sub_index);
+            regexSubroutineExprSet(build->context, start->sub_index, start);
+            _regexPtrlistPatch(build->context, &(start->ptrlist), ret, 0);
+        }
     } else {
-        // No capture, not a subroutine
-        _regexTokenExprApply(build, group);
+        if(start->flags & RE_TOK_FLAG_NO_CAPTURE) {
+            _regexTokenExprApply(build, group);
+            _regexTokenDestroy(build->context, start, 0);
+        } else {
+            _regexTokenExprApply(build, start);
+        }
     }
 
     return eReExprSuccess;
@@ -5359,6 +5378,7 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                                 return eCompileUnsupportedMeta;
                             }
                         }
+                        printf("prepare to choke...\n");
                         if(!regexBuildGroupStart(build,
                                                  ((flags & RE_TOK_FLAG_NO_CAPTURE) ? 0 : 1),
                                                  name, name_len,
@@ -5367,14 +5387,19 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                                                  index)) {
                             return eCompileOutOfMem;
                         }
+                        printf("it survived, miracle of miracles!\n");
                         continue;
 
                     case ')': // Meta, end of subexpression (group)
                         // This should only be encountered in a recursive call
                         // (initiated by an opening group meta character)
+                        printf("prepare to choke...\n");
                         switch(_regexExprFinalize(build->expr)) {
                             case eReExprSuccess:
+                                printf("choking in 3, 2, 1...\n");
+                                fflush(stdout);
                                 regexBuildGroupEnd(build);
+                                printf("never made it here :(\n");
                                 continue;
                             case eReExprOutOfMemory:
                                 return eCompileOutOfMem;
@@ -6231,6 +6256,7 @@ int regexVMProgramGenerateInstr(regex_build_t *build, regex_token_t *token, rege
     }
     token->pc = build->context->pc;
 
+    printf("adding %d:[%s]\n", build->context->pc, _regexTokenDetails[token->tokenType].name);
     instr = RE_VM_ENC_TOKEN_TO_INSTR(token->tokenType);
     switch(token->tokenType) {
         case eTokenCharLiteral:
@@ -6271,14 +6297,17 @@ int regexVMProgramGenerateInstr(regex_build_t *build, regex_token_t *token, rege
             break;
         case eTokenCall:
             if((index = token->out_b->pc) == -1) {
+                printf("patch entry...\n");
                 if(!regexAddPCPatchEntry(build, token->out_b, 1)) {
                     return 0;
                 }
+                printf("checking...\n");
                 if(!regexVMGenPathSubroutineExists(build, token->out_b)) {
                     if(!regexVMGenPathCreate(build, token->out_b, 1)) {
                         return 0;
                     }
                 }
+                printf("amble on...\n");
             }
             instr |= RE_VM_OP_A_TO_INSTR(index);
             break;
@@ -6850,7 +6879,7 @@ int main(int argc, char **argv) {
     regex_match_t *match;
     regex_pattern_t *pattern;
 
-    const char *test = "This is\\s+(?P<foo>?*a test, yo[0-9a-z]*)?, abide, when all else fails, yo yo yo. Super werd salad";
+    const char *test = "This is\\s+(?R<poopstain>?*a test, yo[0-9a-z]*)?, abide, when all else fails, yo yo yo. Super werd salad";
     //const char *test = "a test, yo[0-9a-z]*";
 
     if(argc > 1) {
