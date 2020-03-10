@@ -216,6 +216,9 @@ TODO:
     associate subroutine names w/ nuemonic VM output
     complete evaluator
     verify subroutines
+    vm gen - group names
+    vm gen - subroutine names
+
 
 ///////////////////////////////////////////////////////////////////////////*/
 
@@ -2138,6 +2141,54 @@ static void _regexUtf8ClassBitmapEmit(FILE *fp, const unsigned int *bitmap) {
     }
 }
 
+static int _regexEscapedStrLen(const char *str, int len) {
+    int k;
+    int out = 0;
+    int codepoint;
+
+    if(str == NULL) {
+        return 4;
+    }
+    if(len == RE_STR_NULL_TERM) {
+        len = (int)strlen(str);
+    }
+    for(k = 0; k < len; k++) {
+        // Check for utf8 encoding
+        if((codepoint = _parseUtf8DecodeSequence(str + k)) != -1) {
+            if(codepoint > 0xFFFF) {
+                if(codepoint > 0xFFFFF) {
+                    out += 9; // \u{12345}
+                } else {
+                    out += 10; // \u{102345}
+                }
+                k += 3;
+            } else if(codepoint > 2047) {
+                k += 2;
+                out += 6;
+            } else if(codepoint > 127) {
+                k += 1;
+                out += 6;
+            }
+            if(codepoint > 127) {
+                continue;
+            }
+        }
+        switch(str[k]) {
+            case '\0': case '\a': case '\b': case '\f':
+            case '\n': case '\r': case '\t': case '\v':
+                out += 2;
+            default:
+                if((str[k] >= ' ') && (str[k] <= 127)) {
+                    out++;
+                } else {
+                    out += 4;
+                }
+                break;
+        }
+    }
+    return out;
+}
+
 static void _regexEscapedStrEmit(FILE *fp, const char *str, int len) {
     int k;
     int codepoint;
@@ -2170,7 +2221,6 @@ static void _regexEscapedStrEmit(FILE *fp, const char *str, int len) {
             case '\0': fputs("\\0", fp); break;
             case '\a': fputs("\\a", fp); break;
             case '\b': fputs("\\b", fp); break;
-            case '\x1b': fputs("\\e", fp); break;
             case '\f': fputs("\\f", fp); break;
             case '\n': fputs("\\n", fp); break;
             case '\r': fputs("\\r", fp); break;
@@ -3392,10 +3442,12 @@ int regexIndexToLogicalGroup(int index) {
 int regexBuildGroupStart(regex_build_t *build, int expr_inline, const char *name, int name_len, int no_capture,
                          int compound, int subroutine_index) {
     regex_token_t *token;
-    char *gname;
+    char *gname = NULL;
 
-    if((gname = _regexStrdup(name, name_len)) == NULL) {
-        return 0;
+    if((subroutine_index == 0) && (name != NULL)) {
+        if((gname = _regexStrdup(name, name_len)) == NULL) {
+            return 0;
+        }
     }
 
     if((token = _regexTokenAlloc(build->context, eTokenSubExprStart, gname, NULL, 0)) == NULL) {
@@ -3410,6 +3462,8 @@ int regexBuildGroupStart(regex_build_t *build, int expr_inline, const char *name
     if(subroutine_index > 0) {
         token->flags |= RE_TOK_FLAG_SUBROUTINE;
         token->sub_index = (short)subroutine_index;
+    } else if(name != NULL) {
+        token->flags |= RE_TOK_FLAG_NAMED;
     }
     if(compound) {
         token->flags |= RE_TOK_FLAG_COMPOUND;
@@ -5378,7 +5432,6 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                                 return eCompileUnsupportedMeta;
                             }
                         }
-                        printf("prepare to choke...\n");
                         if(!regexBuildGroupStart(build,
                                                  ((flags & RE_TOK_FLAG_NO_CAPTURE) ? 0 : 1),
                                                  name, name_len,
@@ -5387,19 +5440,14 @@ static eRegexCompileStatus_t _regexTokenizePattern(regex_build_t *build) {
                                                  index)) {
                             return eCompileOutOfMem;
                         }
-                        printf("it survived, miracle of miracles!\n");
                         continue;
 
                     case ')': // Meta, end of subexpression (group)
                         // This should only be encountered in a recursive call
                         // (initiated by an opening group meta character)
-                        printf("prepare to choke...\n");
                         switch(_regexExprFinalize(build->expr)) {
                             case eReExprSuccess:
-                                printf("choking in 3, 2, 1...\n");
-                                fflush(stdout);
                                 regexBuildGroupEnd(build);
-                                printf("never made it here :(\n");
                                 continue;
                             case eReExprOutOfMemory:
                                 return eCompileOutOfMem;
@@ -6245,6 +6293,7 @@ int regexVMProgramAdd(regex_build_t *build, unsigned int instr) {
 int regexVMProgramGenerateInstr(regex_build_t *build, regex_token_t *token, regex_token_t **next) {
     unsigned int instr;
     int index;
+    regex_sub_t *sub;
 
     if(token == NULL) {
         *next = NULL;
@@ -6256,7 +6305,12 @@ int regexVMProgramGenerateInstr(regex_build_t *build, regex_token_t *token, rege
     }
     token->pc = build->context->pc;
 
-    printf("adding %d:[%s]\n", build->context->pc, _regexTokenDetails[token->tokenType].name);
+    for(sub = build->context->subroutines; sub != NULL; sub = sub->next) {
+        if(sub->expr == token) {
+            regexVMSubNameEntrySetPC(build->context->vm, sub->index, build->context->pc);
+        }
+    }
+
     instr = RE_VM_ENC_TOKEN_TO_INSTR(token->tokenType);
     switch(token->tokenType) {
         case eTokenCharLiteral:
@@ -6296,23 +6350,35 @@ int regexVMProgramGenerateInstr(regex_build_t *build, regex_token_t *token, rege
             }
             break;
         case eTokenCall:
+            if(token->out_b == NULL) {
+                if((sub = _regexSubroutineGet(build->context, token->sub_index)) == NULL) {
+                    return 0;
+                }
+                token->out_b = sub->expr;
+            }
             if((index = token->out_b->pc) == -1) {
-                printf("patch entry...\n");
                 if(!regexAddPCPatchEntry(build, token->out_b, 1)) {
                     return 0;
                 }
-                printf("checking...\n");
                 if(!regexVMGenPathSubroutineExists(build, token->out_b)) {
                     if(!regexVMGenPathCreate(build, token->out_b, 1)) {
                         return 0;
                     }
+                    if((sub = _regexSubroutineGet(build->context, token->sub_index)) != NULL) {
+                        if(!regexVMSubNameEntryAdd(build, sub->name, sub->alias, token->sub_index)) {
+                            return 0;
+                        }
+                    }
                 }
-                printf("amble on...\n");
             }
             instr |= RE_VM_OP_A_TO_INSTR(index);
             break;
         case eTokenSave:
-            // TODO - save group name, if applicable
+            if(token->flags & RE_TOK_FLAG_NAMED) {
+                if(!regexVMGroupEntryAdd(build, token->name, RE_STR_NULL_TERM, regexIndexToLogicalGroup(token->group))) {
+                    return 0;
+                }
+            }
             if(token->flags & RE_TOK_FLAG_COMPOUND) {
                 instr |= RE_VM_FLAG_COMPOUND_TO_INSTR();
             }
@@ -6376,7 +6442,6 @@ int regexVMProgramUnanchoredPrefix(regex_build_t *build) {
 
 int regexVMGenerate(regex_build_t *build) {
     regex_token_t *token;
-    //regex_subroutine_t *routine;
 
     if((token = _regexExprOperandPop(build->expr)) == NULL) {
         return 0;
@@ -6384,7 +6449,6 @@ int regexVMGenerate(regex_build_t *build) {
     if(!regexVMProgramUnanchoredPrefix(build)) {
         return 0;
     }
-    printf("building primary...\n");
     do {
         for(;token != NULL;) {
             if(!regexVMProgramGenerateInstr(build, token, &token)) {
@@ -6393,7 +6457,6 @@ int regexVMGenerate(regex_build_t *build) {
         }
     } while((token = regexVMGenPathGetNext(build, 0)) != NULL);
 
-    printf("building subroutines...\n");
     token = regexVMGenPathGetNext(build, 1);
     do {
         do {
@@ -6405,20 +6468,6 @@ int regexVMGenerate(regex_build_t *build) {
         } while((token = regexVMGenPathGetNext(build, 0)) != NULL);
     } while((token = regexVMGenPathGetNext(build, 1)) != NULL);
 
-#if 0
-#ifdef MOJO_REGEX_VM_DEBUG
-    for(routine = build->build_ctx->subroutine_index.subroutines; routine != NULL; routine = routine->next) {
-        if(!(routine->is_graph)) {
-            continue;
-        }
-        if(routine->tokens != NULL) {
-            regexVMSubNameEntrySetPC(build->build_ctx->vm, routine->id, routine->tokens->pc);
-        }
-    }
-#endif // MOJO_REGEX_VM_DEBUG
-#endif // 0
-
-    printf("patching...\n");
     regexVMPatchJumps(build, &(build->context->patch_list));
     regexVMPatchListFree(build, build->context->patch_list);
     build->context->vm->size = build->context->pc;
@@ -6580,6 +6629,7 @@ int regexVMSubNameEntryAdd(regex_build_t *build, const char *name, const char *a
         k = build->context->vm->sub_name_tbl_size;
         build->context->vm->sub_name_tbl_size++;
     }
+    build->context->vm->sub_name_table[k].id = index;
     if((name != NULL) && (build->context->vm->sub_name_table[k].name == NULL)) {
         if((build->context->vm->sub_name_table[k].name = _regexStrdup(name, RE_STR_NULL_TERM)) == NULL) {
             return 0;
@@ -6664,6 +6714,225 @@ const char *regexVMSubAliasEntryGet(regex_vm_t *vm, int pc) {
     }
     return NULL;
 }
+
+/////////////////////////////////////////////////////////////////////////////
+// VM program source code generation functions
+/////////////////////////////////////////////////////////////////////////////
+
+#ifdef MOJO_REGEX_VM_SOURCE_GENERATION
+
+void regexVMGenerateDeclaration(regex_vm_t *vm, const char *symbol, FILE *fp) {
+    fprintf(fp, "extern regex_vm_t *%s;\n", symbol);
+}
+
+#define MAX_LINE_LEN    80
+#define LINE_PADDING    6   // 4 leading spaces, 2 trailing
+
+int hexStrLen(unsigned int val) {
+    unsigned int k;
+
+    for(k = 7; k > 2; k-= 1) {
+        if(val & (0xFu << (k * 4))) {
+            return (int)k + 3; // 3 = '0x' + nibble
+        }
+    }
+    return 4; // 0x##
+}
+
+void generateHexValueTable(FILE *fp, unsigned int *table, int size) {
+    int k, len, line, first = 1;
+
+    line = MAX_LINE_LEN - LINE_PADDING;
+    for(k = 0; k < size; k++) {
+        len = hexStrLen(table[k]) + 1;   // value, comma
+        if(!first) {
+            len++; // padding space between values
+        }
+        line -= len;
+        if(line < 0) {
+            fputs("\n    ", fp);
+            line = MAX_LINE_LEN - LINE_PADDING;
+            first = 1;
+        }
+        fprintf(fp, "%s0x%0.2X%s", (!first ? " " : ""), table[k],
+                (k + 1 != size ? "," : ""));
+        first = 0;
+    }
+}
+
+int intStrLen(int val) {
+    int check = (val < 0 ? -val : val);
+    int k, len;
+
+    for(len = 0, k = 9; k <= check; len++, k = (k * 10) + 9);
+    if(val < 0) {
+        len++;
+    }
+    return len;
+}
+
+void generateIntValueTable(FILE *fp, int *table, int size) {
+    int k, len, line, first = 1;
+
+    line = MAX_LINE_LEN - LINE_PADDING;
+    for(k = 0; k < size; k++) {
+        len = intStrLen(table[k]) + 1;   // value, comma
+        if(!first) {
+            len++; // padding space between values
+        }
+        line -= len;
+        if(line < 0) {
+            fputs("\n    ", fp);
+            line = MAX_LINE_LEN - LINE_PADDING;
+            first = 1;
+        }
+        fprintf(fp, "%s%d%s", (!first ? " " : ""), table[k],
+                (k + 1 != size ? "," : ""));
+        first = 0;
+    }
+}
+
+void generateStringValueTable(FILE *fp, char **table, const int *lengths, int size) {
+    int k, len, pad, line, baselen = 0, first = 1;
+
+    line = MAX_LINE_LEN - LINE_PADDING;
+    for(k = 0; k < size; k++) {
+        if(table[k] == NULL) {
+            len = 4; // NULL
+            pad = 1; // comma
+        } else {
+            baselen = (int)(lengths != NULL ? lengths[k] : strlen(table[k]));
+            len = _regexEscapedStrLen(table[k], baselen);
+            pad = 3; // quotes, comma
+        }
+        if(!first) {
+            pad++; // padding space between values
+        }
+        line -= len + pad;
+        if((line < 0) && (!first)) {
+            fputs("\n    ", fp);
+            line = MAX_LINE_LEN - LINE_PADDING;
+            first = 1;
+        }
+        if(table[k] == NULL) {
+            fprintf(fp, "%sNULL%s", (!first ? " " : ""), (k + 1 != size ? "," : ""));
+        } else {
+            fprintf(fp, "%s\"", (!first ? " " : ""));
+            _regexEscapedStrEmit(fp, table[k], baselen);
+            fprintf(fp, "\"%s", (k + 1 != size ? "," : ""));
+        }
+        first = 0;
+    }
+}
+
+void regexVMGenerateDefinition(regex_vm_t *vm, const char *symbol, FILE *fp) {
+    int k;
+
+    // Program bytecode
+    fprintf(fp, "unsigned int _%s_program[] = {\n    ", symbol);
+    generateHexValueTable(fp, vm->program, vm->size);
+    fprintf(fp, "\n};\n\n");
+
+    // String literal table
+    fprintf(fp, "char *_%s_string_table[] = {\n    ", symbol);
+    generateStringValueTable(fp, vm->string_table, vm->string_tbl_len, vm->string_tbl_size);
+    fprintf(fp, "\n};\n\n");
+
+    fprintf(fp, "int _%s_string_tbl_len[] = {\n    ", symbol);
+    generateIntValueTable(fp, vm->string_tbl_len, vm->string_tbl_size);
+    fprintf(fp, "\n};\n\n");
+
+    // Character class table
+    for(k = 0; k < vm->class_tbl_size; k++) {
+        if(vm->class_table[k] == NULL) {
+            continue;
+        }
+        fprintf(fp, "unsigned int _%s_class_entry_%d[] = {\n    ", symbol, k);
+        generateHexValueTable(fp, vm->class_table[k], 8);
+        fprintf(fp, "\n};\n\n");
+    }
+
+    fprintf(fp, "unsigned int *_%s_class_table[] = {\n", symbol);
+    for(k = 0; k < vm->class_tbl_size; k++) {
+        if(vm->class_table[k] == NULL) {
+            fprintf(fp, "    NULL,\n");
+        } else {
+            fprintf(fp, "    _%s_class_entry_%d,\n", symbol, k);
+        }
+    }
+    fprintf(fp, "};\n\n");
+
+    // Utf8 character class table
+    for(k = 0; k < vm->utf8_tbl_size; k++) {
+        if(vm->utf8_class_table[k] == NULL) {
+            continue;
+        }
+        fprintf(fp, "unsigned int _%s_utf8_class_entry_%d[] = {\n    ", symbol, k);
+        generateHexValueTable(fp, vm->utf8_class_table[k], 2);
+        fprintf(fp, "\n};\n\n");
+    }
+
+    fprintf(fp, "unsigned int *_%s_utf_class_table[] = {\n    ", symbol);
+    for(k = 0; k < vm->utf8_tbl_size; k++) {
+        fprintf(fp, "    _%s_class_entry_%d,\n", symbol, k);
+    }
+    fprintf(fp, "};\n\n");
+
+    // Group table
+    fprintf(fp, "char *_%s_group_table[] = {\n    ", symbol);
+    generateStringValueTable(fp, vm->group_table, NULL, vm->group_tbl_size);
+    fprintf(fp, "\n};\n\n");
+
+#ifdef MOJO_REGEX_VM_DEBUG
+    // Subroutine name table
+    fprintf(fp, "regex_vm_sub_names *_%s_sub_table[] = {\n", symbol);
+    for(k = 0; k < vm->sub_name_tbl_size; k++) {
+        fprintf(fp, "    {%d, %d, ", vm->sub_name_table[k].id, vm->sub_name_table[k].pc);
+        if(vm->sub_name_table[k].name == NULL) {
+            fprintf(fp, "NULL, ");
+        } else {
+            fprintf(fp, "\"%s\", ", vm->sub_name_table[k].name);
+        }
+        if(vm->sub_name_table[k].alias == NULL) {
+            fprintf(fp, "NULL},\n");
+        } else {
+            fprintf(fp, "\"%s\"},\n", vm->sub_name_table[k].alias);
+        }
+    }
+    fprintf(fp, "    {0, 0, NULL, NULL}\n");
+    fprintf(fp, "};\n\n");
+#endif // MOJO_REGEX_VM_DEBUG
+
+    fprintf(fp, "regex_vm_t _%s = {\n", symbol);
+    fprintf(fp, "    .vm_version = %d,\n", vm->vm_version);
+    fprintf(fp, "    .program = _%s_program,\n", symbol);
+    fprintf(fp, "    .size = %d,\n", vm->size);
+    fprintf(fp, "    .string_table = _%s_string_table,\n", symbol);
+    fprintf(fp, "    .string_tbl_size = %d,\n", vm->string_tbl_size);
+    fprintf(fp, "    .string_tbl_len = _%s_string_tbl_len,\n", symbol);
+    fprintf(fp, "    .class_table = _%s_class_table,\n", symbol);
+    fprintf(fp, "    .class_tbl_size = %d,\n", vm->class_tbl_size);
+    fprintf(fp, "    .utf8_class_table = _%s_utf8_class_table,\n", symbol); // TODO
+    fprintf(fp, "    .utf8_tbl_size = %d,\n", vm->utf8_tbl_size); // TODO
+    fprintf(fp, "    .group_table = _%s_group_table,\n", symbol);
+    fprintf(fp, "    .group_tbl_size = %d,\n", vm->group_tbl_size);
+    fprintf(fp, "    .max_call_depth = %d,\n", vm->max_call_depth); // TODO
+    fprintf(fp, "    .max_nested_ranges = %d,\n", vm->max_nested_ranges); // TODO
+    fprintf(fp, "    .sub_name_tbl_size = %d%s\n", vm->sub_name_tbl_size,
+#ifdef MOJO_REGEX_VM_DEBUG
+            ","
+#else // MOJO_REGEX_VM_DEBUG
+            ""
+#endif // MOJO_REGEX_VM_DEBUG
+            ); // TODO
+#ifdef MOJO_REGEX_VM_DEBUG
+    fprintf(fp, "    .sub_name_table = _%s_sub_table\n", symbol);
+#endif // MOJO_REGEX_VM_DEBUG
+    fprintf(fp, "};\n\n");
+    fprintf(fp, "regex_vm_t *%s = &_%s;\n", symbol, symbol);
+}
+
+#endif // MOJO_REGEX_VM_SOURCE_GENERATION
 
 /////////////////////////////////////////////////////////////////////////////
 // Regex evaluation handlers
