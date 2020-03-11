@@ -734,7 +734,39 @@ struct text_consume_buffer_s {
 };
 
 
+/*
+Builder interface concept
 
+    create builder
+    finalize builder
+        no further actions permitted after finalization
+        provides final construct: token DFA
+    destory builder
+
+    append:
+        char literal
+        string literal
+        char class
+        char any
+        call
+        byte
+        assertion
+        utf8 literal
+    quantifier:
+        [applies to the previous construct: bare token, compound, or subexpression]
+        zero or one
+        zero or many
+        one or many
+        range
+    group:
+        start/end
+        named:compound
+
+
+
+
+
+*/
 
 
 

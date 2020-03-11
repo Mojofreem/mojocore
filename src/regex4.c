@@ -213,12 +213,14 @@ TODO:
     utf8 class - create base char class for low byte sequences
     utf8 class - generate DFA for high byte sequences
     sub - map eReSuboutineResult_t to compile result (helper function)
-    associate subroutine names w/ nuemonic VM output
+    identify subroutine entry points in emitted code, label w/ name
     complete evaluator
     verify subroutines
     vm gen - group names
     vm gen - subroutine names
-
+    alternation
+    when adding operands to an expression, there should be OpCount - 1 operators
+        of the type concatenation or alternation. If not, append a concat operator.
 
 ///////////////////////////////////////////////////////////////////////////*/
 
@@ -396,6 +398,7 @@ typedef enum {
 
 #ifdef MOJO_REGEX_COMPILE_IMPLEMENTATION
 
+// TODO - properly enumerate to human readable for diagnostic output
 typedef enum {
     eCompileOk,
     eCompileCharClassRangeIncomplete,
@@ -451,6 +454,8 @@ void regexRegisterEnum(regexRegisterCb_t callback, void *context);
 #ifndef DEF_REGEX_UNICODE_CLASS
 #define DEF_REGEX_UNICODE_CLASS
 
+// Unicode UTF8 property class definitions, derived from the unicode database
+// using the "extract_unicode_props.py" script
 typedef struct regex_unicode_class_s regex_unicode_class_t;
 struct regex_unicode_class_s {
     const char *alias;
@@ -461,8 +466,11 @@ struct regex_unicode_class_s {
 
 #endif // DEF_REGEX_UNICODE_CLASS
 
+// Register the core utf8 property classes: letters, uppercase letters,
+// lowercase letters, combining marks, punctuation, numbers, and separators
 int regexRegisterUnicodePropClasses(regex_unicode_class_t *import_table);
 
+// Compilation flag to signal matching newline with the anychar (.) metacharacter
 #define RE_FLAG_DOT_ALL     0x1u
 
 // Pre-registered meta class names
@@ -839,7 +847,7 @@ struct regex_thread_s {
         //     *: if the match is inverted, 256 is added to flag an invert match
         //        (ie., a byte did NOT match, indicating the invert condition was met)
         // eTokenCharAny
-        //     -1: this is an initial evalation. If unicode support is compiled
+        //     -1: this is an initial evaluation. If unicode support is compiled
         //         in, and the character is the start of a utf8 encoded sequence,
         //         pos will be set to the number of encoded bytes.
         //     >0: number of expected bytes remaining in a valid utf8 sequence
@@ -7148,8 +7156,12 @@ int main(int argc, char **argv) {
     regex_match_t *match;
     regex_pattern_t *pattern;
 
-    const char *test = "This is\\s+(?R<poopstain>?*a test, yo[0-9a-z]*)?, abide, when all else fails, yo yo yo. Super werd salad";
+    const char *test = "This is\\s+(?R<poopstain>?*a test, yo[0-9a-z]*)?, abide, when|all else fails, yo yo yo. Super werd salad";
     //const char *test = "a test, yo[0-9a-z]*";
+
+    printf("Regex pattern: ");
+    _regexEscapedStrEmit(stdout, test, RE_STR_NULL_TERM);
+    printf("\n");
 
     if(argc > 1) {
         build = regexCompile(test, 0);
